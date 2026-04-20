@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nodeseek-rss-architect",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-20",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "APP_NAME": "NodeSeek RSS Reader",
+    "RSS_URL": "https://rss.nodeseek.com/",
+    "RSS_OWNER": "nodeseek",
+    "RSS_REFRESH_SECONDS": "60",
+    "PAGE_SIZE": "50",
+    "RESEND_API_URL": "https://api.resend.com/emails",
+    "TELEGRAM_API_BASE": "https://api.telegram.org",
+    "TELEGRAM_BOT_USERNAME": "",
+    "MANUAL_INGEST_ROUTE": "/api/admin/ingest"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nodeseek_rss_architect",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
+}
