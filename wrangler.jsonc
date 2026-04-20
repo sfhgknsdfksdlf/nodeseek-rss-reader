@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "nodeseek-rss-architect",
+  "name": "nodeseek-rss-reader",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-20",
   "workers_dev": true,
