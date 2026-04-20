@@ -22,7 +22,7 @@
     {
       "binding": "DB",
       "database_name": "nodeseek_rss_architect",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "aa8e3af6-c6c6-4458-9f21-cdc29bc5d1a4",
       "migrations_dir": "migrations"
     }
   ],
