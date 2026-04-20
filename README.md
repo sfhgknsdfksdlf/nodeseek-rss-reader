@@ -69,6 +69,12 @@ Then apply migrations:
 npm run db:migrate:remote
 ```
 
+Or use the one-shot remote deploy flow:
+
+```bash
+npm run deploy:remote
+```
+
 ---
 
 ## 3. Deploy from GitHub in Cloudflare
@@ -81,6 +87,7 @@ This flow intentionally mirrors the convenient GitHub-connected deployment style
 4. Select your repository.
 5. Keep the default build settings, then deploy.
 6. After the first deployment, open the Worker settings and configure the bindings and secrets below.
+7. Make sure the D1 migration has been applied before opening the site, otherwise the Worker will return `500` with errors like `no such table: feed_state`.
 
 ---
 
@@ -154,7 +161,26 @@ Then open the local Wrangler URL.
 
 ---
 
-## 7. What the project does
+## 7. First-run production checklist
+
+1. Confirm `wrangler.jsonc` contains the real D1 `database_id`.
+2. Run remote migration once:
+
+```bash
+npm run db:migrate:remote
+```
+
+3. Or deploy with migration in one step:
+
+```bash
+npm run deploy:remote
+```
+
+4. Open the Worker URL after migration is complete.
+
+---
+
+## 8. What the project does
 
 - Polls `https://rss.nodeseek.com/` every minute using a cron trigger.
 - On first ingest, stores every item currently exposed by the RSS feed.
@@ -171,7 +197,7 @@ Then open the local Wrangler URL.
 
 ---
 
-## 8. Project structure
+## 9. Project structure
 
 ```text
 nodeseek-rss-architect/
@@ -198,7 +224,7 @@ nodeseek-rss-architect/
 
 ---
 
-## 9. Browser support targets
+## 10. Browser support targets
 
 - Chrome / Chromium
 - Firefox
