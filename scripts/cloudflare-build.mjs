@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const databaseName = process.env.D1_DATABASE_NAME || "nodeseek-rss-reader";
-const generatedConfig = resolve(root, ".wrangler/generated-wrangler.jsonc");
+const generatedConfig = resolve(root, "wrangler.generated.jsonc");
 
 function run(args, options = {}) {
   const result = spawnSync(process.platform === "win32" ? "npx.cmd" : "npx", ["wrangler", ...args], {
@@ -68,7 +68,7 @@ async function writeGeneratedConfig(databaseId) {
   const config = `{
   "$schema": "../node_modules/wrangler/config-schema.json",
   "name": "nodeseek-rss-reader",
-  "main": "../src/index.ts",
+  "main": "src/index.ts",
   "compatibility_date": "2026-04-24",
   "triggers": {
     "crons": ["*/1 * * * *"]

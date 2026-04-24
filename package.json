@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "cf:build": "node scripts/cloudflare-build.mjs",
-    "deploy": "npm run cf:build && wrangler deploy --config .wrangler/generated-wrangler.jsonc",
-    "deploy:generated": "wrangler deploy --config .wrangler/generated-wrangler.jsonc",
+    "deploy": "npm run cf:build && wrangler deploy --config wrangler.generated.jsonc",
+    "deploy:generated": "wrangler deploy --config wrangler.generated.jsonc",
     "db:migrate:local": "wrangler d1 migrations apply nodeseek-rss-reader --local",
     "db:migrate": "wrangler d1 migrations apply nodeseek-rss-reader --remote",
     "typecheck": "tsc --noEmit"

@@ -1,5 +1,6 @@
 node_modules/
 .wrangler/
+wrangler.generated.jsonc
 .dev.vars
 dist/
 .DS_Store

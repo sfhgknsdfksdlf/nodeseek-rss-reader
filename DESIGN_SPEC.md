@@ -88,7 +88,7 @@ The build command runs `scripts/cloudflare-build.mjs`, which:
 
 - Uses Wrangler to find a D1 database named `nodeseek-rss-reader`.
 - Creates that D1 database automatically if it does not exist.
-- Generates `.wrangler/generated-wrangler.jsonc` with the discovered `database_id`.
+- Generates `wrangler.generated.jsonc` with the discovered `database_id`.
 - Applies D1 migrations to the remote database.
 - Runs a Wrangler deploy dry-run against the generated config to validate the Worker bundle.
 

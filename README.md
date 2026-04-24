@@ -53,7 +53,7 @@ npm run deploy
 
 - 查询当前 Cloudflare 账号下是否已有 `nodeseek-rss-reader` D1 数据库。
 - 不存在时自动创建该 D1 数据库。
-- 生成 `.wrangler/generated-wrangler.jsonc`。
+- 生成 `wrangler.generated.jsonc`。
 - 自动执行 `migrations/0001_initial.sql`。
 - 执行 Worker 打包 dry-run 校验。
 - 使用自动生成的配置部署 Worker。
