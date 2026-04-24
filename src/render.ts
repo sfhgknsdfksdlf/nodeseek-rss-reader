@@ -21,7 +21,7 @@ function pager(data: PageData): string {
 
 function renderPost(post: Post, groups: Awaited<ReturnType<typeof getHighlightGroups>>): string {
   const title = highlightText(post.title, groups);
-  return `<article class="card ${post.is_read ? "read" : ""}" data-open="/post/${post.id}/open"><div class="title">${title}</div><div class="body">${post.content_html}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
+  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-open="/post/${post.id}/open"><div class="title">${title}</div><div class="body">${post.content_html}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
 }
 
 export async function renderHome(env: Env, user: User | null, data: PageData): Promise<Response> {
@@ -47,7 +47,8 @@ document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.closest('di
 document.querySelectorAll('[data-auth]').forEach(f=>f.onsubmit=async e=>{e.preventDefault();const r=await fetch(f.dataset.auth,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))});if(r.ok) location.reload(); else alert((await r.json()).error||'失败')});
 document.getElementById('logout')?.addEventListener('click',async()=>{await fetch('/api/auth/logout',{method:'POST'});location.reload()});
 document.querySelectorAll('[data-put]').forEach(f=>f.onsubmit=async e=>{e.preventDefault();const r=await fetch(f.dataset.put,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))});alert(r.ok?'已保存':((await r.json()).error||'失败'))});
-document.querySelectorAll('.card').forEach(c=>c.addEventListener('click',e=>{if(e.target.closest('[data-copy]'))return;c.classList.add('read');window.open(c.dataset.open,'_blank','noopener')}));
+const boardSelect=document.querySelector('.toolbar select[name="board"]');boardSelect?.addEventListener('change',()=>{if(boardSelect.form.requestSubmit)boardSelect.form.requestSubmit();else boardSelect.form.submit()});
+document.querySelectorAll('.card').forEach(c=>{const id=c.dataset.postId;if(id&&localStorage.getItem('read:'+id))c.classList.add('read');c.addEventListener('click',e=>{if(e.target.closest('[data-copy]'))return;c.classList.add('read');if(id){localStorage.setItem('read:'+id,'1');fetch('/api/read-state',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({postId:Number(id)})}).catch(()=>{})}window.open(c.dataset.open,'_blank','noopener')})});
 document.querySelectorAll('[data-copy]').forEach(b=>b.onclick=async e=>{e.stopPropagation();const v=b.dataset.copy||'';try{await navigator.clipboard.writeText(v)}catch{const i=document.createElement('input');i.value=v;document.body.append(i);i.select();document.execCommand('copy');i.remove()}});
 document.getElementById('toTop').onclick=()=>scrollTo({top:0,behavior:'smooth'});document.getElementById('toBottom').onclick=()=>scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
 async function api(method,url,body){const r=await fetch(url,{method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)alert((await r.json()).error||'失败');return r}
