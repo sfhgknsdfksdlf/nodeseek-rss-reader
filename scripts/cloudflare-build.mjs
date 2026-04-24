@@ -38,6 +38,13 @@ function getDatabaseId(database) {
   return database.uuid || database.id || database.database_id;
 }
 
+function parseDatabaseIdFromCreateOutput(output) {
+  const uuid = /database_id\s*=\s*"([0-9a-f-]{32,36})"/i.exec(output)?.[1]
+    || /"database_id"\s*:\s*"([0-9a-f-]{32,36})"/i.exec(output)?.[1]
+    || /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(output)?.[1];
+  return uuid || "";
+}
+
 function findDatabase(databases) {
   return databases.find((db) => db.name === databaseName || db.database_name === databaseName);
 }
@@ -46,9 +53,11 @@ async function ensureDatabase() {
   const listOutput = run(["d1", "list", "--json"], { capture: true });
   let database = findDatabase(normalizeList(parseJsonOutput(listOutput)));
   if (!database) {
-    const createOutput = run(["d1", "create", databaseName, "--json"], { capture: true });
-    const created = parseJsonOutput(createOutput);
-    database = Array.isArray(created) ? created[0] : created.result || created;
+    const createOutput = run(["d1", "create", databaseName], { capture: true });
+    const databaseId = parseDatabaseIdFromCreateOutput(createOutput);
+    if (databaseId) return databaseId;
+    const refreshedListOutput = run(["d1", "list", "--json"], { capture: true });
+    database = findDatabase(normalizeList(parseJsonOutput(refreshedListOutput)));
   }
   const databaseId = getDatabaseId(database);
   if (!databaseId) throw new Error(`Could not determine D1 database_id for ${databaseName}`);
