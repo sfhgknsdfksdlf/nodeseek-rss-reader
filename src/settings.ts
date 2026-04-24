@@ -1,7 +1,6 @@
-import { clearSessionCookie, getCookie, json, nowIso, one, setSessionCookie } from "./db";
+import { json, nowIso, one } from "./db";
 import type { Env } from "./types";
 
-const adminSessionDays = 7;
 const encryptedKeys = new Set(["brevo_api_key", "telegram_bot_token"]);
 
 export interface RuntimeSettings {
@@ -12,12 +11,6 @@ export interface RuntimeSettings {
   readStateRetentionDays: number;
   postRetentionDays: number;
   pushLogRetentionDays: number;
-}
-
-function randomToken(bytes = 32): string {
-  const arr = new Uint8Array(bytes);
-  crypto.getRandomValues(arr);
-  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -104,31 +97,29 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
   };
 }
 
-export async function isAdmin(request: Request, env: Env): Promise<boolean> {
-  const sessionId = getCookie(request, "admin_session");
-  if (!sessionId) return false;
-  const row = await one<{ id: string }>(env.DB.prepare("SELECT id FROM admin_sessions WHERE id = ? AND expires_at > ?").bind(sessionId, nowIso()));
-  return !!row;
+function tokenFromRequest(request: Request): string {
+  return new URL(request.url).searchParams.get("token") || request.headers.get("x-admin-token") || "";
 }
 
-export async function adminStatus(request: Request, env: Env): Promise<{ adminSecretConfigured: boolean; adminAuthenticated: boolean }> {
-  return { adminSecretConfigured: !!env.ADMIN_SECRET, adminAuthenticated: await isAdmin(request, env) };
+export function isAdmin(request: Request, env: Env): boolean {
+  return !!env.ADMIN_SECRET && tokenFromRequest(request) === env.ADMIN_SECRET;
+}
+
+export function adminStatus(request: Request, env: Env): { adminSecretConfigured: boolean; adminAuthenticated: boolean } {
+  return { adminSecretConfigured: !!env.ADMIN_SECRET, adminAuthenticated: isAdmin(request, env) };
 }
 
 export async function handleAdmin(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (!env.ADMIN_SECRET) {
-    return new Response(`<!doctype html><meta charset="utf-8"><title>管理员配置</title><body style="font-family:system-ui;margin:2rem;line-height:1.7"><h1>管理员功能未启用</h1><p>请在 Cloudflare Worker Secrets 中添加 <code>ADMIN_SECRET</code>，建议使用 32 字符以上随机字符串，然后重新部署。</p><p>部署后访问 <code>/admin?token=你的ADMIN_SECRET</code>，并保存该管理入口为书签。</p></body>`, { status: 503, headers: { "content-type": "text/html; charset=utf-8" } });
+    return new Response(adminSetupHtml(), { status: 503, headers: { "content-type": "text/html; charset=utf-8" } });
   }
-  if (url.searchParams.get("token") !== env.ADMIN_SECRET) return new Response("Forbidden", { status: 403 });
-  const id = randomToken();
-  const expires = new Date(Date.now() + adminSessionDays * 86400 * 1000);
-  await env.DB.prepare("INSERT INTO admin_sessions (id, expires_at, created_at) VALUES (?, ?, ?)").bind(id, expires.toISOString(), nowIso()).run();
-  return new Response("", { status: 302, headers: { location: "/", "set-cookie": setSessionCookie(id, expires).replace("session=", "admin_session=") } });
+  if (url.searchParams.get("token") !== env.ADMIN_SECRET) return new Response(adminSetupHtml("管理链接中的 token 不正确。"), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(adminPageHtml(url.searchParams.get("token") || ""), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 
 export async function adminSettingsResponse(request: Request, env: Env): Promise<Response> {
-  if (!(await isAdmin(request, env))) return json({ admin: false, adminSecretConfigured: !!env.ADMIN_SECRET }, 401);
+  if (!isAdmin(request, env)) return json({ admin: false, adminSecretConfigured: !!env.ADMIN_SECRET }, 401);
   const settings = await runtimeSettings(env);
   return json({
     admin: true,
@@ -144,7 +135,7 @@ export async function adminSettingsResponse(request: Request, env: Env): Promise
 }
 
 export async function updateAdminSettings(request: Request, env: Env): Promise<Response> {
-  if (!(await isAdmin(request, env))) return json({ error: "管理员认证已过期，请重新打开管理书签" }, 401);
+  if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确，请打开 /admin?token=你的ADMIN_SECRET" }, 401);
   const body = (await request.json().catch(() => ({}))) as {
     mailFrom?: unknown;
     mailFromName?: unknown;
@@ -166,8 +157,11 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
   return json({ ok: true });
 }
 
-export async function logoutAdmin(request: Request, env: Env): Promise<Response> {
-  const sessionId = getCookie(request, "admin_session");
-  if (sessionId) await env.DB.prepare("DELETE FROM admin_sessions WHERE id = ?").bind(sessionId).run();
-  return json({ ok: true }, 200, { "set-cookie": clearSessionCookie().replace("session=", "admin_session=") });
+function adminSetupHtml(error = ""): string {
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeSeek RSS Reader 管理员设置</title><style>body{font-family:system-ui;margin:0;background:#f8f8f8;color:#111}.wrap{max-width:760px;margin:0 auto;padding:18px}.card{background:#fff;border:1px solid #ddd;border-radius:18px;padding:14px}.code{font-weight:700;background:#eee;border-radius:8px;padding:.1rem .35rem;cursor:pointer}button{border:1px solid #ddd;border-radius:12px;background:#fff;padding:.35rem .55rem}li{margin:.35rem 0}.err{color:#d71920}@media(prefers-color-scheme:dark){body{background:#000;color:#f5f5f5}.card{background:#000;border-color:#2a2a2a}.code{background:#222}}</style><body><main class="wrap"><h1>管理员设置</h1>${error ? `<p class="err">${error}</p>` : ""}<section class="card"><p>请在 Cloudflare Worker 中添加一个 Secret。</p><ol><li>打开 Cloudflare 控制台。</li><li>进入「Workers 和 Pages / Workers & Pages」。</li><li>点击当前 Worker：<span class="code">nodeseek-rss-reader</span>。</li><li>打开「设置 / Settings」。</li><li>打开「变量和机密 / Variables and Secrets」。</li><li>点击「添加 / Add」。</li><li>类型选择「机密 / Secret」。</li><li>「变量名称 / Variable name」填 <span class="code" data-copy="ADMIN_SECRET">ADMIN_SECRET</span> <button data-copy="ADMIN_SECRET">复制</button>。</li><li>「值 / Value」填 32-64 位小写字母数字，例如 <span class="code" data-copy="r7m4qp9vz2kx8nw6ta3yh5bc1ls0defg">r7m4qp9vz2kx8nw6ta3yh5bc1ls0defg</span> <button data-copy="r7m4qp9vz2kx8nw6ta3yh5bc1ls0defg">复制</button>。</li><li>保存前复制并安全保存这个值；Cloudflare 保存后不会再显示明文。</li><li>点击输入框下方的空白处，让「保存 / Save」按钮变亮。</li><li>点击「保存 / Save」；如果弹出部署选择，点击「不部署 / Do not deploy」即可生效。</li><li>打开 <span class="code">/admin?token=你的ADMIN_SECRET</span>，并保存完整链接为书签。</li></ol><p>推荐只用小写字母和数字。URL 的域名不区分大小写，但 <code>token</code> 参数值区分大小写；不推荐特殊字符。</p></section></main><script>document.querySelectorAll('[data-copy]').forEach(el=>el.onclick=async()=>{await navigator.clipboard.writeText(el.dataset.copy);el.textContent='已复制'})</script></body></html>`;
+}
+
+function adminPageHtml(token: string): string {
+  const safeToken = token.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch));
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeSeek RSS Reader 管理员</title><style>:root{color-scheme:light dark}body{font-family:system-ui;margin:0;background:#f8f8f8;color:#111}.wrap{max-width:760px;margin:0 auto;padding:14px}.card{display:grid;gap:10px;background:#fff;border:1px solid #ddd;border-radius:18px;padding:14px}input,button{font:inherit;border:1px solid #ddd;border-radius:12px;padding:.5rem}.primary{background:#1663ff;border-color:#1663ff;color:#fff}label{display:grid;gap:4px}.muted{color:#666}@media(prefers-color-scheme:dark){body{background:#000;color:#f5f5f5}.card,input,button{background:#000;color:#f5f5f5;border-color:#2a2a2a}.muted{color:#aaa}}</style><body><main class="wrap"><h1>管理员配置</h1><form class="card" id="adminForm"><label>Brevo API Key<input name="brevoApiKey" id="brevoApiKey"></label><label>发件邮箱<input name="mailFrom" id="mailFrom"></label><label>发件人名称<input name="mailFromName" id="mailFromName"></label><label>Telegram Bot Token<input name="telegramBotToken" id="telegramBotToken"></label><label>已读保留天数<input name="readStateRetentionDays" id="readStateRetentionDays" type="number" min="1" max="3650"></label><label>RSS帖子保留天数<input name="postRetentionDays" id="postRetentionDays" type="number" min="1" max="3650"></label><label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label><button class="primary">保存</button><a href="/">返回阅读器</a><p class="muted">管理链接包含 SECRET，请不要分享。请保存当前完整链接为书签。</p></form></main><script>const token='${safeToken}';const $=s=>document.querySelector(s);function toast(m){alert(m)}async function load(){const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token));if(!r.ok){toast('管理员 token 不正确');return}const s=await r.json();$('#brevoApiKey').placeholder=s.brevoApiKeyConfigured?'已配置，留空不修改':'未配置';$('#telegramBotToken').placeholder=s.telegramBotTokenConfigured?'已配置，留空不修改':'未配置';$('#mailFrom').value=s.mailFrom||'';$('#mailFromName').value=s.mailFromName||'';$('#readStateRetentionDays').value=s.readStateRetentionDays;$('#postRetentionDays').value=s.postRetentionDays;$('#pushLogRetentionDays').value=s.pushLogRetentionDays}$('#adminForm').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));body.readStateRetentionDays=Number(body.readStateRetentionDays);body.postRetentionDays=Number(body.postRetentionDays);body.pushLogRetentionDays=Number(body.pushLogRetentionDays);const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});toast(r.ok?'已保存':'保存失败')};load()</script></body></html>`;
 }

@@ -5,7 +5,7 @@ import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { latestUnpushedPosts, safeSyncRss, testRssFetch } from "./rss";
-import { adminSettingsResponse, adminStatus, handleAdmin, logoutAdmin, updateAdminSettings } from "./settings";
+import { adminSettingsResponse, adminStatus, handleAdmin, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
@@ -30,7 +30,6 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   const path = url.pathname;
   if (path === "/api/admin/settings" && request.method === "GET") return adminSettingsResponse(request, env);
   if (path === "/api/admin/settings" && request.method === "PUT") return updateAdminSettings(request, env);
-  if (path === "/api/admin/logout" && request.method === "POST") return logoutAdmin(request, env);
   if (path === "/api/auth/register" && request.method === "POST") return register(request, env);
   if (path === "/api/auth/login" && request.method === "POST") return login(request, env);
   if (path === "/api/auth/logout" && request.method === "POST") return logout(request, env);

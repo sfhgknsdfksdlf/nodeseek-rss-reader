@@ -78,21 +78,21 @@ npm run deploy
 npx wrangler secret put ADMIN_SECRET
 ```
 
-`ADMIN_SECRET` 建议使用 32-64 位随机字母数字。可以包含特殊字符，但不推荐；如果使用特殊字符，放进 `/admin?token=...` 时必须 URL 编码。避免使用空格和这些容易影响 URL/Shell 的字符：`?`、`#`、`&`、`%`、`=`、`+`、`/`、`\`、引号、反引号、`<`、`>`。
+`ADMIN_SECRET` 建议使用 32-64 位小写字母和数字。URL 的域名不区分大小写，但 `token` 参数值区分大小写；为了减少复制和输入错误，推荐只用小写字母和数字。可以包含特殊字符，但不推荐；如果使用特殊字符，放进 `/admin?token=...` 时必须 URL 编码。避免使用空格和这些容易影响 URL/Shell 的字符：`?`、`#`、`&`、`%`、`=`、`+`、`/`、`\`、引号、反引号、`<`、`>`。
 
 推荐示例：
 
 ```text
-R7m4Qp9Vz2Kx8Nw6Ta3Yh5Bc1Ls0DeFg
+r7m4qp9vz2kx8nw6ta3yh5bc1ls0defg
 ```
 
-Cloudflare 保存 Secret 后不会再显示明文，保存前请复制到密码管理器或安全位置。添加后重新部署，然后访问：
+Cloudflare 保存 Secret 后不会再显示明文，保存前请复制到密码管理器或安全位置。添加后点击输入框下方空白处，让「保存 / Save」按钮变亮；点击「保存 / Save」后如弹出部署选择，点击「不部署 / Do not deploy」即可生效。然后访问：
 
 ```text
 https://你的域名/admin?token=你的ADMIN_SECRET
 ```
 
-请保存这个管理入口为书签。管理员会话 7 天后过期，过期后重新打开该书签即可认证。
+请保存这个管理入口为书签。管理链接包含 Secret，不要分享给其他人。
 
 也可以继续用 Cloudflare 变量作为 fallback：`BREVO_API_KEY`、`TELEGRAM_BOT_TOKEN`、`MAIL_FROM`、`MAIL_FROM_NAME`。
 
@@ -101,16 +101,16 @@ https://你的域名/admin?token=你的ADMIN_SECRET
 1. 注册 Brevo。
 2. 配置发件邮箱或发信域名。
 3. 创建 SMTP/API Key。
-4. 访问 `/admin?token=你的ADMIN_SECRET` 进入管理员后台。
-5. 在管理员 tab 中填写 Brevo API Key、发件邮箱和发件人名称。
+4. 访问 `/admin?token=你的ADMIN_SECRET` 进入独立管理员页面。
+5. 填写 Brevo API Key、发件邮箱和发件人名称。
 6. 用户在网页设置里绑定自己的收件邮箱。
 
 ## Telegram Bot
 
 1. 在 Telegram 找到 `@BotFather`。
 2. 创建 Bot 并复制 Token。
-3. 访问 `/admin?token=你的ADMIN_SECRET` 进入管理员后台。
-4. 在管理员 tab 中填写 Telegram Bot Token。
+3. 访问 `/admin?token=你的ADMIN_SECRET` 进入独立管理员页面。
+4. 填写 Telegram Bot Token。
 5. 部署完成后，在网页设置里查看自己的绑定码。
 6. 用户向 Bot 发送 `/start 绑定码`。
 7. 也可以直接在网页设置里填写自己的 Chat ID。
@@ -130,7 +130,7 @@ ADMIN_SECRET
 /admin?token=你的ADMIN_SECRET
 ```
 
-认证成功后会写入 7 天有效的管理员 session。请保存完整管理入口为书签，过期后重新打开书签即可。
+访问 URL 中的 `token` 正确时会直接打开独立管理员页面。请保存完整管理入口为书签；管理链接包含 Secret，不要分享给其他人。
 
 管理员后台可配置：
 
