@@ -78,7 +78,15 @@ npm run deploy
 npx wrangler secret put ADMIN_SECRET
 ```
 
-`ADMIN_SECRET` 建议使用 32 字符以上随机字符串。添加后重新部署，然后访问：
+`ADMIN_SECRET` 建议使用 32-64 位随机字母数字。可以包含特殊字符，但不推荐；如果使用特殊字符，放进 `/admin?token=...` 时必须 URL 编码。避免使用空格和这些容易影响 URL/Shell 的字符：`?`、`#`、`&`、`%`、`=`、`+`、`/`、`\`、引号、反引号、`<`、`>`。
+
+推荐示例：
+
+```text
+R7m4Qp9Vz2Kx8Nw6Ta3Yh5Bc1Ls0DeFg
+```
+
+Cloudflare 保存 Secret 后不会再显示明文，保存前请复制到密码管理器或安全位置。添加后重新部署，然后访问：
 
 ```text
 https://你的域名/admin?token=你的ADMIN_SECRET

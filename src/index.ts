@@ -5,7 +5,7 @@ import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { latestUnpushedPosts, safeSyncRss, testRssFetch } from "./rss";
-import { adminSettingsResponse, handleAdmin, logoutAdmin, updateAdminSettings } from "./settings";
+import { adminSettingsResponse, adminStatus, handleAdmin, logoutAdmin, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
@@ -56,8 +56,8 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     const name = (body.name || "").trim();
     const color = /^#[0-9a-f]{6}$/i.test(body.color || "") ? body.color! : "#ffe066";
     if (!name) return json({ error: "分组名不能为空" }, 400);
-    await env.DB.prepare("INSERT INTO highlight_groups (user_id, name, color, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))").bind(me.id, name, color).run();
-    return json({ ok: true });
+    const result = await env.DB.prepare("INSERT INTO highlight_groups (user_id, name, color, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))").bind(me.id, name, color).run();
+    return json({ ok: true, id: Number(result.meta.last_row_id), name, color, patterns: [] });
   }
   const groupMatch = /^\/api\/highlight-groups\/(\d+)(\/clear)?$/.exec(path);
   if (groupMatch) {
@@ -89,8 +89,8 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     const body = await readJson<{ pattern?: string }>(request);
     const pattern = (body.pattern || "").trim();
     if (!safeRegex(pattern)) return json({ error: "正则无效" }, 400);
-    await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(me.id, pattern).run();
-    return json({ ok: true });
+    const result = await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(me.id, pattern).run();
+    return json({ ok: true, id: Number(result.meta.last_row_id), pattern });
   }
   const blockMatch = /^\/api\/block-rules\/(\d+)$/.exec(path);
   if (blockMatch && request.method === "DELETE") {
@@ -193,7 +193,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const link = await markReadAndGetLink(env, user, Number(openMatch[1]));
     return link ? Response.redirect(link, 302) : new Response("Not found", { status: 404 });
   }
-  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) return renderHome(env, user, await queryPosts(env, user, url));
+  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) return renderHome(env, user, await queryPosts(env, user, url), await adminStatus(request, env));
   return new Response("Not found", { status: 404 });
 }
 

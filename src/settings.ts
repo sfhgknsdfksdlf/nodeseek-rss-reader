@@ -111,6 +111,10 @@ export async function isAdmin(request: Request, env: Env): Promise<boolean> {
   return !!row;
 }
 
+export async function adminStatus(request: Request, env: Env): Promise<{ adminSecretConfigured: boolean; adminAuthenticated: boolean }> {
+  return { adminSecretConfigured: !!env.ADMIN_SECRET, adminAuthenticated: await isAdmin(request, env) };
+}
+
 export async function handleAdmin(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (!env.ADMIN_SECRET) {
