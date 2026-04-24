@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nodeseek-rss-reader",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-24",
+  "triggers": {
+    "crons": ["*/1 * * * *"]
+  },
+  "vars": {
+    "RSS_URL": "https://rss.nodeseek.com/",
+    "ADMIN_USERNAME": "admin",
+    "MAIL_PROVIDER": "brevo"
+  }
+}

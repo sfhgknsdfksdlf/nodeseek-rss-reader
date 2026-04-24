@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader">
+  <rect width="128" height="128" rx="30" fill="#fff"/>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/>
+  <path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/>
+  <circle cx="38" cy="91" r="8" fill="#111"/>
+  <path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/>
+  <path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/>
+</svg>
