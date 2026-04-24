@@ -96,7 +96,7 @@ async function main() {
   const databaseId = await ensureDatabase();
   await writeGeneratedConfig(databaseId);
   console.log(`Generated ${generatedConfig}`);
-  run(["d1", "migrations", "apply", databaseName, "--remote"]);
+  run(["d1", "migrations", "apply", databaseName, "--remote", "--config", generatedConfig]);
   run(["deploy", "--dry-run", "--config", generatedConfig]);
 }
 
