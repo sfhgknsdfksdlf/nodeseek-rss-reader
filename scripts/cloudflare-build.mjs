@@ -101,9 +101,9 @@ function verifyMigratedDatabase() {
     "--config",
     generatedConfig,
     "--command",
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('posts', 'users', 'sync_state') ORDER BY name;"
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('posts', 'users', 'sync_state', 'app_settings', 'admin_sessions') ORDER BY name;"
   ], { capture: true });
-  for (const table of ["posts", "users", "sync_state"]) {
+  for (const table of ["posts", "users", "sync_state", "app_settings", "admin_sessions"]) {
     if (!output.includes(table)) throw new Error(`D1 migration verification failed: missing table ${table}`);
   }
 }

@@ -7,6 +7,10 @@ export interface Env {
   BREVO_API_KEY?: string;
   MAIL_FROM?: string;
   MAIL_FROM_NAME?: string;
+  ADMIN_SECRET?: string;
+  READ_STATE_RETENTION_DAYS?: string;
+  POST_RETENTION_DAYS?: string;
+  PUSH_LOG_RETENTION_DAYS?: string;
 }
 
 export interface User {

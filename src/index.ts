@@ -1,9 +1,11 @@
 import { currentUser, login, logout, register, updateEmail, updateTelegram } from "./auth";
+import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { latestUnpushedPosts, safeSyncRss, testRssFetch } from "./rss";
+import { adminSettingsResponse, handleAdmin, logoutAdmin, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
@@ -26,6 +28,9 @@ async function listHighlights(env: Env, user: User): Promise<Response> {
 
 async function handleApi(request: Request, env: Env, user: User | null, url: URL): Promise<Response> {
   const path = url.pathname;
+  if (path === "/api/admin/settings" && request.method === "GET") return adminSettingsResponse(request, env);
+  if (path === "/api/admin/settings" && request.method === "PUT") return updateAdminSettings(request, env);
+  if (path === "/api/admin/logout" && request.method === "POST") return logoutAdmin(request, env);
   if (path === "/api/auth/register" && request.method === "POST") return register(request, env);
   if (path === "/api/auth/login" && request.method === "POST") return login(request, env);
   if (path === "/api/auth/logout" && request.method === "POST") return logout(request, env);
@@ -102,7 +107,47 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   if (path === "/api/export/highlights") return listHighlights(env, me);
   if (path === "/api/export/blocks") return json(await all(env.DB.prepare("SELECT pattern FROM block_rules WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
   if (path === "/api/export/subscriptions") return json(await all(env.DB.prepare("SELECT pattern, send_email, send_telegram FROM subscriptions WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
+  if (path === "/api/import/highlights" && request.method === "POST") return importHighlights(request, env, me);
+  if (path === "/api/import/blocks" && request.method === "POST") return importBlocks(request, env, me);
+  if (path === "/api/import/subscriptions" && request.method === "POST") return importSubscriptions(request, env, me);
   return json({ error: "Not found" }, 404);
+}
+
+async function importHighlights(request: Request, env: Env, user: User): Promise<Response> {
+  const body = await readJson<{ groups?: Array<{ name?: string; color?: string; patterns?: string[] }> }>(request);
+  await env.DB.prepare("DELETE FROM highlight_rules WHERE group_id IN (SELECT id FROM highlight_groups WHERE user_id = ?)").bind(user.id).run();
+  await env.DB.prepare("DELETE FROM highlight_groups WHERE user_id = ?").bind(user.id).run();
+  for (const group of body.groups || []) {
+    const name = String(group.name || "未命名").trim() || "未命名";
+    const color = /^#[0-9a-f]{6}$/i.test(String(group.color || "")) ? String(group.color) : "#ffe066";
+    const result = await env.DB.prepare("INSERT INTO highlight_groups (user_id, name, color, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))").bind(user.id, name, color).run();
+    const groupId = Number(result.meta.last_row_id);
+    for (const pattern of group.patterns || []) {
+      const p = String(pattern).trim();
+      if (p && p.length <= 200 && safeRegex(p)) await env.DB.prepare("INSERT INTO highlight_rules (group_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(groupId, p).run();
+    }
+  }
+  return json({ ok: true });
+}
+
+async function importBlocks(request: Request, env: Env, user: User): Promise<Response> {
+  const body = await readJson<{ patterns?: string[] }>(request);
+  await env.DB.prepare("DELETE FROM block_rules WHERE user_id = ?").bind(user.id).run();
+  for (const pattern of body.patterns || []) {
+    const p = String(pattern).trim();
+    if (p && p.length <= 200 && safeRegex(p)) await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(user.id, p).run();
+  }
+  return json({ ok: true });
+}
+
+async function importSubscriptions(request: Request, env: Env, user: User): Promise<Response> {
+  const body = await readJson<{ rules?: Array<{ pattern?: string; sendEmail?: boolean; sendTelegram?: boolean }> }>(request);
+  await env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ?").bind(user.id).run();
+  for (const rule of body.rules || []) {
+    const pattern = String(rule.pattern || "").trim();
+    if (pattern && pattern.length <= 200 && safeRegex(pattern)) await env.DB.prepare("INSERT INTO subscriptions (user_id, pattern, send_email, send_telegram, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))").bind(user.id, pattern, rule.sendEmail === false ? 0 : 1, rule.sendTelegram === false ? 0 : 1).run();
+  }
+  return json({ ok: true });
 }
 
 async function handleTelegram(request: Request, env: Env): Promise<Response> {
@@ -139,6 +184,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/manifest.webmanifest") return json(manifest, 200, { "cache-control": "public, max-age=86400" });
   if (url.pathname === "/health") return health(env);
   if (!env.DB) return missingDbResponse(request);
+  if (url.pathname === "/admin") return handleAdmin(request, env);
   const user = await currentUser(request, env);
   if (url.pathname.startsWith("/api/")) return handleApi(request, env, user, url);
   if (url.pathname === "/telegram/webhook" && request.method === "POST") return handleTelegram(request, env);
@@ -165,5 +211,6 @@ export default {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
     const result = await safeSyncRss(env);
     if (result.ok && !result.firstSync) await processSubscriptions(env, await latestUnpushedPosts(env));
+    await cleanupOldData(env);
   }
 };

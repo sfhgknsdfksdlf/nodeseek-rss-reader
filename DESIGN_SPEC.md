@@ -47,6 +47,8 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 
 - `users(id, username, password_hash, password_salt, email, telegram_chat_id, telegram_bind_code, created_at, updated_at)`
 - `sessions(id, user_id, expires_at, created_at)`
+- `admin_sessions(id, expires_at, created_at)`
+- `app_settings(key, value, encrypted, updated_at)`
 - `posts(id, guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at)`
 - `read_states(user_id, post_id, opened_at)`
 - `highlight_groups(id, user_id, name, color, created_at, updated_at)`
@@ -95,3 +97,17 @@ The build command runs `scripts/cloudflare-build.mjs`, which:
 `wrangler.jsonc` remains a template for local development and does not contain a manual `database_id` placeholder. `npm run deploy` deploys with the generated config after `npm run cf:build` has prepared it. The Cloudflare GitHub UI only needs this single build command.
 
 If Cloudflare's GitHub build environment does not grant enough Wrangler permission to create or migrate D1, README provides a fallback CLI section, but the primary documented deployment path is still the single build command.
+
+## Admin Settings
+
+Admin access uses a single Cloudflare Secret named `ADMIN_SECRET`. The admin enters `/admin?token=ADMIN_SECRET` to create a 7-day HttpOnly admin session. The UI must tell the admin to bookmark this URL because the session expires after 7 days.
+
+`ADMIN_SECRET` is also used to derive an AES-GCM key for encrypted D1 settings. Brevo API Key and Telegram Bot Token are stored encrypted in `app_settings`. Mail sender, sender name, and retention-day settings are stored as normal app settings. Runtime notification code reads D1 settings first and falls back to environment variables.
+
+Default retention settings:
+
+- Read states: 30 days.
+- RSS posts: 365 days.
+- Push logs: 30 days.
+
+The scheduled task performs cleanup at most once per day using `sync_state.last_cleanup_at`.

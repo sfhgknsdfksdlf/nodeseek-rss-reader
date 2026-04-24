@@ -72,38 +72,69 @@ npm run deploy
 }
 ```
 
-建议设置的 Secrets：
+通知功能可以在网页管理员后台配置。若要启用管理员后台，请在部署后添加一个 Secret：
 
 ```bash
-npx wrangler secret put BREVO_API_KEY
-npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put ADMIN_SECRET
 ```
 
-建议设置的普通变量：
+`ADMIN_SECRET` 建议使用 32 字符以上随机字符串。添加后重新部署，然后访问：
 
 ```text
-MAIL_FROM=你的 Brevo 发件邮箱
-MAIL_FROM_NAME=NodeSeek RSS Reader
+https://你的域名/admin?token=你的ADMIN_SECRET
 ```
+
+请保存这个管理入口为书签。管理员会话 7 天后过期，过期后重新打开该书签即可认证。
+
+也可以继续用 Cloudflare 变量作为 fallback：`BREVO_API_KEY`、`TELEGRAM_BOT_TOKEN`、`MAIL_FROM`、`MAIL_FROM_NAME`。
 
 ## Brevo 邮件
 
 1. 注册 Brevo。
 2. 配置发件邮箱或发信域名。
 3. 创建 SMTP/API Key。
-4. 在 Cloudflare Workers Secrets 中设置 `BREVO_API_KEY`。
-5. 设置 `MAIL_FROM` 为 Brevo 允许的发件邮箱。
+4. 访问 `/admin?token=你的ADMIN_SECRET` 进入管理员后台。
+5. 在管理员 tab 中填写 Brevo API Key、发件邮箱和发件人名称。
 6. 用户在网页设置里绑定自己的收件邮箱。
 
 ## Telegram Bot
 
 1. 在 Telegram 找到 `@BotFather`。
 2. 创建 Bot 并复制 Token。
-3. 设置 Secret：`TELEGRAM_BOT_TOKEN`。
-4. 部署完成后，在网页设置里查看自己的绑定码。
-5. 用户向 Bot 发送 `/start 绑定码`。
-6. 也可以直接在网页设置里填写自己的 Chat ID。
-7. 如需 Webhook，设置为 `https://你的域名/telegram/webhook`。
+3. 访问 `/admin?token=你的ADMIN_SECRET` 进入管理员后台。
+4. 在管理员 tab 中填写 Telegram Bot Token。
+5. 部署完成后，在网页设置里查看自己的绑定码。
+6. 用户向 Bot 发送 `/start 绑定码`。
+7. 也可以直接在网页设置里填写自己的 Chat ID。
+8. 如需 Webhook，设置为 `https://你的域名/telegram/webhook`。
+
+## 管理员后台
+
+管理员后台不需要管理员账号，使用单个 Secret 认证：
+
+```text
+ADMIN_SECRET
+```
+
+访问：
+
+```text
+/admin?token=你的ADMIN_SECRET
+```
+
+认证成功后会写入 7 天有效的管理员 session。请保存完整管理入口为书签，过期后重新打开书签即可。
+
+管理员后台可配置：
+
+- Brevo API Key
+- 发件邮箱
+- 发件人名称
+- Telegram Bot Token
+- 已读状态保留天数，默认 30 天
+- RSS 帖子保留天数，默认 365 天
+- 推送日志保留天数，默认 30 天
+
+敏感配置会使用 `ADMIN_SECRET` 加密后存入 D1。如果更换 `ADMIN_SECRET`，需要重新填写 Brevo API Key 和 Telegram Bot Token。
 
 Webhook 设置示例：
 
