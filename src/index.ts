@@ -3,7 +3,7 @@ import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
-import { latestUnpushedPosts, syncRss } from "./rss";
+import { latestUnpushedPosts, safeSyncRss, testRssFetch } from "./rss";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
@@ -35,6 +35,7 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   const me = user!;
 
   if (path === "/api/posts") return json(await queryPosts(env, me, url));
+  if (path === "/api/rss-test") return json({ results: await testRssFetch(env), timestamp: new Date().toISOString() });
   if (path === "/api/me/email" && request.method === "PUT") return updateEmail(request, env, me);
   if (path === "/api/me/telegram" && request.method === "PUT") return updateTelegram(request, env, me);
   if (path === "/api/highlight-groups" && request.method === "GET") return listHighlights(env, me);
@@ -155,7 +156,7 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
-    const result = await syncRss(env);
-    if (!result.firstSync) await processSubscriptions(env, await latestUnpushedPosts(env));
+    const result = await safeSyncRss(env);
+    if (result.ok && !result.firstSync) await processSubscriptions(env, await latestUnpushedPosts(env));
   }
 };

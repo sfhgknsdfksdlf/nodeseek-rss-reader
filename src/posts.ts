@@ -50,7 +50,8 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
   const filtered = rows.filter((post) => allowedByBlocks(post, blocks) && allowedBySearch(post, query));
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const page = Math.min(requestedPage, totalPages);
-  return { posts: filtered.slice((page - 1) * pageSize, page * pageSize), page, pageSize, totalPages, board, query };
+  const syncError = filtered.length === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+  return { posts: filtered.slice((page - 1) * pageSize, page * pageSize), page, pageSize, totalPages, board, query, syncError };
 }
 
 export async function markReadAndGetLink(env: Env, user: User | null, postId: number): Promise<string | null> {

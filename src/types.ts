@@ -60,4 +60,5 @@ export interface PageData {
   totalPages: number;
   board: string;
   query: string;
+  syncError?: string;
 }
