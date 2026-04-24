@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const databaseName = process.env.D1_DATABASE_NAME || "nodeseek-rss-reader";
 const generatedConfig = resolve(root, "wrangler.generated.jsonc");
+const rootConfig = resolve(root, "wrangler.jsonc");
 
 function run(args, options = {}) {
   const result = spawnSync(process.platform === "win32" ? "npx.cmd" : "npx", ["wrangler", ...args], {
@@ -66,7 +67,7 @@ async function ensureDatabase() {
 
 async function writeGeneratedConfig(databaseId) {
   const config = `{
-  "$schema": "../node_modules/wrangler/config-schema.json",
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "nodeseek-rss-reader",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-24",
@@ -87,8 +88,24 @@ async function writeGeneratedConfig(databaseId) {
   }
 }
 `;
-  await mkdir(dirname(generatedConfig), { recursive: true });
   await writeFile(generatedConfig, config, "utf8");
+  await writeFile(rootConfig, config, "utf8");
+}
+
+function verifyMigratedDatabase() {
+  const output = run([
+    "d1",
+    "execute",
+    databaseName,
+    "--remote",
+    "--config",
+    generatedConfig,
+    "--command",
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('posts', 'users', 'sync_state') ORDER BY name;"
+  ], { capture: true });
+  for (const table of ["posts", "users", "sync_state"]) {
+    if (!output.includes(table)) throw new Error(`D1 migration verification failed: missing table ${table}`);
+  }
 }
 
 async function main() {
@@ -96,7 +113,10 @@ async function main() {
   const databaseId = await ensureDatabase();
   await writeGeneratedConfig(databaseId);
   console.log(`Generated ${generatedConfig}`);
+  console.log(`Updated ${rootConfig} so Cloudflare deploys with DB binding`);
+  console.log(`D1 binding: DB -> ${databaseName} (${databaseId})`);
   run(["d1", "migrations", "apply", databaseName, "--remote", "--config", generatedConfig]);
+  verifyMigratedDatabase();
   run(["deploy", "--dry-run", "--config", generatedConfig]);
 }
 

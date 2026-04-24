@@ -54,7 +54,9 @@ npm run deploy
 - 查询当前 Cloudflare 账号下是否已有 `nodeseek-rss-reader` D1 数据库。
 - 不存在时自动创建该 D1 数据库。
 - 生成 `wrangler.generated.jsonc`。
+- 同步更新根目录 `wrangler.jsonc`，确保 Cloudflare 最终部署阶段也带有 `DB` 绑定。
 - 自动执行 `migrations/0001_initial.sql`。
+- 验证 `posts`、`users`、`sync_state` 表已经存在。
 - 执行 Worker 打包 dry-run 校验。
 - 使用自动生成的配置部署 Worker。
 
@@ -142,6 +144,32 @@ npm run deploy:generated
 ```
 
 这仍然不需要手动复制 SQL 或手动编辑 `database_id`。
+
+## 部署检查
+
+部署完成后打开：
+
+```text
+https://你的域名/health
+```
+
+正常返回示例：
+
+```json
+{
+  "ok": true,
+  "dbBinding": true,
+  "tables": {
+    "posts": true,
+    "users": true,
+    "sync_state": true
+  }
+}
+```
+
+如果看到 `dbBinding: false`，说明当前 Worker 没有 D1 绑定 `DB`。请确认 Cloudflare 构建命令是 `npm run deploy`，并重新部署。
+
+如果 Cloudflare 面板里有旧 Worker 或旧 Cron 仍在报 `D1 database ... has been deleted`，请删除旧 Worker，或在旧 Worker 的 Triggers 中禁用 Cron。
 
 ## 更新
 

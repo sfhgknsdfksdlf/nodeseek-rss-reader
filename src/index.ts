@@ -7,6 +7,9 @@ import { latestUnpushedPosts, syncRss } from "./rss";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
+const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader"><rect width="128" height="128" rx="30" fill="#fff"/><rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/><path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/><circle cx="38" cy="91" r="8" fill="#111"/><path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/><path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/></svg>`;
+const manifest = { name: "NodeSeek RSS Reader", short_name: "NodeSeek RSS", start_url: "/", display: "standalone", background_color: "#000000", theme_color: "#000000", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
+
 function requireUser(user: User | null): Response | null {
   return user ? null : json({ error: "需要登录" }, 401);
 }
@@ -104,10 +107,30 @@ async function handleTelegram(request: Request, env: Env): Promise<Response> {
   return json({ ok: true });
 }
 
+function missingDbResponse(request: Request): Response {
+  const message = "Cloudflare D1 binding DB is missing. Redeploy with build command `npm run deploy`, or add a D1 binding named DB to this Worker.";
+  if (new URL(request.url).pathname.startsWith("/api/") || new URL(request.url).pathname === "/health") return json({ ok: false, error: message, dbBinding: false }, 500);
+  return new Response(`<!doctype html><meta charset="utf-8"><title>NodeSeek RSS Reader Setup Error</title><body style="font-family:system-ui;margin:2rem;line-height:1.6"><h1>NodeSeek RSS Reader</h1><p>${message}</p><p>Open <code>/health</code> after fixing the binding.</p></body>`, { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+async function health(env: Env): Promise<Response> {
+  if (!env.DB) return json({ ok: false, dbBinding: false, tables: {} }, 500);
+  try {
+    const rows = await all<{ name: string }>(env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('posts', 'users', 'sync_state')"));
+    const names = new Set(rows.map((row) => row.name));
+    const tables = { posts: names.has("posts"), users: names.has("users"), sync_state: names.has("sync_state") };
+    return json({ ok: Object.values(tables).every(Boolean), dbBinding: true, tables }, Object.values(tables).every(Boolean) ? 200 : 500);
+  } catch (error) {
+    return json({ ok: false, dbBinding: true, error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
 async function handleFetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  if (url.pathname === "/icon.svg") return fetch(new URL("../public/icon.svg", import.meta.url));
-  if (url.pathname === "/manifest.webmanifest") return fetch(new URL("../public/manifest.webmanifest", import.meta.url));
+  if (url.pathname === "/icon.svg") return new Response(iconSvg, { headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "public, max-age=86400" } });
+  if (url.pathname === "/manifest.webmanifest") return json(manifest, 200, { "cache-control": "public, max-age=86400" });
+  if (url.pathname === "/health") return health(env);
+  if (!env.DB) return missingDbResponse(request);
   const user = await currentUser(request, env);
   if (url.pathname.startsWith("/api/")) return handleApi(request, env, user, url);
   if (url.pathname === "/telegram/webhook" && request.method === "POST") return handleTelegram(request, env);
@@ -122,9 +145,16 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    return handleFetch(request, env);
+    try {
+      return await handleFetch(request, env);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (new URL(request.url).pathname.startsWith("/api/")) return json({ ok: false, error: message }, 500);
+      return new Response(`<!doctype html><meta charset="utf-8"><title>NodeSeek RSS Reader Error</title><body style="font-family:system-ui;margin:2rem;line-height:1.6"><h1>NodeSeek RSS Reader Error</h1><pre style="white-space:pre-wrap">${message.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch))}</pre><p>Check <code>/health</code> and Cloudflare Worker bindings.</p></body>`, { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
+    }
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
     const result = await syncRss(env);
     if (!result.firstSync) await processSubscriptions(env, await latestUnpushedPosts(env));
   }
