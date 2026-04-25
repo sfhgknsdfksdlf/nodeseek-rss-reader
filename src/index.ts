@@ -5,7 +5,7 @@ import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { safeSyncRss, testRssFetch } from "./rss";
-import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, updateAdminSettings } from "./settings";
+import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
@@ -51,6 +51,10 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   if (notAuthed) return notAuthed;
   const me = user!;
 
+  if (path === "/api/notification-settings") {
+    const settings = await runtimeSettings(env);
+    return json({ telegramBotUsername: settings.telegramBotUsername, telegramBotConfigured: !!settings.telegramBotToken, mailConfigured: !!settings.mailFrom });
+  }
   if (path === "/api/posts") return json(await queryPosts(env, me, url));
   if (path === "/api/rss-test") return json({ results: await testRssFetch(env), timestamp: new Date().toISOString() });
   if (path === "/api/read-state" && request.method === "POST") {
