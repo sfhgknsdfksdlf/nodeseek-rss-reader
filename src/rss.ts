@@ -123,30 +123,36 @@ async function setSyncState(env: Env, key: string, value: string): Promise<void>
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)").bind(key, value, nowIso()).run();
 }
 
-export async function syncRss(env: Env): Promise<{ inserted: number; firstSync: boolean }> {
+export async function syncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; insertedPosts: Post[] }> {
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
   const { xml, strategy } = await fetchRssXml(rssUrl);
   const items = parseItems(xml);
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
   let inserted = 0;
+  const insertedPosts: Post[] = [];
   for (const item of items) {
+    const fetchedAt = nowIso();
     const result = await env.DB.prepare("INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso())
+      .bind(item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, fetchedAt)
       .run();
-    if (result.meta.changes) inserted++;
+    if (result.meta.changes) {
+      inserted++;
+      const post = await one<Post>(env.DB.prepare("SELECT * FROM posts WHERE guid = ?").bind(item.guid));
+      if (post) insertedPosts.push(post);
+    }
   }
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('first_sync_done', '1', ?), ('last_sync_at', ?, ?), ('last_sync_error', '', ?), ('last_sync_strategy', ?, ?)").bind(nowIso(), nowIso(), nowIso(), nowIso(), strategy, nowIso()).run();
-  return { inserted, firstSync: first };
+  return { inserted, firstSync: first, insertedPosts };
 }
 
-export async function safeSyncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; ok: boolean; error?: string }> {
+export async function safeSyncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; insertedPosts: Post[]; ok: boolean; error?: string }> {
   try {
     return { ...(await syncRss(env)), ok: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await setSyncState(env, "last_sync_error", message);
     await setSyncState(env, "last_sync_at", nowIso());
-    return { inserted: 0, firstSync: false, ok: false, error: message };
+    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message };
   }
 }
 
@@ -164,8 +170,4 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
     }
   }
   return results;
-}
-
-export async function latestUnpushedPosts(env: Env): Promise<Post[]> {
-  return all<Post>(env.DB.prepare("SELECT * FROM posts WHERE fetched_at >= datetime('now', '-3 minutes') ORDER BY published_at DESC LIMIT 100"));
 }

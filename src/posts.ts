@@ -1,6 +1,6 @@
 import { all, one } from "./db";
 import { normalizeBoard } from "./board";
-import { postTextForBlock, regexMatches } from "./filters";
+import { postTextForBlock, safeRegex } from "./filters";
 import type { BlockRule, Env, HighlightGroup, PageData, Post, User } from "./types";
 
 export const pageSize = 50;
@@ -12,23 +12,37 @@ export async function getBlockRules(env: Env, user: User | null): Promise<BlockR
 
 export async function getHighlightGroups(env: Env, user: User | null): Promise<HighlightGroup[]> {
   if (!user) return [];
-  const groups = await all<Omit<HighlightGroup, "patterns">>(env.DB.prepare("SELECT id, user_id, name, color FROM highlight_groups WHERE user_id = ? ORDER BY id DESC").bind(user.id));
-  const result: HighlightGroup[] = [];
-  for (const group of groups) {
-    const rules = await all<{ pattern: string }>(env.DB.prepare("SELECT pattern FROM highlight_rules WHERE group_id = ? ORDER BY id DESC").bind(group.id));
-    result.push({ ...group, patterns: rules.map((r) => r.pattern) });
+  const rows = await all<{ id: number; user_id: number; name: string; color: string; pattern: string | null }>(env.DB.prepare(`
+    SELECT hg.id, hg.user_id, hg.name, hg.color, hr.pattern
+    FROM highlight_groups hg
+    LEFT JOIN highlight_rules hr ON hr.group_id = hg.id
+    WHERE hg.user_id = ?
+    ORDER BY hg.id DESC, hr.id DESC
+  `).bind(user.id));
+  const byId = new Map<number, HighlightGroup>();
+  for (const row of rows) {
+    let group = byId.get(row.id);
+    if (!group) {
+      group = { id: row.id, user_id: row.user_id, name: row.name, color: row.color, patterns: [] };
+      byId.set(row.id, group);
+    }
+    if (row.pattern) group.patterns.push(row.pattern);
   }
-  return result;
+  return [...byId.values()];
 }
 
-function allowedByBlocks(post: Post, blocks: BlockRule[]): boolean {
+function allowedByBlocks(post: Post, blocks: RegExp[]): boolean {
   const text = postTextForBlock(post);
-  return !blocks.some((rule) => regexMatches(rule.pattern, text));
+  return !blocks.some((rule) => rule.test(text));
 }
 
-function allowedBySearch(post: Post, query: string): boolean {
-  if (!query) return true;
-  return regexMatches(query, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`);
+function postTextForSearch(post: Post): string {
+  return `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`;
+}
+
+function allowedBySearch(post: Post, queryRegex: RegExp | null): boolean {
+  if (!queryRegex) return true;
+  return queryRegex.test(postTextForSearch(post));
 }
 
 export async function queryPosts(env: Env, user: User | null, url: URL): Promise<PageData> {
@@ -37,6 +51,8 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
   const urlPage = /\/page\/(\d+)/.exec(url.pathname)?.[1];
   const requestedPage = Math.max(1, Number(url.searchParams.get("page") || urlPage || "1") || 1);
   const blocks = await getBlockRules(env, user);
+  const blockRegexes = blocks.map((rule) => safeRegex(rule.pattern)).filter((rule): rule is RegExp => !!rule);
+  const queryRegex = query ? safeRegex(query) : null;
   if (!query && blocks.length === 0) {
     const where = board ? "WHERE board_key = ?" : "";
     const countArgs = board ? [board] : [];
@@ -70,19 +86,28 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
     args.push(board);
   }
   sql += "ORDER BY p.published_at DESC LIMIT ? OFFSET ?";
-  const rows: Post[] = [];
   const chunkSize = 500;
+  let matched = 0;
+  const pagePosts: Post[] = [];
+  const lastPagePosts: Post[] = [];
+  const start = (requestedPage - 1) * pageSize;
+  const end = start + pageSize;
   for (let offset = 0; ; offset += chunkSize) {
     const chunk = await all<Post>(env.DB.prepare(sql).bind(...args, chunkSize, offset));
     if (!chunk.length) break;
-    rows.push(...chunk);
+    for (const post of chunk) {
+      if (!allowedByBlocks(post, blockRegexes) || !allowedBySearch(post, queryRegex)) continue;
+      if (matched >= start && matched < end) pagePosts.push(post);
+      lastPagePosts.push(post);
+      if (lastPagePosts.length > pageSize) lastPagePosts.shift();
+      matched++;
+    }
     if (chunk.length < chunkSize) break;
   }
-  const filtered = rows.filter((post) => allowedByBlocks(post, blocks) && allowedBySearch(post, query));
-  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(matched / pageSize));
   const page = Math.min(requestedPage, totalPages);
-  const syncError = filtered.length === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
-  return { posts: filtered.slice((page - 1) * pageSize, page * pageSize), page, pageSize, totalPages, board, query, syncError };
+  const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+  return { posts: page === requestedPage ? pagePosts : lastPagePosts, page, pageSize, totalPages, board, query, syncError };
 }
 
 export async function markReadAndGetLink(env: Env, user: User | null, postId: number): Promise<string | null> {

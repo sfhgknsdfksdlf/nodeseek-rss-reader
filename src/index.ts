@@ -4,7 +4,7 @@ import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
-import { latestUnpushedPosts, safeSyncRss, testRssFetch } from "./rss";
+import { safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
@@ -17,13 +17,23 @@ function requireUser(user: User | null): Response | null {
 }
 
 async function listHighlights(env: Env, user: User): Promise<Response> {
-  const groups = await all<{ id: number; user_id: number; name: string; color: string }>(env.DB.prepare("SELECT id, user_id, name, color FROM highlight_groups WHERE user_id = ? ORDER BY id DESC").bind(user.id));
-  const out = [];
-  for (const group of groups) {
-    const rules = await all<{ pattern: string }>(env.DB.prepare("SELECT pattern FROM highlight_rules WHERE group_id = ? ORDER BY id DESC").bind(group.id));
-    out.push({ ...group, patterns: rules.map((r) => r.pattern) });
+  const rows = await all<{ id: number; user_id: number; name: string; color: string; pattern: string | null }>(env.DB.prepare(`
+    SELECT hg.id, hg.user_id, hg.name, hg.color, hr.pattern
+    FROM highlight_groups hg
+    LEFT JOIN highlight_rules hr ON hr.group_id = hg.id
+    WHERE hg.user_id = ?
+    ORDER BY hg.id DESC, hr.id DESC
+  `).bind(user.id));
+  const byId = new Map<number, { id: number; user_id: number; name: string; color: string; patterns: string[] }>();
+  for (const row of rows) {
+    let group = byId.get(row.id);
+    if (!group) {
+      group = { id: row.id, user_id: row.user_id, name: row.name, color: row.color, patterns: [] };
+      byId.set(row.id, group);
+    }
+    if (row.pattern) group.patterns.push(row.pattern);
   }
-  return json(out);
+  return json([...byId.values()]);
 }
 
 async function handleApi(request: Request, env: Env, user: User | null, url: URL): Promise<Response> {
@@ -212,7 +222,7 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
     const result = await safeSyncRss(env);
-    if (result.ok && !result.firstSync) await processSubscriptions(env, await latestUnpushedPosts(env));
+    if (result.ok && !result.firstSync) await processSubscriptions(env, result.insertedPosts);
     await cleanupOldData(env);
   }
 };

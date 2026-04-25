@@ -1,5 +1,6 @@
 import { nowIso } from "./db";
 import { runtimeSettings } from "./settings";
+import type { RuntimeSettings } from "./settings";
 import type { Env, Post, Subscription, User } from "./types";
 
 async function logPush(env: Env, userId: number, subscriptionId: number, postId: number, channel: string, status: string, error = ""): Promise<void> {
@@ -8,8 +9,8 @@ async function logPush(env: Env, userId: number, subscriptionId: number, postId:
     .run();
 }
 
-export async function sendBrevo(env: Env, user: User, sub: Subscription, post: Post): Promise<void> {
-  const settings = await runtimeSettings(env);
+export async function sendBrevo(env: Env, user: User, sub: Subscription, post: Post, cachedSettings?: RuntimeSettings): Promise<void> {
+  const settings = cachedSettings || await runtimeSettings(env);
   if (!settings.brevoApiKey || !settings.mailFrom || !user.email) return;
   try {
     const res = await fetch("https://api.brevo.com/v3/smtp/email", {
@@ -28,8 +29,8 @@ export async function sendBrevo(env: Env, user: User, sub: Subscription, post: P
   }
 }
 
-export async function sendTelegram(env: Env, user: User, sub: Subscription, post: Post): Promise<void> {
-  const settings = await runtimeSettings(env);
+export async function sendTelegram(env: Env, user: User, sub: Subscription, post: Post, cachedSettings?: RuntimeSettings): Promise<void> {
+  const settings = cachedSettings || await runtimeSettings(env);
   if (!settings.telegramBotToken || !user.telegram_chat_id) return;
   try {
     const text = `NodeSeek 订阅命中\n${post.title}\n${post.link}`;
