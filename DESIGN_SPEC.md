@@ -106,7 +106,7 @@ Admin access uses a single Cloudflare Secret named `ADMIN_SECRET`. The admin ent
 
 Default retention settings:
 
-- Read states: 30 days.
+- Read states: 7 days.
 - RSS posts: 365 days.
 - Push logs: 30 days.
 

@@ -37,6 +37,30 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
   const urlPage = /\/page\/(\d+)/.exec(url.pathname)?.[1];
   const requestedPage = Math.max(1, Number(url.searchParams.get("page") || urlPage || "1") || 1);
   const blocks = await getBlockRules(env, user);
+  if (!query && blocks.length === 0) {
+    const where = board ? "WHERE board_key = ?" : "";
+    const countArgs = board ? [board] : [];
+    const total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${where}`).bind(...countArgs)))?.count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(requestedPage, totalPages);
+    const offset = (page - 1) * pageSize;
+    const args: unknown[] = [];
+    let sql = "SELECT p.*, " + (user ? "CASE WHEN r.post_id IS NULL THEN 0 ELSE 1 END" : "0") + " AS is_read FROM posts p ";
+    if (user) {
+      sql += "LEFT JOIN read_states r ON r.post_id = p.id AND r.user_id = ? ";
+      args.push(user.id);
+    }
+    if (board) {
+      sql += "WHERE p.board_key = ? ";
+      args.push(board);
+    }
+    sql += "ORDER BY p.published_at DESC LIMIT ? OFFSET ?";
+    args.push(pageSize, offset);
+    const posts = await all<Post>(env.DB.prepare(sql).bind(...args));
+    const syncError = total === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+    return { posts, page, pageSize, totalPages, board, query, syncError };
+  }
+
   const args: unknown[] = [];
   let sql = "SELECT p.*, " + (user ? "CASE WHEN r.post_id IS NULL THEN 0 ELSE 1 END" : "0") + " AS is_read FROM posts p ";
   if (user) sql += "LEFT JOIN read_states r ON r.post_id = p.id AND r.user_id = ? ";
@@ -45,8 +69,15 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
     sql += "WHERE p.board_key = ? ";
     args.push(board);
   }
-  sql += "ORDER BY p.published_at DESC LIMIT 1000";
-  const rows = await all<Post>(env.DB.prepare(sql).bind(...args));
+  sql += "ORDER BY p.published_at DESC LIMIT ? OFFSET ?";
+  const rows: Post[] = [];
+  const chunkSize = 500;
+  for (let offset = 0; ; offset += chunkSize) {
+    const chunk = await all<Post>(env.DB.prepare(sql).bind(...args, chunkSize, offset));
+    if (!chunk.length) break;
+    rows.push(...chunk);
+    if (chunk.length < chunkSize) break;
+  }
   const filtered = rows.filter((post) => allowedByBlocks(post, blocks) && allowedBySearch(post, query));
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const page = Math.min(requestedPage, totalPages);

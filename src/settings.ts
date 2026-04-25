@@ -91,7 +91,7 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
     telegramBotToken: telegramBotToken || env.TELEGRAM_BOT_TOKEN || "",
     mailFrom: mailFrom || env.MAIL_FROM || "",
     mailFromName: mailFromName || env.MAIL_FROM_NAME || "NodeSeek RSS Reader",
-    readStateRetentionDays: clampDays(readDays || env.READ_STATE_RETENTION_DAYS, 30),
+    readStateRetentionDays: clampDays(readDays || env.READ_STATE_RETENTION_DAYS, 7),
     postRetentionDays: clampDays(postDays || env.POST_RETENTION_DAYS, 365),
     pushLogRetentionDays: clampDays(pushDays || env.PUSH_LOG_RETENTION_DAYS, 30)
   };
@@ -150,7 +150,7 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
   if (typeof body.mailFromName === "string") updates.push(["mail_from_name", body.mailFromName.trim() || "NodeSeek RSS Reader"]);
   if (typeof body.brevoApiKey === "string" && body.brevoApiKey.trim()) updates.push(["brevo_api_key", body.brevoApiKey.trim()]);
   if (typeof body.telegramBotToken === "string" && body.telegramBotToken.trim()) updates.push(["telegram_bot_token", body.telegramBotToken.trim()]);
-  updates.push(["read_state_retention_days", String(clampDays(body.readStateRetentionDays, 30))]);
+  updates.push(["read_state_retention_days", String(clampDays(body.readStateRetentionDays, 7))]);
   updates.push(["post_retention_days", String(clampDays(body.postRetentionDays, 365))]);
   updates.push(["push_log_retention_days", String(clampDays(body.pushLogRetentionDays, 30))]);
   for (const [key, value] of updates) await setSetting(env, key, value);
