@@ -26,6 +26,11 @@ export interface RssFetchTestResult {
   success: boolean;
   contentType?: string | null;
   preview?: string;
+  itemCount?: number;
+  latestGuid?: string;
+  latestTitle?: string;
+  latestPublishedAt?: string;
+  latestLink?: string;
   error?: string;
 }
 
@@ -37,9 +42,7 @@ const rssFetchStrategies: FetchStrategy[] = [
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Accept-Encoding": "gzip, deflate, br",
-      "Referer": "https://www.nodeseek.com/",
-      "Cache-Control": "no-cache",
-      "Pragma": "no-cache"
+      "Referer": "https://www.nodeseek.com/"
     }
   },
   {
@@ -59,6 +62,12 @@ const rssFetchStrategies: FetchStrategy[] = [
     }
   }
 ];
+
+const retryableStatuses = new Set([502, 503, 504]);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function textBetween(xml: string, tags: string[]): string {
   for (const tag of tags) {
@@ -104,17 +113,25 @@ function parseItems(xml: string): RssItem[] {
   }).filter((item) => item.guid && item.title && item.link);
 }
 
+async function fetchWithStrategy(rssUrl: string, strategy: FetchStrategy): Promise<Response> {
+  return fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 60 } });
+}
+
 async function fetchRssXml(rssUrl: string): Promise<{ xml: string; strategy: string }> {
   const errors: string[] = [];
-  for (const strategy of rssFetchStrategies) {
-    try {
-      const res = await fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 0, cacheEverything: false } });
-      const text = await res.text();
-      if (res.ok) return { xml: text, strategy: strategy.name };
-      errors.push(`${strategy.name}: ${res.status} ${res.statusText} ${text.slice(0, 120)}`.trim());
-    } catch (error) {
-      errors.push(`${strategy.name}: ${error instanceof Error ? error.message : String(error)}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const strategy of rssFetchStrategies) {
+      try {
+        const res = await fetchWithStrategy(rssUrl, strategy);
+        const text = await res.text();
+        if (res.ok) return { xml: text, strategy: strategy.name };
+        errors.push(`${strategy.name} attempt ${attempt + 1}: ${res.status} ${res.statusText} ${text.slice(0, 120)}`.trim());
+        if (!retryableStatuses.has(res.status)) continue;
+      } catch (error) {
+        errors.push(`${strategy.name} attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
+    if (attempt < 2) await sleep(attempt === 0 ? 1000 : 3000);
   }
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
@@ -150,6 +167,7 @@ export async function safeSyncRss(env: Env): Promise<{ inserted: number; firstSy
     return { ...(await syncRss(env)), ok: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    console.error("RSS sync failed", message);
     await setSyncState(env, "last_sync_error", message);
     await setSyncState(env, "last_sync_at", nowIso());
     return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message };
@@ -161,9 +179,11 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
   const results: RssFetchTestResult[] = [];
   for (const strategy of rssFetchStrategies) {
     try {
-      const res = await fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 0, cacheEverything: false } });
+      const res = await fetchWithStrategy(rssUrl, strategy);
       const text = await res.text();
-      results.push({ method: strategy.name, status: res.status, statusText: res.statusText, success: res.ok, contentType: res.headers.get("content-type"), preview: text.slice(0, 200) });
+      const items = res.ok ? parseItems(text) : [];
+      const latest = items[0];
+      results.push({ method: strategy.name, status: res.status, statusText: res.statusText, success: res.ok, contentType: res.headers.get("content-type"), preview: text.slice(0, 200), itemCount: items.length, latestGuid: latest?.guid, latestTitle: latest?.title, latestPublishedAt: latest?.publishedAt, latestLink: latest?.link });
       if (res.ok) break;
     } catch (error) {
       results.push({ method: strategy.name, success: false, error: error instanceof Error ? error.message : String(error) });

@@ -5,7 +5,7 @@ import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { safeSyncRss, testRssFetch } from "./rss";
-import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, runtimeSettings, updateAdminSettings } from "./settings";
+import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
 
@@ -38,6 +38,7 @@ async function listHighlights(env: Env, user: User): Promise<Response> {
 
 async function handleApi(request: Request, env: Env, user: User | null, url: URL): Promise<Response> {
   const path = url.pathname;
+  if (path === "/api/debug/status" && request.method === "GET") return debugStatus(request, env);
   if (path === "/api/admin/settings" && request.method === "GET") return adminSettingsResponse(request, env);
   if (path === "/api/admin/settings" && request.method === "PUT") return updateAdminSettings(request, env);
   if (path === "/api/admin/users" && request.method === "GET") return adminUsersResponse(request, env);
@@ -109,6 +110,10 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     const result = await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(me.id, pattern).run();
     return json({ ok: true, id: Number(result.meta.last_row_id), pattern });
   }
+  if (path === "/api/block-rules/clear" && request.method === "POST") {
+    await env.DB.prepare("DELETE FROM block_rules WHERE user_id = ?").bind(me.id).run();
+    return json({ ok: true });
+  }
   const blockMatch = /^\/api\/block-rules\/(\d+)$/.exec(path);
   if (blockMatch && request.method === "DELETE") {
     await env.DB.prepare("DELETE FROM block_rules WHERE id = ? AND user_id = ?").bind(Number(blockMatch[1]), me.id).run();
@@ -116,6 +121,10 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   }
   if (path === "/api/subscriptions" && request.method === "GET") return json(await all(env.DB.prepare("SELECT id, pattern, send_email, send_telegram FROM subscriptions WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
   if (path === "/api/subscriptions" && request.method === "POST") return createSubscription(request, env, me);
+  if (path === "/api/subscriptions/clear" && request.method === "POST") {
+    await env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ?").bind(me.id).run();
+    return json({ ok: true });
+  }
   const subMatch = /^\/api\/subscriptions\/(\d+)$/.exec(path);
   if (subMatch && request.method === "DELETE") {
     await env.DB.prepare("DELETE FROM subscriptions WHERE id = ? AND user_id = ?").bind(Number(subMatch[1]), me.id).run();
@@ -128,6 +137,45 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   if (path === "/api/import/blocks" && request.method === "POST") return importBlocks(request, env, me);
   if (path === "/api/import/subscriptions" && request.method === "POST") return importSubscriptions(request, env, me);
   return json({ error: "Not found" }, 404);
+}
+
+async function debugStatus(request: Request, env: Env): Promise<Response> {
+  if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确" }, 401);
+  const tableRows = await all<{ name: string }>(env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('posts', 'users', 'sync_state', 'app_settings')"));
+  const tableNames = new Set(tableRows.map((row) => row.name));
+  const syncRows = await all<{ key: string; value: string; updated_at: string }>(env.DB.prepare("SELECT key, value, updated_at FROM sync_state ORDER BY updated_at DESC"));
+  const sync = Object.fromEntries(syncRows.map((row) => [row.key, { value: row.value, updatedAt: row.updated_at }]));
+  const postCount = (await env.DB.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count || 0;
+  const latestPost = await env.DB.prepare("SELECT guid, title, link, published_at, fetched_at FROM posts ORDER BY published_at DESC LIMIT 1").first<{ guid: string; title: string; link: string; published_at: string; fetched_at: string }>();
+  const rssResults = await testRssFetch(env);
+  const latestRss = rssResults.find((result) => result.success && result.latestGuid);
+  let missingFromDb: string[] = [];
+  if (latestRss?.latestGuid && latestPost?.guid) {
+    const latestRssId = Number(latestRss.latestGuid);
+    const latestDbId = Number(latestPost.guid);
+    if (Number.isFinite(latestRssId) && Number.isFinite(latestDbId) && latestRssId > latestDbId) {
+      missingFromDb = Array.from({ length: latestRssId - latestDbId }, (_value, index) => String(latestDbId + index + 1));
+    }
+  }
+  return json({
+    ok: true,
+    timestamp: new Date().toISOString(),
+    worker: { dbBinding: !!env.DB, rssUrl: env.RSS_URL || "https://rss.nodeseek.com/", adminSecretConfigured: !!env.ADMIN_SECRET },
+    database: {
+      tables: { posts: tableNames.has("posts"), users: tableNames.has("users"), sync_state: tableNames.has("sync_state"), app_settings: tableNames.has("app_settings") },
+      postCount,
+      latestPost
+    },
+    sync: {
+      lastSyncAt: sync.last_sync_at?.value || "",
+      lastSyncError: sync.last_sync_error?.value || "",
+      lastSyncStrategy: sync.last_sync_strategy?.value || "",
+      firstSyncDone: sync.first_sync_done?.value === "1",
+      lastCleanupAt: sync.last_cleanup_at?.value || "",
+      rows: syncRows
+    },
+    rss: { ok: !!latestRss, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults }
+  });
 }
 
 async function importHighlights(request: Request, env: Env, user: User): Promise<Response> {

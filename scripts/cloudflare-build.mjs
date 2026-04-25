@@ -77,6 +77,9 @@ async function writeGeneratedConfig(databaseId) {
   "triggers": {
     "crons": ["*/1 * * * *"]
   },
+  "observability": {
+    "enabled": true
+  },
   "d1_databases": [
     {
       "binding": "DB",
