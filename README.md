@@ -98,12 +98,17 @@ https://你的域名/admin?token=你的ADMIN_SECRET
 
 ## Brevo 邮件
 
-1. 注册 Brevo。
-2. 配置发件邮箱或发信域名。
-3. 创建 SMTP/API Key。
-4. 访问 `/admin?token=你的ADMIN_SECRET` 进入独立管理员页面。
-5. 填写 Brevo API Key、发件邮箱和发件人名称。
-6. 用户在网页设置里绑定自己的收件邮箱。
+1. 打开 [Brevo 官网](https://www.brevo.com/) 并注册或登录账号。
+2. 进入 Brevo 控制台，打开右上角账号菜单。
+3. 进入「SMTP & API」。
+4. 切换到「API Keys」，也可以尝试直接打开 [Brevo API Keys 页面](https://app.brevo.com/settings/keys/api)。
+5. 点击「Generate a new API key」，名称可填写 `NodeSeek RSS Reader`。
+6. 复制生成的 API Key。
+7. 访问 `/admin?token=你的ADMIN_SECRET` 进入独立管理员页面。
+8. 填写 Brevo API Key、发件邮箱和发件人名称。
+9. 用户在网页设置里绑定自己的收件邮箱。
+
+注意：发件邮箱必须是 Brevo 允许发送的邮箱或已验证域名下的邮箱；如果邮件发不出去，请先在 Brevo 检查 Sender / Domain 是否已验证。API Key 保存后不会在管理员页明文显示，留空保存不会覆盖旧 Key。
 
 ## Telegram Bot
 
