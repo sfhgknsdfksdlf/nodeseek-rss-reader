@@ -2,6 +2,7 @@ import { clearSessionCookie, getCookie, nowIso, one, readJson, setSessionCookie 
 import type { Env, User } from "./types";
 
 const sessionDays = 30;
+const telegramBindHours = 24;
 
 function toBase64(bytes: ArrayBuffer): string {
   let binary = "";
@@ -15,6 +16,10 @@ function randomToken(bytes = 32): string {
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function telegramBindExpiry(): string {
+  return new Date(Date.now() + telegramBindHours * 60 * 60 * 1000).toISOString();
+}
+
 async function hashPassword(password: string, salt: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 100000, hash: "SHA-256" }, key, 256);
@@ -22,14 +27,24 @@ async function hashPassword(password: string, salt: string): Promise<string> {
 }
 
 function userRow(row: User): User {
-  return { id: row.id, username: row.username, email: row.email, telegram_chat_id: row.telegram_chat_id, telegram_bind_code: row.telegram_bind_code };
+  return { id: row.id, username: row.username, email: row.email, telegram_chat_id: row.telegram_chat_id, telegram_bind_code: row.telegram_bind_code, telegram_bind_code_expires_at: row.telegram_bind_code_expires_at };
 }
 
 export async function currentUser(request: Request, env: Env): Promise<User | null> {
   const sessionId = getCookie(request, "session");
   if (!sessionId) return null;
-  const row = await one<User>(env.DB.prepare("SELECT u.id, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > ?").bind(sessionId, nowIso()));
+  const row = await one<User>(env.DB.prepare("SELECT u.id, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code, u.telegram_bind_code_expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > ?").bind(sessionId, nowIso()));
   return row ? userRow(row) : null;
+}
+
+export async function accountInfo(env: Env, user: User): Promise<User> {
+  if (user.telegram_chat_id) return user;
+  const expiresAt = user.telegram_bind_code_expires_at || "";
+  if (user.telegram_bind_code && expiresAt && new Date(expiresAt).getTime() > Date.now()) return user;
+  const bindCode = randomToken(4);
+  const nextExpiry = telegramBindExpiry();
+  await env.DB.prepare("UPDATE users SET telegram_bind_code = ?, telegram_bind_code_expires_at = ?, updated_at = ? WHERE id = ?").bind(bindCode, nextExpiry, nowIso(), user.id).run();
+  return { ...user, telegram_bind_code: bindCode, telegram_bind_code_expires_at: nextExpiry };
 }
 
 async function createSession(env: Env, userId: number): Promise<{ id: string; expires: Date }> {
@@ -47,8 +62,9 @@ export async function register(request: Request, env: Env): Promise<Response> {
   const salt = randomToken(16);
   const passwordHash = await hashPassword(password, salt);
   const bindCode = randomToken(4);
+  const bindExpiry = telegramBindExpiry();
   try {
-    const result = await env.DB.prepare("INSERT INTO users (username, password_hash, password_salt, telegram_bind_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").bind(username, passwordHash, salt, bindCode, nowIso(), nowIso()).run();
+    const result = await env.DB.prepare("INSERT INTO users (username, password_hash, password_salt, telegram_bind_code, telegram_bind_code_expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(username, passwordHash, salt, bindCode, bindExpiry, nowIso(), nowIso()).run();
     const session = await createSession(env, Number(result.meta.last_row_id));
     return Response.json({ ok: true }, { headers: { "set-cookie": setSessionCookie(session.id, session.expires) } });
   } catch {
@@ -84,6 +100,11 @@ export async function updateTelegram(request: Request, env: Env, user: User): Pr
   const body = await readJson<{ telegramChatId?: string }>(request);
   const chatId = (body.telegramChatId || "").trim();
   if (chatId && !/^-?\d{4,32}$/.test(chatId)) return Response.json({ error: "Telegram Chat ID 格式不正确" }, { status: 400 });
-  await env.DB.prepare("UPDATE users SET telegram_chat_id = ?, updated_at = ? WHERE id = ?").bind(chatId || null, nowIso(), user.id).run();
+  const bindCode = randomToken(4);
+  await env.DB.prepare("UPDATE users SET telegram_chat_id = ?, telegram_bind_code = ?, telegram_bind_code_expires_at = ?, updated_at = ? WHERE id = ?").bind(chatId || null, bindCode, telegramBindExpiry(), nowIso(), user.id).run();
   return Response.json({ ok: true });
+}
+
+export function newTelegramBindCode(): { code: string; expiresAt: string } {
+  return { code: randomToken(4), expiresAt: telegramBindExpiry() };
 }

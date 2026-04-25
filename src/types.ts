@@ -19,6 +19,7 @@ export interface User {
   email: string | null;
   telegram_chat_id: string | null;
   telegram_bind_code: string | null;
+  telegram_bind_code_expires_at: string | null;
 }
 
 export interface Post {

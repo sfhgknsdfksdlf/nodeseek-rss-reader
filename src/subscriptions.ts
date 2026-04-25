@@ -9,6 +9,7 @@ interface SubscriptionWithUser extends Subscription {
   email: string | null;
   telegram_chat_id: string | null;
   telegram_bind_code: string | null;
+  telegram_bind_code_expires_at: string | null;
 }
 
 function pushKey(userId: number, subscriptionId: number, postId: number, channel: string): string {
@@ -18,7 +19,7 @@ function pushKey(userId: number, subscriptionId: number, postId: number, channel
 export async function processSubscriptions(env: Env, posts: Post[]): Promise<void> {
   if (!posts.length) return;
   const subs = await all<SubscriptionWithUser>(env.DB.prepare(`
-    SELECT s.*, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code
+    SELECT s.*, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code, u.telegram_bind_code_expires_at
     FROM subscriptions s
     JOIN users u ON u.id = s.user_id
     ORDER BY s.id DESC
@@ -35,7 +36,7 @@ export async function processSubscriptions(env: Env, posts: Post[]): Promise<voi
   const settings = await runtimeSettings(env);
   const postTexts = new Map(posts.map((post) => [post.id, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
   for (const { sub, regex } of compiledSubs) {
-    const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code };
+    const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code, telegram_bind_code_expires_at: sub.telegram_bind_code_expires_at };
     for (const post of posts) {
       if (!regex.test(postTexts.get(post.id) || "")) continue;
       if (sub.send_email && !sent.has(pushKey(user.id, sub.id, post.id, "email"))) {

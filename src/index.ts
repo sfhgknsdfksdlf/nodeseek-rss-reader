@@ -1,4 +1,4 @@
-import { currentUser, login, logout, register, updateEmail, updateTelegram } from "./auth";
+import { accountInfo, currentUser, login, logout, newTelegramBindCode, register, updateEmail, updateTelegram } from "./auth";
 import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
@@ -55,6 +55,7 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     const settings = await runtimeSettings(env);
     return json({ telegramBotUsername: settings.telegramBotUsername, telegramBotConfigured: !!settings.telegramBotToken, mailConfigured: !!settings.mailFrom });
   }
+  if (path === "/api/account") return json(await accountInfo(env, me));
   if (path === "/api/posts") return json(await queryPosts(env, me, url));
   if (path === "/api/rss-test") return json({ results: await testRssFetch(env), timestamp: new Date().toISOString() });
   if (path === "/api/read-state" && request.method === "POST") {
@@ -172,7 +173,13 @@ async function handleTelegram(request: Request, env: Env): Promise<Response> {
   const chatId = body.message?.chat?.id;
   if (!chatId || !text) return json({ ok: true });
   const code = text.replace(/^\/start\s*/, "").trim();
-  if (code) await env.DB.prepare("UPDATE users SET telegram_chat_id = ?, updated_at = datetime('now') WHERE telegram_bind_code = ?").bind(String(chatId), code).run();
+  if (code) {
+    const user = await env.DB.prepare("SELECT id, telegram_bind_code_expires_at FROM users WHERE telegram_bind_code = ? LIMIT 1").bind(code).first<{ id: number; telegram_bind_code_expires_at: string | null }>();
+    if (user?.telegram_bind_code_expires_at && new Date(user.telegram_bind_code_expires_at).getTime() > Date.now()) {
+      const next = newTelegramBindCode();
+      await env.DB.prepare("UPDATE users SET telegram_chat_id = ?, telegram_bind_code = ?, telegram_bind_code_expires_at = ?, updated_at = datetime('now') WHERE id = ?").bind(String(chatId), next.code, next.expiresAt, user.id).run();
+    }
+  }
   return json({ ok: true });
 }
 
