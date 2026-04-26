@@ -34,6 +34,34 @@ export interface RssFetchTestResult {
   error?: string;
 }
 
+interface RssFailureLogRow {
+  created_at: string;
+  source: string;
+  method: string;
+  status: number | null;
+  status_text: string | null;
+  error: string | null;
+  preview: string | null;
+}
+
+export interface RssFailureSummary {
+  windowHours: number;
+  since: string;
+  totalFailures: number;
+  bySource: Record<string, number>;
+  byMethod: Record<string, number>;
+  byStatus: Record<string, number>;
+  recentSamples: Array<{
+    createdAt: string;
+    source: string;
+    method: string;
+    status: number | null;
+    statusText: string | null;
+    error: string | null;
+    preview: string | null;
+  }>;
+}
+
 const rssFetchStrategies: FetchStrategy[] = [
   {
     name: "browser",
@@ -53,21 +81,8 @@ const rssFetchStrategies: FetchStrategy[] = [
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Referer": "https://www.nodeseek.com/"
     }
-  },
-  {
-    name: "curl",
-    headers: {
-      "User-Agent": "curl/8.0.1",
-      "Accept": "*/*"
-    }
   }
 ];
-
-const retryableStatuses = new Set([502, 503, 504]);
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function textBetween(xml: string, tags: string[]): string {
   for (const tag of tags) {
@@ -117,21 +132,33 @@ async function fetchWithStrategy(rssUrl: string, strategy: FetchStrategy): Promi
   return fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 60 } });
 }
 
-async function fetchRssXml(rssUrl: string): Promise<{ xml: string; strategy: string }> {
+async function cleanupOldRssFailureLogs(env: Env): Promise<void> {
+  const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  await env.DB.prepare("DELETE FROM rss_fetch_failures WHERE created_at < ?").bind(cutoff).run();
+}
+
+async function recordRssFailure(env: Env, source: string, strategy: string, status?: number, statusText?: string, error?: string, preview?: string): Promise<void> {
+  await cleanupOldRssFailureLogs(env);
+  await env.DB.prepare("INSERT INTO rss_fetch_failures (source, method, status, status_text, error, preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(source, strategy, status ?? null, statusText ?? null, error ?? null, preview ?? null, nowIso())
+    .run();
+}
+
+async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
   const errors: string[] = [];
-  for (let attempt = 0; attempt < 3; attempt++) {
-    for (const strategy of rssFetchStrategies) {
-      try {
-        const res = await fetchWithStrategy(rssUrl, strategy);
-        const text = await res.text();
-        if (res.ok) return { xml: text, strategy: strategy.name };
-        errors.push(`${strategy.name} attempt ${attempt + 1}: ${res.status} ${res.statusText} ${text.slice(0, 120)}`.trim());
-        if (!retryableStatuses.has(res.status)) continue;
-      } catch (error) {
-        errors.push(`${strategy.name} attempt ${attempt + 1}: ${error instanceof Error ? error.message : String(error)}`);
-      }
+  for (const strategy of rssFetchStrategies) {
+    try {
+      const res = await fetchWithStrategy(rssUrl, strategy);
+      const text = await res.text();
+      if (res.ok) return { xml: text, strategy: strategy.name };
+      const preview = text.slice(0, 120);
+      errors.push(`${strategy.name}: ${res.status} ${res.statusText} ${preview}`.trim());
+      await recordRssFailure(env, "sync", strategy.name, res.status, res.statusText, undefined, preview);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${strategy.name}: ${message}`);
+      await recordRssFailure(env, "sync", strategy.name, undefined, undefined, message);
     }
-    if (attempt < 2) await sleep(attempt === 0 ? 1000 : 3000);
   }
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
@@ -142,7 +169,7 @@ async function setSyncState(env: Env, key: string, value: string): Promise<void>
 
 export async function syncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; insertedPosts: Post[] }> {
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
-  const { xml, strategy } = await fetchRssXml(rssUrl);
+  const { xml, strategy } = await fetchRssXml(env, rssUrl);
   const items = parseItems(xml);
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
   let inserted = 0;
@@ -184,10 +211,45 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
       const items = res.ok ? parseItems(text) : [];
       const latest = items[0];
       results.push({ method: strategy.name, status: res.status, statusText: res.statusText, success: res.ok, contentType: res.headers.get("content-type"), preview: text.slice(0, 200), itemCount: items.length, latestGuid: latest?.guid, latestTitle: latest?.title, latestPublishedAt: latest?.publishedAt, latestLink: latest?.link });
+      if (!res.ok) await recordRssFailure(env, "rss_test", strategy.name, res.status, res.statusText, undefined, text.slice(0, 120));
       if (res.ok) break;
     } catch (error) {
-      results.push({ method: strategy.name, success: false, error: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      results.push({ method: strategy.name, success: false, error: message });
+      await recordRssFailure(env, "rss_test", strategy.name, undefined, undefined, message);
     }
   }
   return results;
+}
+
+export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary> {
+  await cleanupOldRssFailureLogs(env);
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const rows = await all<RssFailureLogRow>(env.DB.prepare("SELECT created_at, source, method, status, status_text, error, preview FROM rss_fetch_failures WHERE created_at >= ? ORDER BY created_at DESC LIMIT 200").bind(since));
+  const bySource: Record<string, number> = {};
+  const byMethod: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  for (const row of rows) {
+    bySource[row.source] = (bySource[row.source] || 0) + 1;
+    byMethod[row.method] = (byMethod[row.method] || 0) + 1;
+    const statusKey = row.status == null ? "error" : String(row.status);
+    byStatus[statusKey] = (byStatus[statusKey] || 0) + 1;
+  }
+  return {
+    windowHours: 24,
+    since,
+    totalFailures: rows.length,
+    bySource,
+    byMethod,
+    byStatus,
+    recentSamples: rows.slice(0, 20).map((row) => ({
+      createdAt: row.created_at,
+      source: row.source,
+      method: row.method,
+      status: row.status,
+      statusText: row.status_text,
+      error: row.error,
+      preview: row.preview
+    }))
+  };
 }

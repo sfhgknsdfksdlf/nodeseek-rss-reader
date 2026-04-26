@@ -4,7 +4,7 @@ import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
-import { safeSyncRss, testRssFetch } from "./rss";
+import { getRssFailureSummary, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, User } from "./types";
@@ -148,6 +148,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const postCount = (await env.DB.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count || 0;
   const latestPost = await env.DB.prepare("SELECT guid, title, link, published_at, fetched_at FROM posts ORDER BY published_at DESC LIMIT 1").first<{ guid: string; title: string; link: string; published_at: string; fetched_at: string }>();
   const rssResults = await testRssFetch(env);
+  const failureSummary = await getRssFailureSummary(env);
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -174,7 +175,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
       lastCleanupAt: sync.last_cleanup_at?.value || "",
       rows: syncRows
     },
-    rss: { ok: !!latestRss, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults }
+    rss: { ok: !!latestRss, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, failureSummary }
   });
 }
 

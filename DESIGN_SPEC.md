@@ -33,7 +33,7 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `src/types.ts`: shared environment and model types.
 - `src/db.ts`: D1 helpers and SQL utilities.
 - `src/auth.ts`: registration, login, logout, sessions, PBKDF2 password hashing.
-- `src/rss.ts`: fetch and parse NodeSeek RSS.
+- `src/rss.ts`: fetch and parse NodeSeek RSS, record structured RSS failure logs.
 - `src/posts.ts`: post list query, pagination, search, block filtering, read state.
 - `src/filters.ts`: regex validation, matching, highlight rendering.
 - `src/subscriptions.ts`: subscription matching and deduplicated push dispatch.
@@ -57,6 +57,7 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `subscriptions(id, user_id, pattern, send_email, send_telegram, created_at, updated_at)`
 - `push_logs(id, user_id, subscription_id, post_id, channel, status, error, created_at)`
 - `sync_state(key, value, updated_at)`
+- `rss_fetch_failures(id, source, method, status, status_text, error, preview, created_at)`
 
 ## API
 
@@ -70,6 +71,14 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `GET /api/subscriptions`, `POST /api/subscriptions`, `DELETE /api/subscriptions/:id`.
 - `GET /api/export/highlights`, `GET /api/export/blocks`, `GET /api/export/subscriptions`.
 - `POST /telegram/webhook`.
+
+## RSS Failure Diagnostics
+
+- Production RSS sync keeps only two fetch header strategies: `browser` then `rss`.
+- Each sync execution tries the strategies once in order and does not perform multi-round retries.
+- RSS fetch failures are written to D1 as structured records instead of relying only on concatenated text logs.
+- Failure records are retained for 24 hours and exposed in admin diagnostics.
+- `GET /api/debug/status?token=ADMIN_SECRET` adds `rss.failureSummary`, which summarizes the last 24 hours of `/api/rss-test` and scheduled sync fetch failures while preserving raw `rss.results` output.
 
 ## UI Rules
 
