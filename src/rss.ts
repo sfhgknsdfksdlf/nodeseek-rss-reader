@@ -174,7 +174,7 @@ async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; str
   const browserStrategy = rssFetchStrategies[1];
   const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
   if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
-  await sleep(7000);
+  await sleep(26000);
   const browserResult = await tryStrategy(env, "sync", "browser_retry", rssUrl, browserStrategy);
   if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy };
   const errors = [rssResult.message, browserResult.message];

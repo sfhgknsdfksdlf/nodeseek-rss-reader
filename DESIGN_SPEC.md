@@ -74,7 +74,7 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 
 ## RSS Failure Diagnostics
 
-- Production RSS sync keeps only two fetch header strategies and runs them as `rss`, then `browser` after a 7-second delay if the RSS-style request fails.
+- Production RSS sync keeps only two fetch header strategies and runs them as `rss`, then `browser` after a 26-second delay if the RSS-style request fails.
 - `/api/rss-test` uses the same strategy order `rss` then `browser`, but it does not wait 7 seconds between attempts so manual diagnostics stay fast.
 - RSS fetch failures are written to D1 as structured records instead of relying only on concatenated text logs.
 - Failure records are retained for 24 hours and exposed in admin diagnostics.
