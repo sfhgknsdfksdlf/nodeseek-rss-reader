@@ -64,6 +64,15 @@ export interface RssFailureSummary {
 
 const rssFetchStrategies: FetchStrategy[] = [
   {
+    name: "rss",
+    headers: {
+      "User-Agent": "Mozilla/5.0 NodeSeek RSS Reader",
+      "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.nodeseek.com/"
+    }
+  },
+  {
     name: "browser",
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -77,17 +86,12 @@ const rssFetchStrategies: FetchStrategy[] = [
       "sec-fetch-user": "?1",
       "upgrade-insecure-requests": "1"
     }
-  },
-  {
-    name: "rss",
-    headers: {
-      "User-Agent": "Mozilla/5.0 NodeSeek RSS Reader",
-      "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      "Referer": "https://www.nodeseek.com/"
-    }
   }
 ];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function textBetween(xml: string, tags: string[]): string {
   for (const tag of tags) {
@@ -149,22 +153,31 @@ async function recordRssFailure(env: Env, source: string, strategy: string, stat
     .run();
 }
 
-async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
-  const errors: string[] = [];
-  for (const strategy of rssFetchStrategies) {
-    try {
-      const res = await fetchWithStrategy(rssUrl, strategy);
-      const text = await res.text();
-      if (res.ok) return { xml: text, strategy: strategy.name };
-      const preview = text.slice(0, 120);
-      errors.push(`${strategy.name}: ${res.status} ${res.statusText} ${preview}`.trim());
-      await recordRssFailure(env, "sync", strategy.name, res.status, res.statusText, undefined, preview);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(`${strategy.name}: ${message}`);
-      await recordRssFailure(env, "sync", strategy.name, undefined, undefined, message);
-    }
+async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: string, strategy: FetchStrategy): Promise<{ ok: true; xml: string; strategy: string } | { ok: false; message: string }> {
+  try {
+    const res = await fetchWithStrategy(rssUrl, strategy);
+    const text = await res.text();
+    if (res.ok) return { ok: true, xml: text, strategy: strategy.name };
+    const preview = text.slice(0, 120);
+    const message = `${logMethod}: ${res.status} ${res.statusText} ${preview}`.trim();
+    await recordRssFailure(env, source, logMethod, res.status, res.statusText, undefined, preview);
+    return { ok: false, message };
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : String(error);
+    await recordRssFailure(env, source, logMethod, undefined, undefined, messageText);
+    return { ok: false, message: `${logMethod}: ${messageText}` };
   }
+}
+
+async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
+  const rssStrategy = rssFetchStrategies[0];
+  const browserStrategy = rssFetchStrategies[1];
+  const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
+  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
+  await sleep(7000);
+  const browserResult = await tryStrategy(env, "sync", "browser_retry", rssUrl, browserStrategy);
+  if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy };
+  const errors = [rssResult.message, browserResult.message];
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
 
