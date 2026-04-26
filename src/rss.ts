@@ -70,7 +70,12 @@ const rssFetchStrategies: FetchStrategy[] = [
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Accept-Encoding": "gzip, deflate, br",
-      "Referer": "https://www.nodeseek.com/"
+      "Referer": "https://www.nodeseek.com/",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
+      "sec-fetch-user": "?1",
+      "upgrade-insecure-requests": "1"
     }
   },
   {
