@@ -34,10 +34,11 @@ export interface RssFetchTestResult {
   error?: string;
 }
 
-interface RssFailureLogRow {
+interface RssAttemptLogRow {
   created_at: string;
   source: string;
   method: string;
+  outcome: string;
   status: number | null;
   status_text: string | null;
   error: string | null;
@@ -47,14 +48,17 @@ interface RssFailureLogRow {
 export interface RssFailureSummary {
   windowHours: number;
   since: string;
+  totalAttempts: number;
+  totalSuccesses: number;
   totalFailures: number;
   bySource: Record<string, number>;
-  byMethod: Record<string, number>;
+  byResult: Record<string, number>;
   byStatus: Record<string, number>;
   recentSamples: Array<{
     createdAt: string;
     source: string;
     method: string;
+    outcome: string;
     status: number | null;
     statusText: string | null;
     error: string | null;
@@ -63,6 +67,15 @@ export interface RssFailureSummary {
 }
 
 const rssFetchStrategies: FetchStrategy[] = [
+  {
+    name: "rss",
+    headers: {
+      "User-Agent": "Mozilla/5.0 NodeSeek RSS Reader",
+      "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.nodeseek.com/"
+    }
+  },
   {
     name: "browser",
     headers: {
@@ -77,20 +90,15 @@ const rssFetchStrategies: FetchStrategy[] = [
       "sec-fetch-user": "?1",
       "upgrade-insecure-requests": "1"
     }
-  },
-  {
-    name: "rss",
-    headers: {
-      "User-Agent": "Mozilla/5.0 NodeSeek RSS Reader",
-      "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      "Referer": "https://www.nodeseek.com/"
-    }
   }
 ];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomIntInclusive(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function textBetween(xml: string, tags: string[]): string {
@@ -141,15 +149,15 @@ async function fetchWithStrategy(rssUrl: string, strategy: FetchStrategy): Promi
   return fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 60 } });
 }
 
-async function cleanupOldRssFailureLogs(env: Env): Promise<void> {
+async function cleanupOldRssAttemptLogs(env: Env): Promise<void> {
   const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  await env.DB.prepare("DELETE FROM rss_fetch_failures WHERE created_at < ?").bind(cutoff).run();
+  await env.DB.prepare("DELETE FROM rss_fetch_attempts WHERE created_at < ?").bind(cutoff).run();
 }
 
-async function recordRssFailure(env: Env, source: string, strategy: string, status?: number, statusText?: string, error?: string, preview?: string): Promise<void> {
-  await cleanupOldRssFailureLogs(env);
-  await env.DB.prepare("INSERT INTO rss_fetch_failures (source, method, status, status_text, error, preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(source, strategy, status ?? null, statusText ?? null, error ?? null, preview ?? null, nowIso())
+async function recordRssAttempt(env: Env, source: string, strategy: string, outcome: "success" | "failure", status?: number, statusText?: string, error?: string, preview?: string): Promise<void> {
+  await cleanupOldRssAttemptLogs(env);
+  await env.DB.prepare("INSERT INTO rss_fetch_attempts (source, method, outcome, status, status_text, error, preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(source, strategy, outcome, status ?? null, statusText ?? null, error ?? null, preview ?? null, nowIso())
     .run();
 }
 
@@ -157,27 +165,33 @@ async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: 
   try {
     const res = await fetchWithStrategy(rssUrl, strategy);
     const text = await res.text();
-    if (res.ok) return { ok: true, xml: text, strategy: strategy.name };
     const preview = text.slice(0, 120);
+    if (res.ok) {
+      await recordRssAttempt(env, source, strategy.name, "success", res.status, res.statusText, undefined, preview);
+      return { ok: true, xml: text, strategy: strategy.name };
+    }
     const message = `${logMethod}: ${res.status} ${res.statusText} ${preview}`.trim();
-    await recordRssFailure(env, source, logMethod, res.status, res.statusText, undefined, preview);
+    await recordRssAttempt(env, source, strategy.name, "failure", res.status, res.statusText, undefined, preview);
     return { ok: false, message };
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
-    await recordRssFailure(env, source, logMethod, undefined, undefined, messageText);
+    await recordRssAttempt(env, source, strategy.name, "failure", undefined, undefined, messageText);
     return { ok: false, message: `${logMethod}: ${messageText}` };
   }
 }
 
 async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
-  const browserStrategy = rssFetchStrategies[0];
-  const rssStrategy = rssFetchStrategies[1];
+  const rssStrategy = rssFetchStrategies[0];
+  const browserStrategy = rssFetchStrategies[1];
+  const firstDelaySeconds = randomIntInclusive(11, 14);
+  const retryDelaySeconds = randomIntInclusive(5, 8);
+  await sleep(firstDelaySeconds * 1000);
+  const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
+  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
+  await sleep(retryDelaySeconds * 1000);
   const browserResult = await tryStrategy(env, "sync", "browser", rssUrl, browserStrategy);
   if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy };
-  await sleep(26000);
-  const rssResult = await tryStrategy(env, "sync", "rss_retry", rssUrl, rssStrategy);
-  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
-  const errors = [browserResult.message, rssResult.message];
+  const errors = [rssResult.message, browserResult.message];
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
 
@@ -229,41 +243,49 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
       const items = res.ok ? parseItems(text) : [];
       const latest = items[0];
       results.push({ method: strategy.name, status: res.status, statusText: res.statusText, success: res.ok, contentType: res.headers.get("content-type"), preview: text.slice(0, 200), itemCount: items.length, latestGuid: latest?.guid, latestTitle: latest?.title, latestPublishedAt: latest?.publishedAt, latestLink: latest?.link });
-      if (!res.ok) await recordRssFailure(env, "rss_test", strategy.name, res.status, res.statusText, undefined, text.slice(0, 120));
+      await recordRssAttempt(env, "rss_test", strategy.name, res.ok ? "success" : "failure", res.status, res.statusText, undefined, text.slice(0, 120));
       if (res.ok) break;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       results.push({ method: strategy.name, success: false, error: message });
-      await recordRssFailure(env, "rss_test", strategy.name, undefined, undefined, message);
+      await recordRssAttempt(env, "rss_test", strategy.name, "failure", undefined, undefined, message);
     }
   }
   return results;
 }
 
 export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary> {
-  await cleanupOldRssFailureLogs(env);
+  await cleanupOldRssAttemptLogs(env);
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const rows = await all<RssFailureLogRow>(env.DB.prepare("SELECT created_at, source, method, status, status_text, error, preview FROM rss_fetch_failures WHERE created_at >= ? ORDER BY created_at DESC LIMIT 200").bind(since));
+  const rows = await all<RssAttemptLogRow>(env.DB.prepare("SELECT created_at, source, method, outcome, status, status_text, error, preview FROM rss_fetch_attempts WHERE created_at >= ? ORDER BY created_at DESC LIMIT 200").bind(since));
   const bySource: Record<string, number> = {};
-  const byMethod: Record<string, number> = {};
+  const byResult: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
+  let totalSuccesses = 0;
+  let totalFailures = 0;
   for (const row of rows) {
     bySource[row.source] = (bySource[row.source] || 0) + 1;
-    byMethod[row.method] = (byMethod[row.method] || 0) + 1;
+    const resultKey = `${row.method}_${row.outcome}`;
+    byResult[resultKey] = (byResult[resultKey] || 0) + 1;
+    if (row.outcome === "success") totalSuccesses++;
+    if (row.outcome === "failure") totalFailures++;
     const statusKey = row.status == null ? "error" : String(row.status);
     byStatus[statusKey] = (byStatus[statusKey] || 0) + 1;
   }
   return {
     windowHours: 24,
     since,
-    totalFailures: rows.length,
+    totalAttempts: rows.length,
+    totalSuccesses,
+    totalFailures,
     bySource,
-    byMethod,
+    byResult,
     byStatus,
     recentSamples: rows.slice(0, 20).map((row) => ({
       createdAt: row.created_at,
       source: row.source,
       method: row.method,
+      outcome: row.outcome,
       status: row.status,
       statusText: row.status_text,
       error: row.error,

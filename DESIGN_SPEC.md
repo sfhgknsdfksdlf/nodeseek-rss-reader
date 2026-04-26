@@ -33,7 +33,7 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `src/types.ts`: shared environment and model types.
 - `src/db.ts`: D1 helpers and SQL utilities.
 - `src/auth.ts`: registration, login, logout, sessions, PBKDF2 password hashing.
-- `src/rss.ts`: fetch and parse NodeSeek RSS, record structured RSS failure logs.
+- `src/rss.ts`: fetch and parse NodeSeek RSS, record structured RSS fetch attempt logs.
 - `src/posts.ts`: post list query, pagination, search, block filtering, read state.
 - `src/filters.ts`: regex validation, matching, highlight rendering.
 - `src/subscriptions.ts`: subscription matching and deduplicated push dispatch.
@@ -57,7 +57,8 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `subscriptions(id, user_id, pattern, send_email, send_telegram, created_at, updated_at)`
 - `push_logs(id, user_id, subscription_id, post_id, channel, status, error, created_at)`
 - `sync_state(key, value, updated_at)`
-- `rss_fetch_failures(id, source, method, status, status_text, error, preview, created_at)`
+- `rss_fetch_failures(id, source, method, status, status_text, error, preview, created_at)` legacy table no longer read by diagnostics.
+- `rss_fetch_attempts(id, source, method, outcome, status, status_text, error, preview, created_at)`
 
 ## API
 
@@ -74,11 +75,11 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 
 ## RSS Failure Diagnostics
 
-- Production RSS sync keeps only two fetch header strategies and runs them as `browser`, then `rss` after a 26-second delay if the browser-style request fails.
-- `/api/rss-test` uses the same strategy order `browser` then `rss`, but it does not wait 26 seconds between attempts so manual diagnostics stay fast.
-- RSS fetch failures are written to D1 as structured records instead of relying only on concatenated text logs.
-- Failure records are retained for 24 hours and exposed in admin diagnostics.
-- `GET /api/debug/status?token=ADMIN_SECRET` adds `rss.failureSummary`, which summarizes the last 24 hours of `/api/rss-test` and scheduled sync fetch failures while preserving raw `rss.results` output.
+- Production RSS sync generates random integer `A` in `[11, 14]`, sleeps `A` seconds, tries `rss`, then if it fails generates random integer `B` in `[5, 8]`, sleeps `B` seconds, and tries `browser`.
+- `/api/rss-test` uses the same strategy order `rss` then `browser`, but it does not sleep so manual diagnostics stay fast.
+- RSS fetch attempts, both successes and failures, are written to D1 as structured records in `rss_fetch_attempts`.
+- Attempt records are retained for 24 hours and exposed in admin diagnostics; old `rss_fetch_failures` rows are ignored by new diagnostics.
+- `GET /api/debug/status?token=ADMIN_SECRET` adds `rss.failureSummary`, which summarizes the last 24 hours of `/api/rss-test` and scheduled sync attempts as `rss_success`, `rss_failure`, `browser_success`, and `browser_failure` while preserving raw `rss.results` output.
 
 ## UI Rules
 
