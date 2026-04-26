@@ -64,15 +64,6 @@ export interface RssFailureSummary {
 
 const rssFetchStrategies: FetchStrategy[] = [
   {
-    name: "rss",
-    headers: {
-      "User-Agent": "Mozilla/5.0 NodeSeek RSS Reader",
-      "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      "Referer": "https://www.nodeseek.com/"
-    }
-  },
-  {
     name: "browser",
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -85,6 +76,15 @@ const rssFetchStrategies: FetchStrategy[] = [
       "sec-fetch-site": "none",
       "sec-fetch-user": "?1",
       "upgrade-insecure-requests": "1"
+    }
+  },
+  {
+    name: "rss",
+    headers: {
+      "User-Agent": "Mozilla/5.0 NodeSeek RSS Reader",
+      "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Referer": "https://www.nodeseek.com/"
     }
   }
 ];
@@ -170,14 +170,14 @@ async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: 
 }
 
 async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
-  const rssStrategy = rssFetchStrategies[0];
-  const browserStrategy = rssFetchStrategies[1];
-  const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
-  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
-  await sleep(26000);
-  const browserResult = await tryStrategy(env, "sync", "browser_retry", rssUrl, browserStrategy);
+  const browserStrategy = rssFetchStrategies[0];
+  const rssStrategy = rssFetchStrategies[1];
+  const browserResult = await tryStrategy(env, "sync", "browser", rssUrl, browserStrategy);
   if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy };
-  const errors = [rssResult.message, browserResult.message];
+  await sleep(26000);
+  const rssResult = await tryStrategy(env, "sync", "rss_retry", rssUrl, rssStrategy);
+  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
+  const errors = [browserResult.message, rssResult.message];
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
 
