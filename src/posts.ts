@@ -92,7 +92,7 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     setTiming("dbPageMs", Date.now() - dbPageStart);
     const syncError = total === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
     setTiming("totalMs", Date.now() - totalStart);
-    return { posts, page, pageSize, totalPages, board, query, syncError };
+    return { posts, page, pageSize, totalPages, hasNextPage: page < totalPages, board, query, syncError };
   }
 
   const args: unknown[] = [];
@@ -110,9 +110,10 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const lastPagePosts: Post[] = [];
   const start = (requestedPage - 1) * pageSize;
   const end = start + pageSize;
+  let stoppedAtPageLimit = false;
   let scannedChunks = 0;
   const scanStart = Date.now();
-  for (let offset = 0; ; offset += chunkSize) {
+  scan: for (let offset = 0; ; offset += chunkSize) {
     scannedChunks++;
     const chunk = await all<Post>(env.DB.prepare(sql).bind(...args, chunkSize, offset));
     if (!chunk.length) break;
@@ -129,17 +130,24 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
       lastPagePosts.push(post);
       if (lastPagePosts.length > pageSize) lastPagePosts.shift();
       matched++;
+      if (matched >= end) {
+        stoppedAtPageLimit = true;
+        break scan;
+      }
     }
     if (chunk.length < chunkSize) break;
   }
   setTiming("scanMs", Date.now() - scanStart);
-  const totalPages = Math.max(1, Math.ceil(matched / pageSize));
-  const page = Math.min(requestedPage, totalPages);
+  const pageHasRows = pagePosts.length > 0;
+  const page = pageHasRows ? requestedPage : Math.max(1, requestedPage - 1);
+  const totalPages = stoppedAtPageLimit ? requestedPage + 1 : Math.max(1, page);
   const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
   setTiming("scannedChunks", scannedChunks);
   setTiming("matchedPosts", matched);
+  setTiming("limitedScan", 1);
+  setTiming("hasNextPage", stoppedAtPageLimit ? 1 : 0);
   setTiming("totalMs", Date.now() - totalStart);
-  return { posts: page === requestedPage ? pagePosts : lastPagePosts, page, pageSize, totalPages, board, query, syncError };
+  return { posts: pageHasRows ? pagePosts : lastPagePosts, page, pageSize, totalPages, hasNextPage: stoppedAtPageLimit, board, query, syncError };
 }
 
 export async function markReadAndGetLink(env: Env, user: User | null, postId: number): Promise<string | null> {
