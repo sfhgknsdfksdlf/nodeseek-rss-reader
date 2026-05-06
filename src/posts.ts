@@ -113,6 +113,9 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   let stoppedAtPageLimit = false;
   let scannedChunks = 0;
   const scanStart = Date.now();
+  const countStart = Date.now();
+  const total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${board ? "WHERE board_key = ?" : ""}`).bind(...(board ? [board] : []))))?.count || 0;
+  setTiming("countMs", Date.now() - countStart);
   scan: for (let offset = 0; ; offset += chunkSize) {
     scannedChunks++;
     const chunk = await all<Post>(env.DB.prepare(sql).bind(...args, chunkSize, offset));
@@ -140,7 +143,7 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   setTiming("scanMs", Date.now() - scanStart);
   const pageHasRows = pagePosts.length > 0;
   const page = pageHasRows ? requestedPage : Math.max(1, requestedPage - 1);
-  const totalPages = stoppedAtPageLimit ? requestedPage + 1 : Math.max(1, page);
+  const totalPages = query ? (stoppedAtPageLimit ? requestedPage + 1 : Math.max(1, page)) : Math.max(1, Math.ceil(total / pageSize));
   const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
   setTiming("scannedChunks", scannedChunks);
   setTiming("matchedPosts", matched);
