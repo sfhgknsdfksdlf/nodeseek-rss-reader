@@ -79,7 +79,7 @@ export function highlightHtml(html: string, groups: HighlightGroup[]): string {
   return html.split(/(<[^>]+>)/g).map((part) => part.startsWith("<") ? part : highlightEscapedText(part, groups)).join("");
 }
 
-export function postTextForBlock(post: Post): string {
+export function postTextForBlock(post: Pick<Post, "title" | "content_text" | "author">): string {
   return `${post.title}\n${post.content_text}\n${post.author || ""}`;
 }
 
