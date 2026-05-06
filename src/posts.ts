@@ -110,7 +110,7 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     return { posts, page, pageSize, totalPages, board, query, syncError };
   }
 
-  const chunkSize = 500;
+  const chunkSize = 1000;
   let matched = 0;
   const pagePostIds: number[] = [];
   const lastPagePostIds: number[] = [];
@@ -119,9 +119,12 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   let stoppedAtPageLimit = false;
   let scannedChunks = 0;
   const scanStart = Date.now();
-  const countStart = Date.now();
-  const total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${board ? "WHERE board_key = ?" : ""}`).bind(...(board ? [board] : []))))?.count || 0;
-  setTiming("countMs", Date.now() - countStart);
+  let total = 0;
+  if (!query) {
+    const countStart = Date.now();
+    total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${board ? "WHERE board_key = ?" : ""}`).bind(...(board ? [board] : []))))?.count || 0;
+    setTiming("countMs", Date.now() - countStart);
+  }
   let cursorPublishedAt: string | null = null;
   let cursorId: number | null = null;
   scan: for (;;) {
