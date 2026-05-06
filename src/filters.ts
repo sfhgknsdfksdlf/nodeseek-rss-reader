@@ -50,16 +50,59 @@ export function sanitizePostHtml(raw: string): string {
   return html.trim();
 }
 
+function escapeTextPreservingEntities(value: string): string {
+  return value.replace(/&(?!(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);)/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 export function highlightText(text: string, groups: HighlightGroup[]): string {
-  let output = escapeHtml(text);
+  return highlightPlainText(text, groups);
+}
+
+function buildHighlightRanges(text: string, groups: HighlightGroup[]): Array<{ start: number; end: number; color: string }> {
+  const ranges: Array<{ start: number; end: number; color: string }> = [];
   for (const group of groups) {
     for (const pattern of group.patterns) {
       const re = safeRegex(pattern);
       if (!re) continue;
-      output = output.replace(new RegExp(re.source, "gi"), (match) => `<mark style="background:${escapeAttr(group.color)}">${match}</mark>`);
+      const globalRe = new RegExp(re.source, "gi");
+      for (const match of text.matchAll(globalRe)) {
+        const start = match.index ?? -1;
+        const value = match[0] || "";
+        if (start < 0 || !value) continue;
+        ranges.push({ start, end: start + value.length, color: group.color });
+      }
     }
   }
+  ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: typeof ranges = [];
+  for (const range of ranges) {
+    const prev = merged[merged.length - 1];
+    if (!prev || range.start >= prev.end) {
+      merged.push(range);
+    }
+  }
+  return merged;
+}
+
+function highlightPlainText(text: string, groups: HighlightGroup[]): string {
+  if (!text) return "";
+  const ranges = buildHighlightRanges(text, groups);
+  if (!ranges.length) return escapeTextPreservingEntities(text);
+  let output = "";
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start > cursor) output += escapeTextPreservingEntities(text.slice(cursor, range.start));
+    output += `<mark style="background:${escapeAttr(range.color)}">${escapeTextPreservingEntities(text.slice(range.start, range.end))}</mark>`;
+    cursor = range.end;
+  }
+  if (cursor < text.length) output += escapeTextPreservingEntities(text.slice(cursor));
   return output;
+}
+
+export function highlightHtml(html: string, groups: HighlightGroup[]): string {
+  if (!html) return "";
+  const parts = html.split(/(<[^>]+>)/g);
+  return parts.map((part) => (part.startsWith("<") && part.endsWith(">") ? part : highlightPlainText(part, groups))).join("");
 }
 
 export function postTextForBlock(post: Post): string {

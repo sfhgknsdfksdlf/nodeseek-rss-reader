@@ -49,8 +49,6 @@ export interface RssFailureSummary {
   windowHours: number;
   since: string;
   totalAttempts: number;
-  totalSuccesses: number;
-  totalFailures: number;
   bySource: Record<string, number>;
   byResult: Record<string, number>;
   byStatus: Record<string, number>;
@@ -99,6 +97,11 @@ function sleep(ms: number): Promise<void> {
 
 function randomIntInclusive(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+export interface RssAttemptStats {
+  cron: { success: number; failure: number };
+  rssTest: { success: number; failure: number };
 }
 
 function textBetween(xml: string, tags: string[]): string {
@@ -183,8 +186,8 @@ async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: 
 async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
   const rssStrategy = rssFetchStrategies[0];
   const browserStrategy = rssFetchStrategies[1];
-  const firstDelaySeconds = randomIntInclusive(11, 14);
-  const retryDelaySeconds = randomIntInclusive(5, 8);
+  const firstDelaySeconds = randomIntInclusive(21, 24);
+  const retryDelaySeconds = randomIntInclusive(21, 24);
   await sleep(firstDelaySeconds * 1000);
   const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
   if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
@@ -261,14 +264,10 @@ export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary>
   const bySource: Record<string, number> = {};
   const byResult: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
-  let totalSuccesses = 0;
-  let totalFailures = 0;
   for (const row of rows) {
     bySource[row.source] = (bySource[row.source] || 0) + 1;
     const resultKey = `${row.method}_${row.outcome}`;
     byResult[resultKey] = (byResult[resultKey] || 0) + 1;
-    if (row.outcome === "success") totalSuccesses++;
-    if (row.outcome === "failure") totalFailures++;
     const statusKey = row.status == null ? "error" : String(row.status);
     byStatus[statusKey] = (byStatus[statusKey] || 0) + 1;
   }
@@ -276,8 +275,6 @@ export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary>
     windowHours: 24,
     since,
     totalAttempts: rows.length,
-    totalSuccesses,
-    totalFailures,
     bySource,
     byResult,
     byStatus,
@@ -292,4 +289,20 @@ export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary>
       preview: row.preview
     }))
   };
+}
+
+export async function getRssAttemptStats(env: Env): Promise<RssAttemptStats> {
+  await cleanupOldRssAttemptLogs(env);
+  const rows = await all<{ source: string; outcome: string }>(env.DB.prepare("SELECT source, outcome FROM rss_fetch_attempts WHERE created_at >= ?").bind(new Date(Date.now() - 24 * 3600 * 1000).toISOString()));
+  const stats: RssAttemptStats = {
+    cron: { success: 0, failure: 0 },
+    rssTest: { success: 0, failure: 0 }
+  };
+  for (const row of rows) {
+    const bucket = row.source === "sync" ? stats.cron : row.source === "rss_test" ? stats.rssTest : null;
+    if (!bucket) continue;
+    if (row.outcome === "success") bucket.success++;
+    if (row.outcome === "failure") bucket.failure++;
+  }
+  return stats;
 }

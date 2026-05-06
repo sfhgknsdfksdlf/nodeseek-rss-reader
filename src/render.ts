@@ -1,5 +1,5 @@
 import { boardOptions, displayBoard } from "./board";
-import { escapeAttr, escapeHtml, highlightText } from "./filters";
+import { escapeAttr, escapeHtml, highlightHtml, highlightText } from "./filters";
 import { getHighlightGroups } from "./posts";
 import { formatBeijingTime } from "./time";
 import type { Env, PageData, Post, User } from "./types";
@@ -21,7 +21,7 @@ function pager(data: PageData): string {
 
 function renderPost(post: Post, groups: Awaited<ReturnType<typeof getHighlightGroups>>): string {
   const link = escapeAttr(post.link);
-  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${highlightText(post.title, groups)}</a></div><div class="body">${post.content_html}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
+  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${highlightText(post.title, groups)}</a></div><div class="body">${highlightHtml(post.content_html, groups)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
 }
 
 export async function renderHome(env: Env, user: User | null, data: PageData, admin: { adminSecretConfigured: boolean; adminAuthenticated: boolean }): Promise<Response> {

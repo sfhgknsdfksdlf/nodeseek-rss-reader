@@ -75,11 +75,11 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 
 ## RSS Failure Diagnostics
 
-- Production RSS sync generates random integer `A` in `[11, 14]`, sleeps `A` seconds, tries `rss`, then if it fails generates random integer `B` in `[5, 8]`, sleeps `B` seconds, and tries `browser`.
+- Production RSS sync generates random integer `A` in `[21, 24]`, sleeps `A` seconds, tries `rss`, then if it fails generates random integer `B` in `[21, 24]`, sleeps `B` seconds, and tries `browser`.
 - `/api/rss-test` uses the same strategy order `rss` then `browser`, but it does not sleep so manual diagnostics stay fast.
 - RSS fetch attempts, both successes and failures, are written to D1 as structured records in `rss_fetch_attempts`.
 - Attempt records are retained for 24 hours and exposed in admin diagnostics; old `rss_fetch_failures` rows are ignored by new diagnostics.
-- `GET /api/debug/status?token=ADMIN_SECRET` adds `rss.failureSummary`, which summarizes the last 24 hours of `/api/rss-test` and scheduled sync attempts as `rss_success`, `rss_failure`, `browser_success`, and `browser_failure` while preserving raw `rss.results` output.
+- `GET /api/debug/status?token=ADMIN_SECRET` includes backend timing fields plus `rss.attemptStats` for `cron.success`, `cron.failure`, `rssTest.success`, and `rssTest.failure`, while preserving raw `rss.results` output and `rss.failureSummary`.
 
 ## UI Rules
 
