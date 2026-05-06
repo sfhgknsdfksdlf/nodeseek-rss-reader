@@ -1,7 +1,7 @@
 import { all, one } from "./db";
 import { normalizeBoard } from "./board";
 import { postTextForBlock, safeRegex } from "./filters";
-import type { BlockRule, Env, HighlightGroup, PageData, Post, User } from "./types";
+import type { BlockRule, Env, HighlightGroup, HomeTimings, PageData, Post, User } from "./types";
 
 export const pageSize = 50;
 
@@ -45,18 +45,24 @@ function allowedBySearch(post: Post, queryRegex: RegExp | null): boolean {
   return queryRegex.test(postTextForSearch(post));
 }
 
-export async function queryPosts(env: Env, user: User | null, url: URL): Promise<PageData> {
+export async function queryPosts(env: Env, user: User | null, url: URL, timings?: HomeTimings["queryPosts"]): Promise<PageData> {
+  const totalStart = Date.now();
   const board = normalizeBoard(url.searchParams.get("board"));
   const query = (url.searchParams.get("q") || "").trim();
   const urlPage = /\/page\/(\d+)/.exec(url.pathname)?.[1];
   const requestedPage = Math.max(1, Number(url.searchParams.get("page") || urlPage || "1") || 1);
+  const setTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
+    if (timings) timings[key] = value;
+  };
   const blocks = await getBlockRules(env, user);
   const blockRegexes = blocks.map((rule) => safeRegex(rule.pattern)).filter((rule): rule is RegExp => !!rule);
   const queryRegex = query ? safeRegex(query) : null;
   if (!query && blocks.length === 0) {
+    const countStart = Date.now();
     const where = board ? "WHERE board_key = ?" : "";
     const countArgs = board ? [board] : [];
     const total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${where}`).bind(...countArgs)))?.count || 0;
+    setTiming("countMs", Date.now() - countStart);
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(requestedPage, totalPages);
     const offset = (page - 1) * pageSize;
@@ -74,6 +80,7 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
     args.push(pageSize, offset);
     const posts = await all<Post>(env.DB.prepare(sql).bind(...args));
     const syncError = total === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+    setTiming("totalMs", Date.now() - totalStart);
     return { posts, page, pageSize, totalPages, board, query, syncError };
   }
 
@@ -92,11 +99,21 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
   const lastPagePosts: Post[] = [];
   const start = (requestedPage - 1) * pageSize;
   const end = start + pageSize;
+  let scannedChunks = 0;
+  const scanStart = Date.now();
   for (let offset = 0; ; offset += chunkSize) {
+    scannedChunks++;
     const chunk = await all<Post>(env.DB.prepare(sql).bind(...args, chunkSize, offset));
     if (!chunk.length) break;
     for (const post of chunk) {
-      if (!allowedByBlocks(post, blockRegexes) || !allowedBySearch(post, queryRegex)) continue;
+      const blockStart = Date.now();
+      const allowedBlock = allowedByBlocks(post, blockRegexes);
+      if (timings) timings.blockMs = (timings.blockMs || 0) + (Date.now() - blockStart);
+      if (!allowedBlock) continue;
+      const searchStart = Date.now();
+      const allowedSearch = allowedBySearch(post, queryRegex);
+      if (timings) timings.searchMs = (timings.searchMs || 0) + (Date.now() - searchStart);
+      if (!allowedSearch) continue;
       if (matched >= start && matched < end) pagePosts.push(post);
       lastPagePosts.push(post);
       if (lastPagePosts.length > pageSize) lastPagePosts.shift();
@@ -104,9 +121,13 @@ export async function queryPosts(env: Env, user: User | null, url: URL): Promise
     }
     if (chunk.length < chunkSize) break;
   }
+  setTiming("scanMs", Date.now() - scanStart);
   const totalPages = Math.max(1, Math.ceil(matched / pageSize));
   const page = Math.min(requestedPage, totalPages);
   const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+  setTiming("scannedChunks", scannedChunks);
+  setTiming("matchedPosts", matched);
+  setTiming("totalMs", Date.now() - totalStart);
   return { posts: page === requestedPage ? pagePosts : lastPagePosts, page, pageSize, totalPages, board, query, syncError };
 }
 

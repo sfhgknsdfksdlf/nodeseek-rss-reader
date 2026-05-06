@@ -67,3 +67,23 @@ export interface PageData {
   query: string;
   syncError?: string;
 }
+
+export interface HomeTimings {
+  totalMs?: number;
+  queryPosts?: {
+    totalMs?: number;
+    countMs?: number;
+    scanMs?: number;
+    blockMs?: number;
+    searchMs?: number;
+    scannedChunks?: number;
+    matchedPosts?: number;
+  };
+  render?: {
+    groupsMs?: number;
+    postsMs?: number;
+    titleHighlightMs?: number;
+    bodyHighlightMs?: number;
+    htmlMs?: number;
+  };
+}

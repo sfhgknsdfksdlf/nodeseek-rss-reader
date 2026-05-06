@@ -7,7 +7,7 @@ import { renderHome } from "./render";
 import { getRssAttemptStats, getRssFailureSummary, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
-import type { Env, User } from "./types";
+import type { Env, HomeTimings, User } from "./types";
 
 const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader"><rect width="128" height="128" rx="30" fill="#fff"/><rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/><path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/><circle cx="38" cy="91" r="8" fill="#111"/><path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/><path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/></svg>`;
 const manifest = { name: "NodeSeek RSS Reader", short_name: "NodeSeek RSS", start_url: "/", display: "standalone", background_color: "#000000", theme_color: "#000000", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
@@ -275,7 +275,32 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const link = await markReadAndGetLink(env, user, Number(openMatch[1]));
     return link ? Response.redirect(link, 302) : new Response("Not found", { status: 404 });
   }
-  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) return renderHome(env, user, await queryPosts(env, user, url), await adminStatus(request, env));
+  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) {
+    const debugRequested = url.searchParams.get("debug") === "1" || request.headers.get("x-debug-timings") === "1" || !!env.ADMIN_SECRET && isAdmin(request, env);
+    const timings: HomeTimings | undefined = debugRequested ? { queryPosts: {}, render: {} } : undefined;
+    const posts = await queryPosts(env, user, url, timings?.queryPosts);
+    const response = await renderHome(env, user, posts, await adminStatus(request, env), timings);
+    if (debugRequested && timings) {
+      const existing = response.headers.get("Server-Timing");
+      const extra = [
+        timings.totalMs != null ? `home_total;dur=${Math.round(timings.totalMs)}` : null,
+        timings.queryPosts?.totalMs != null ? `query_posts_total;dur=${Math.round(timings.queryPosts.totalMs)}` : null,
+        timings.queryPosts?.countMs != null ? `query_posts_count;dur=${Math.round(timings.queryPosts.countMs)}` : null,
+        timings.queryPosts?.scanMs != null ? `query_posts_scan;dur=${Math.round(timings.queryPosts.scanMs)}` : null,
+        timings.queryPosts?.blockMs != null ? `query_posts_block;dur=${Math.round(timings.queryPosts.blockMs)}` : null,
+        timings.queryPosts?.searchMs != null ? `query_posts_search;dur=${Math.round(timings.queryPosts.searchMs)}` : null,
+        timings.render?.groupsMs != null ? `render_groups;dur=${Math.round(timings.render.groupsMs)}` : null,
+        timings.render?.postsMs != null ? `render_posts;dur=${Math.round(timings.render.postsMs)}` : null,
+        timings.render?.titleHighlightMs != null ? `render_title_highlight;dur=${Math.round(timings.render.titleHighlightMs)}` : null,
+        timings.render?.bodyHighlightMs != null ? `render_body_highlight;dur=${Math.round(timings.render.bodyHighlightMs)}` : null,
+        timings.render?.htmlMs != null ? `render_html;dur=${Math.round(timings.render.htmlMs)}` : null
+      ].filter((item): item is string => !!item);
+      const headers = new Headers(response.headers);
+      headers.set("Server-Timing", [existing, ...extra].filter(Boolean).join(", "));
+      return new Response(await response.text(), { status: response.status, headers });
+    }
+    return response;
+  }
   return new Response("Not found", { status: 404 });
 }
 
