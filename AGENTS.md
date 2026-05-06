@@ -59,15 +59,17 @@
 
 ## Data And Migrations
 - Add schema changes as new numbered SQL files; never rewrite deployed migrations.
-- Current migration chain: `0001_initial` through `0007_rss_fetch_attempts`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
+- Current migration chain: `0001_initial` through `0008_posts_keyset_indexes`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
+- `0008_posts_keyset_indexes` supports home-page keyset scans with `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)`; confirm remote indexes with `wrangler d1 execute ... "SELECT name FROM sqlite_master WHERE type='index' AND name IN (...)"` when diagnosing deep-page slowness.
 - `ADMIN_SECRET` authenticates `/admin?token=...` and encrypts D1-stored Brevo/Telegram settings; changing it requires re-entering encrypted settings.
 - PBKDF2 iterations must stay `<= 100000`; Workers reject higher counts.
 
 ## RSS Sync
-- Current scheduled sync sleeps random `A=11..14s`, tries `rss`, and on failure sleeps random `B=5..8s` before trying `browser`.
+- Current scheduled sync sleeps random `A=21..24s`, tries `rss`, and on failure sleeps random `B=21..24s` before trying `browser`.
 - `/api/rss-test` is fast diagnostics only: same order `rss -> browser`, no sleeps.
 - `src/rss.ts` uses `cf.cacheTtl = 60`; NodeSeek RSS often returns nginx `503`, so keep structured diagnostics before changing cron frequency or headers.
-- `rss_fetch_attempts` records both successes and failures with keys like `rss_success`, `rss_failure`, `browser_success`, `browser_failure` in `/api/debug/status?token=ADMIN_SECRET` under `rss.failureSummary`.
+- `/api/debug/status?token=ADMIN_SECRET` does not run live RSS fetches by default; append `live=1` to run `/api/rss-test` style diagnostics.
+- `rss_fetch_attempts` records both successes and failures with keys like `rss_success`, `rss_failure`, `browser_success`, `browser_failure` in `/api/debug/status?token=ADMIN_SECRET` under `rss.failureSummary`; `rss.attemptStats` also summarizes cron vs rss-test success/failure.
 - `safeSyncRss()` catches cron errors and records `sync_state.last_sync_error`; Cloudflare cron logs can show `outcome: ok` even when RSS sync failed.
 
 ## Runtime Behavior
@@ -77,7 +79,9 @@
 - Telegram bind codes are 24-hour codes from `GET /api/account`; bound users should not see a bind code until they clear Telegram binding.
 
 ## Hotspots
-- `src/posts.ts`: search/block rules can force Worker-side scans; prefer SQL filtering and avoid materializing full result sets when one page is needed.
+- `src/posts.ts`: search/block rules force Worker-side filtering; keep `page=N` URLs/UI, but scan only until the current page is filled, use keyset pagination, and do not load `content_html` until the final 50 post IDs are known.
+- Slow-path scan chunk size is intentionally `1000`; check `home.timings.queryPosts.scannedChunks`, `matchedPosts`, and `scanMs` in `/api/debug/status` before changing it.
+- `/api/debug/status` shows the latest real home-page timing from `sync_state.last_home_timing`; it is written with `ctx.waitUntil()` so timing writes should not block normal page responses.
 - `src/subscriptions.ts`: matching can become users x subscriptions x posts; batch reads/log checks and avoid repeated `runtimeSettings(env)` in notification loops.
 - Precompile regexes per request/task; avoid `new RegExp` per post/rule comparison.
 
