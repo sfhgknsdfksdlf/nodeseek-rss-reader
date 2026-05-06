@@ -16,8 +16,7 @@ function pageUrl(page: number, data: PageData): string {
 
 function pager(data: PageData): string {
   const pages = [data.page, data.page + 1, data.page + 2, data.page + 3].filter((p) => p <= data.totalPages);
-  const nextPage = data.hasNextPage === false ? data.page : Math.min(data.totalPages, data.page + 1);
-  return `<nav class="pager"><a class="page" href="${pageUrl(Math.max(1, data.page - 1), data)}">上一页</a>${pages.map((p) => `<a class="page ${p === data.page ? "current" : ""}" href="${pageUrl(p, data)}">${p}</a>`).join("")}<a class="page" href="${pageUrl(nextPage, data)}">下一页</a></nav>`;
+  return `<nav class="pager"><a class="page" href="${pageUrl(Math.max(1, data.page - 1), data)}">上一页</a>${pages.map((p) => `<a class="page ${p === data.page ? "current" : ""}" href="${pageUrl(p, data)}">${p}</a>`).join("")}<a class="page" href="${pageUrl(Math.min(data.totalPages, data.page + 1), data)}">下一页</a></nav>`;
 }
 
 function addRenderTiming(timings: HomeTimings | undefined, key: keyof NonNullable<HomeTimings["render"]>, value: number): void {
