@@ -63,7 +63,6 @@ export interface PageData {
   page: number;
   pageSize: number;
   totalPages: number;
-  hasNextPage?: boolean;
   board: string;
   query: string;
   syncError?: string;

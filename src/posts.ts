@@ -72,9 +72,6 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const setTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
     if (timings) timings[key] = value;
   };
-  const addTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
-    if (timings) timings[key] = (timings[key] || 0) + value;
-  };
   const blocksStart = Date.now();
   const blocks = await getBlockRules(env, user);
   setTiming("blockRulesLoadMs", Date.now() - blocksStart);
@@ -103,14 +100,14 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
       sql += "WHERE p.board_key = ? ";
       args.push(board);
     }
-    sql += "ORDER BY p.published_at DESC LIMIT ? OFFSET ?";
+    sql += "ORDER BY p.published_at DESC, p.id DESC LIMIT ? OFFSET ?";
     args.push(pageSize, offset);
     const dbPageStart = Date.now();
     const posts = await all<Post>(env.DB.prepare(sql).bind(...args));
     setTiming("dbPageMs", Date.now() - dbPageStart);
     const syncError = total === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
     setTiming("totalMs", Date.now() - totalStart);
-    return { posts, page, pageSize, totalPages, hasNextPage: page < totalPages, board, query, syncError };
+    return { posts, page, pageSize, totalPages, board, query, syncError };
   }
 
   const chunkSize = 500;
@@ -142,15 +139,13 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     const sql = `SELECT id, title, content_text, author, board_key, published_at FROM posts ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY published_at DESC, id DESC LIMIT ?`;
     const chunk = await all<PostScanRow>(env.DB.prepare(sql).bind(...args, chunkSize));
     if (!chunk.length) break;
-    for (const post of chunk) {
-      const blockStart = Date.now();
-      const allowedBlock = allowedByBlocks(post, blockRegexes);
-      addTiming("blockMatchMs", Date.now() - blockStart);
-      if (!allowedBlock) continue;
-      const searchStart = Date.now();
-      const allowedSearch = allowedBySearch(post, queryRegex);
-      addTiming("searchMatchMs", Date.now() - searchStart);
-      if (!allowedSearch) continue;
+    const blockStart = Date.now();
+    const blockAllowed = blockRegexes.length ? chunk.filter((post) => allowedByBlocks(post, blockRegexes)) : chunk;
+    if (timings) timings.blockMatchMs = (timings.blockMatchMs || 0) + (Date.now() - blockStart);
+    const searchStart = Date.now();
+    const searchAllowed = queryRegex ? blockAllowed.filter((post) => allowedBySearch(post, queryRegex)) : blockAllowed;
+    if (timings) timings.searchMatchMs = (timings.searchMatchMs || 0) + (Date.now() - searchStart);
+    for (const post of searchAllowed) {
       if (matched >= start && matched < end) pagePostIds.push(post.id);
       lastPagePostIds.push(post.id);
       if (lastPagePostIds.length > pageSize) lastPagePostIds.shift();
@@ -178,7 +173,7 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const posts = await postsByIds(env, user, pageHasRows ? pagePostIds : lastPagePostIds);
   setTiming("dbPageMs", Date.now() - dbPageStart);
   setTiming("totalMs", Date.now() - totalStart);
-  return { posts, page, pageSize, totalPages, hasNextPage: stoppedAtPageLimit, board, query, syncError };
+  return { posts, page, pageSize, totalPages, board, query, syncError };
 }
 
 export async function markReadAndGetLink(env: Env, user: User | null, postId: number): Promise<string | null> {

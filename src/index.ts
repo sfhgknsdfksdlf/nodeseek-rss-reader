@@ -278,7 +278,7 @@ async function health(env: Env): Promise<Response> {
   }
 }
 
-async function handleFetch(request: Request, env: Env): Promise<Response> {
+async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const isHomeRoute = url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname);
   const homeTimings: HomeTimings | undefined = isHomeRoute ? { queryPosts: {}, render: {} } : undefined;
@@ -305,16 +305,16 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     homeTimings.adminStatusMs = Date.now() - adminStatusStart;
     const response = await renderHome(env, user, pageData, admin, homeTimings);
     homeTimings.totalMs = Date.now() - homeStart;
-    await storeLastHomeTiming(env, { path: url.pathname, query: url.searchParams.get("q") || "", board: url.searchParams.get("board") || "", page: pageData.page, user: !!user, postCount: pageData.posts.length, recordedAt: new Date().toISOString(), timings: homeTimings });
+    ctx.waitUntil(storeLastHomeTiming(env, { path: url.pathname, query: url.searchParams.get("q") || "", board: url.searchParams.get("board") || "", page: pageData.page, user: !!user, postCount: pageData.posts.length, recordedAt: new Date().toISOString(), timings: homeTimings }));
     return response;
   }
   return new Response("Not found", { status: 404 });
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      return await handleFetch(request, env);
+      return await handleFetch(request, env, ctx);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (new URL(request.url).pathname.startsWith("/api/")) return json({ ok: false, error: message }, 500);

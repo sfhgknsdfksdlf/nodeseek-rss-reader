@@ -59,6 +59,7 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `sync_state(key, value, updated_at)`
 - `rss_fetch_failures(id, source, method, status, status_text, error, preview, created_at)` legacy table no longer read by diagnostics.
 - `rss_fetch_attempts(id, source, method, outcome, status, status_text, error, preview, created_at)`
+- `sync_state.last_home_timing` stores the latest normal home-page server timing snapshot for `/api/debug/status`.
 
 ## API
 
@@ -80,6 +81,16 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - RSS fetch attempts, both successes and failures, are written to D1 as structured records in `rss_fetch_attempts`.
 - Attempt records are retained for 24 hours and exposed in admin diagnostics; old `rss_fetch_failures` rows are ignored by new diagnostics.
 - `GET /api/debug/status?token=ADMIN_SECRET` includes backend timing fields plus `rss.attemptStats` for `cron.success`, `cron.failure`, `rssTest.success`, and `rssTest.failure`, while preserving raw `rss.results` output and `rss.failureSummary`.
+- `/api/debug/status` does not run live RSS fetch diagnostics by default; append `live=1` to run `/api/rss-test` style fetch checks.
+
+## Home Page Timing And Scanning
+
+- Normal `/` and `/page/:page` requests record server-side timing for auth, post querying, block/search matching, highlight group loading, title/body highlighting, and HTML rendering.
+- The latest timing snapshot is written asynchronously with `ctx.waitUntil()` to avoid delaying the page response.
+- `page=N` URLs and pager UI remain unchanged.
+- When search or block rules require Worker-side filtering, scanning stops after the current page is filled instead of scanning the full post table.
+- Worker-side scans use keyset pagination internally with `published_at DESC, id DESC`; SQL fast paths use the same ordering for stable pagination.
+- Migration `0008_posts_keyset_indexes.sql` adds `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)` indexes for keyset and board-filtered scans.
 
 ## UI Rules
 
