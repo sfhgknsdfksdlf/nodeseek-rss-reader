@@ -70,20 +70,38 @@ export interface PageData {
 
 export interface HomeTimings {
   totalMs?: number;
+  authMs?: number;
+  adminStatusMs?: number;
   queryPosts?: {
     totalMs?: number;
+    blockRulesLoadMs?: number;
+    blockRegexCompileMs?: number;
+    blockMatchMs?: number;
+    searchRegexCompileMs?: number;
+    searchMatchMs?: number;
     countMs?: number;
+    dbPageMs?: number;
     scanMs?: number;
-    blockMs?: number;
-    searchMs?: number;
     scannedChunks?: number;
     matchedPosts?: number;
   };
   render?: {
-    groupsMs?: number;
-    postsMs?: number;
+    totalMs?: number;
+    highlightGroupsLoadMs?: number;
+    postsHtmlMs?: number;
     titleHighlightMs?: number;
     bodyHighlightMs?: number;
-    htmlMs?: number;
+    htmlShellMs?: number;
   };
+}
+
+export interface HomeTimingSnapshot {
+  path: string;
+  query: string;
+  board: string;
+  page: number;
+  user: boolean;
+  postCount: number;
+  recordedAt: string;
+  timings: HomeTimings;
 }

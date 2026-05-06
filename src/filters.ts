@@ -62,8 +62,21 @@ export function highlightText(text: string, groups: HighlightGroup[]): string {
   return output;
 }
 
-export function highlightHtml(html: string, _groups: HighlightGroup[]): string {
-  return html;
+function highlightEscapedText(text: string, groups: HighlightGroup[]): string {
+  let output = text;
+  for (const group of groups) {
+    for (const pattern of group.patterns) {
+      const re = safeRegex(pattern);
+      if (!re) continue;
+      output = output.replace(new RegExp(re.source, "gi"), (match) => `<mark style="background:${escapeAttr(group.color)}">${match}</mark>`);
+    }
+  }
+  return output;
+}
+
+export function highlightHtml(html: string, groups: HighlightGroup[]): string {
+  if (!groups.some((group) => group.patterns.length)) return html;
+  return html.split(/(<[^>]+>)/g).map((part) => part.startsWith("<") ? part : highlightEscapedText(part, groups)).join("");
 }
 
 export function postTextForBlock(post: Post): string {

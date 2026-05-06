@@ -54,9 +54,18 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const setTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
     if (timings) timings[key] = value;
   };
+  const addTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
+    if (timings) timings[key] = (timings[key] || 0) + value;
+  };
+  const blocksStart = Date.now();
   const blocks = await getBlockRules(env, user);
+  setTiming("blockRulesLoadMs", Date.now() - blocksStart);
+  const blockRegexStart = Date.now();
   const blockRegexes = blocks.map((rule) => safeRegex(rule.pattern)).filter((rule): rule is RegExp => !!rule);
+  setTiming("blockRegexCompileMs", Date.now() - blockRegexStart);
+  const searchRegexStart = Date.now();
   const queryRegex = query ? safeRegex(query) : null;
+  setTiming("searchRegexCompileMs", Date.now() - searchRegexStart);
   if (!query && blocks.length === 0) {
     const countStart = Date.now();
     const where = board ? "WHERE board_key = ?" : "";
@@ -78,7 +87,9 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     }
     sql += "ORDER BY p.published_at DESC LIMIT ? OFFSET ?";
     args.push(pageSize, offset);
+    const dbPageStart = Date.now();
     const posts = await all<Post>(env.DB.prepare(sql).bind(...args));
+    setTiming("dbPageMs", Date.now() - dbPageStart);
     const syncError = total === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
     setTiming("totalMs", Date.now() - totalStart);
     return { posts, page, pageSize, totalPages, board, query, syncError };
@@ -108,11 +119,11 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     for (const post of chunk) {
       const blockStart = Date.now();
       const allowedBlock = allowedByBlocks(post, blockRegexes);
-      if (timings) timings.blockMs = (timings.blockMs || 0) + (Date.now() - blockStart);
+      addTiming("blockMatchMs", Date.now() - blockStart);
       if (!allowedBlock) continue;
       const searchStart = Date.now();
       const allowedSearch = allowedBySearch(post, queryRegex);
-      if (timings) timings.searchMs = (timings.searchMs || 0) + (Date.now() - searchStart);
+      addTiming("searchMatchMs", Date.now() - searchStart);
       if (!allowedSearch) continue;
       if (matched >= start && matched < end) pagePosts.push(post);
       lastPagePosts.push(post);

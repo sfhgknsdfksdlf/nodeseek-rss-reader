@@ -3,11 +3,11 @@ import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
-import { profileRenderHome, renderHome } from "./render";
+import { renderHome } from "./render";
 import { getRssAttemptDiagnostics, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
-import type { Env, HomeTimings, User } from "./types";
+import type { Env, HomeTimingSnapshot, HomeTimings, User } from "./types";
 
 const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader"><rect width="128" height="128" rx="30" fill="#fff"/><rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/><path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/><circle cx="38" cy="91" r="8" fill="#111"/><path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/><path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/></svg>`;
 const manifest = { name: "NodeSeek RSS Reader", short_name: "NodeSeek RSS", start_url: "/", display: "standalone", background_color: "#000000", theme_color: "#000000", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
@@ -159,14 +159,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const latestPost = await measure("latestPostMs", async () => env.DB.prepare("SELECT guid, title, link, published_at, fetched_at FROM posts ORDER BY published_at DESC LIMIT 1").first<{ guid: string; title: string; link: string; published_at: string; fetched_at: string }>());
   const rssResults = live ? await measure("rssTestMs", async () => testRssFetch(env)) : [];
   const rssDiagnostics = await measure("rssDiagnosticsMs", async () => getRssAttemptDiagnostics(env));
-  const homeTimings: HomeTimings = { queryPosts: {}, render: {} };
-  await measure("homeProfileMs", async () => {
-    const homeUrl = new URL(request.url);
-    homeUrl.pathname = "/";
-    homeUrl.search = "";
-    const pageData = await queryPosts(env, null, homeUrl, homeTimings.queryPosts);
-    await profileRenderHome(env, null, pageData, homeTimings);
-  });
+  const lastHomeTiming = await measure("homeTimingMs", async () => getLastHomeTiming(env));
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -194,9 +187,24 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
       lastCleanupAt: sync.last_cleanup_at?.value || "",
       rows: syncRows
     },
-    home: { path: "/", timings: homeTimings },
+    home: lastHomeTiming,
     rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
+}
+
+async function getLastHomeTiming(env: Env): Promise<HomeTimingSnapshot | null> {
+  const row = await env.DB.prepare("SELECT value, updated_at FROM sync_state WHERE key = 'last_home_timing' LIMIT 1").first<{ value: string; updated_at: string }>();
+  if (!row?.value) return null;
+  try {
+    const parsed = JSON.parse(row.value) as HomeTimingSnapshot;
+    return { ...parsed, recordedAt: row.updated_at || parsed.recordedAt };
+  } catch {
+    return null;
+  }
+}
+
+async function storeLastHomeTiming(env: Env, snapshot: HomeTimingSnapshot): Promise<void> {
+  await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('last_home_timing', ?, ?)").bind(JSON.stringify(snapshot), snapshot.recordedAt).run();
 }
 
 async function importHighlights(request: Request, env: Env, user: User): Promise<Response> {
@@ -272,12 +280,17 @@ async function health(env: Env): Promise<Response> {
 
 async function handleFetch(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  const isHomeRoute = url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname);
+  const homeTimings: HomeTimings | undefined = isHomeRoute ? { queryPosts: {}, render: {} } : undefined;
+  const homeStart = isHomeRoute ? Date.now() : 0;
   if (url.pathname === "/icon.svg") return new Response(iconSvg, { headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "public, max-age=86400" } });
   if (url.pathname === "/manifest.webmanifest") return json(manifest, 200, { "cache-control": "public, max-age=86400" });
   if (url.pathname === "/health") return health(env);
   if (!env.DB) return missingDbResponse(request);
   if (url.pathname === "/admin") return handleAdmin(request, env);
+  const authStart = isHomeRoute ? Date.now() : 0;
   const user = await currentUser(request, env);
+  if (homeTimings) homeTimings.authMs = Date.now() - authStart;
   if (url.pathname.startsWith("/api/")) return handleApi(request, env, user, url);
   if (url.pathname === "/telegram/webhook" && request.method === "POST") return handleTelegram(request, env);
   const openMatch = /^\/post\/(\d+)\/open$/.exec(url.pathname);
@@ -285,7 +298,16 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const link = await markReadAndGetLink(env, user, Number(openMatch[1]));
     return link ? Response.redirect(link, 302) : new Response("Not found", { status: 404 });
   }
-  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) return renderHome(env, user, await queryPosts(env, user, url), await adminStatus(request, env));
+  if (isHomeRoute && homeTimings) {
+    const pageData = await queryPosts(env, user, url, homeTimings.queryPosts);
+    const adminStatusStart = Date.now();
+    const admin = await adminStatus(request, env);
+    homeTimings.adminStatusMs = Date.now() - adminStatusStart;
+    const response = await renderHome(env, user, pageData, admin, homeTimings);
+    homeTimings.totalMs = Date.now() - homeStart;
+    await storeLastHomeTiming(env, { path: url.pathname, query: url.searchParams.get("q") || "", board: url.searchParams.get("board") || "", page: pageData.page, user: !!user, postCount: pageData.posts.length, recordedAt: new Date().toISOString(), timings: homeTimings });
+    return response;
+  }
   return new Response("Not found", { status: 404 });
 }
 
