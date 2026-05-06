@@ -19,33 +19,42 @@ function pager(data: PageData): string {
   return `<nav class="pager"><a class="page" href="${pageUrl(Math.max(1, data.page - 1), data)}">上一页</a>${pages.map((p) => `<a class="page ${p === data.page ? "current" : ""}" href="${pageUrl(p, data)}">${p}</a>`).join("")}<a class="page" href="${pageUrl(Math.min(data.totalPages, data.page + 1), data)}">下一页</a></nav>`;
 }
 
-function renderPost(post: Post, groups: Awaited<ReturnType<typeof getHighlightGroups>>, timings?: HomeTimings["render"]): string {
+function renderPost(post: Post, groups: Awaited<ReturnType<typeof getHighlightGroups>>): string {
   const link = escapeAttr(post.link);
-  const titleStart = Date.now();
-  const title = highlightText(post.title, groups);
-  if (timings) timings.titleHighlightMs = (timings.titleHighlightMs || 0) + (Date.now() - titleStart);
-  const bodyStart = Date.now();
-  const body = highlightHtml(post.content_html, groups);
-  if (timings) timings.bodyHighlightMs = (timings.bodyHighlightMs || 0) + (Date.now() - bodyStart);
-  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${title}</a></div><div class="body">${body}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
+  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${highlightText(post.title, groups)}</a></div><div class="body">${highlightHtml(post.content_html, groups)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
 }
 
-export async function renderHome(env: Env, user: User | null, data: PageData, admin: { adminSecretConfigured: boolean; adminAuthenticated: boolean }, timings?: HomeTimings): Promise<Response> {
-  const renderStart = Date.now();
-  const groupsStart = Date.now();
+export async function renderHome(env: Env, user: User | null, data: PageData, admin: { adminSecretConfigured: boolean; adminAuthenticated: boolean }): Promise<Response> {
   const groups = await getHighlightGroups(env, user);
-  if (timings) timings.render = { ...(timings.render || {}), groupsMs: Date.now() - groupsStart };
   const boardSelect = `<select name="board">${boardOptions.map(([value, label]) => `<option value="${escapeAttr(value)}" ${value === data.board ? "selected" : ""}>${label}</option>`).join("")}</select>`;
   const empty = data.syncError ? `<p class="muted">暂无帖子。RSS 获取失败：${escapeHtml(data.syncError)}。请打开 <a href="/api/rss-test">/api/rss-test</a> 查看请求测试结果。</p>` : `<p class="muted">暂无帖子</p>`;
   const adminNotice = adminNoticeHtml(admin);
   const github = `<footer class="footer"><a class="github-link" href="https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader" target="_blank" rel="noreferrer" aria-label="GitHub nodeseek-rss-reader"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.09.68-.22.68-.49 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.3 9.3 0 0 1 12 6.99c.85 0 1.7.12 2.5.35 1.9-1.33 2.74-1.05 2.74-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.95.68 1.92 0 1.38-.01 2.5-.01 2.84 0 .27.18.59.69.49A10.12 10.12 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg><span>nodeseek-rss-reader</span><span id="githubStars" class="muted">★</span></a></footer>`;
-  const postsStart = Date.now();
-  const postsHtml = data.posts.map((p) => renderPost(p, groups, timings?.render)).join("") || empty;
-  if (timings) timings.render = { ...(timings.render || {}), postsMs: Date.now() - postsStart };
-  const htmlStart = Date.now();
+  const postsHtml = data.posts.map((p) => renderPost(p, groups)).join("") || empty;
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>NodeSeek RSS Reader</title><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><style>${styles}</style></head><body><main class="wrap"><header class="top"><a class="brand" href="/">NodeSeek RSS Reader</a><div class="auth">${user ? `<span class="muted hide-sm">${escapeHtml(user.username)}</span><button data-dialog="settings">设置</button><button id="logout">退出</button>` : `<button data-dialog="login">登录</button><button data-dialog="register" class="primary">注册</button>`}</div></header>${adminNotice}<form class="toolbar" action="/" method="get">${boardSelect}<input name="q" value="${escapeAttr(data.query)}" placeholder="正则搜索"><button class="primary">搜索</button></form>${pager(data)}<section>${postsHtml}</section>${pager(data)}<form class="jump" action="/" method="get"><input name="page" inputmode="numeric" value="${data.page}" aria-label="页码"><input type="hidden" name="board" value="${escapeAttr(data.board)}"><input type="hidden" name="q" value="${escapeAttr(data.query)}"><button>跳转</button></form>${github}</main><div class="nd-jump-group"><button class="nd-jump-item" id="toTop" aria-label="到顶部"><svg viewBox="0 0 24 24" width="24"><path fill="currentColor" d="M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z" /></svg></button><button class="nd-jump-item" id="toBottom" aria-label="到底部"><svg viewBox="0 0 24 24" width="24"><path fill="currentColor" d="M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z" /></svg></button></div>${dialogs(user)}<div id="toast" class="toast"></div><script>${clientScript()}</script></body></html>`;
-  if (timings) timings.totalMs = Date.now() - renderStart;
   return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
+export async function profileRenderHome(env: Env, user: User | null, data: PageData, timings: HomeTimings): Promise<void> {
+  const renderStart = Date.now();
+  timings.render ||= {};
+  const groupsStart = Date.now();
+  const groups = await getHighlightGroups(env, user);
+  timings.render.groupsMs = Date.now() - groupsStart;
+  const postsStart = Date.now();
+  for (const post of data.posts) {
+    const titleStart = Date.now();
+    highlightText(post.title, groups);
+    timings.render.titleHighlightMs = (timings.render.titleHighlightMs || 0) + (Date.now() - titleStart);
+    const bodyStart = Date.now();
+    highlightHtml(post.content_html, groups);
+    timings.render.bodyHighlightMs = (timings.render.bodyHighlightMs || 0) + (Date.now() - bodyStart);
+  }
+  timings.render.postsMs = Date.now() - postsStart;
+  const htmlStart = Date.now();
+  data.posts.map((p) => renderPost(p, groups)).join("");
+  timings.render.htmlMs = Date.now() - htmlStart;
+  timings.totalMs = Date.now() - renderStart;
 }
 
 function adminNoticeHtml(admin: { adminSecretConfigured: boolean; adminAuthenticated: boolean }): string {

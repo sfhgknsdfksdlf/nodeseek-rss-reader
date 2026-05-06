@@ -62,21 +62,8 @@ export function highlightText(text: string, groups: HighlightGroup[]): string {
   return output;
 }
 
-export function highlightHtml(html: string, groups: HighlightGroup[]): string {
-  if (!html) return "";
-  const parts = html.split(/(<[^>]+>)/g);
-  return parts.map((part) => {
-    if (part.startsWith("<") && part.endsWith(">")) return part;
-    let output = escapeHtml(part);
-    for (const group of groups) {
-      for (const pattern of group.patterns) {
-        const re = safeRegex(pattern);
-        if (!re) continue;
-        output = output.replace(new RegExp(re.source, "gi"), (match) => `<mark style="background:${escapeAttr(group.color)}">${match}</mark>`);
-      }
-    }
-    return output;
-  }).join("");
+export function highlightHtml(html: string, _groups: HighlightGroup[]): string {
+  return html;
 }
 
 export function postTextForBlock(post: Post): string {

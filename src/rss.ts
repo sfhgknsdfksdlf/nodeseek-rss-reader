@@ -104,6 +104,11 @@ export interface RssAttemptStats {
   rssTest: { success: number; failure: number };
 }
 
+export interface RssAttemptDiagnostics {
+  attemptStats: RssAttemptStats;
+  failureSummary: RssFailureSummary;
+}
+
 function textBetween(xml: string, tags: string[]): string {
   for (const tag of tags) {
     const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
@@ -258,51 +263,55 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
 }
 
 export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary> {
+  return (await getRssAttemptDiagnostics(env)).failureSummary;
+}
+
+export async function getRssAttemptStats(env: Env): Promise<RssAttemptStats> {
+  return (await getRssAttemptDiagnostics(env)).attemptStats;
+}
+
+export async function getRssAttemptDiagnostics(env: Env): Promise<RssAttemptDiagnostics> {
   await cleanupOldRssAttemptLogs(env);
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   const rows = await all<RssAttemptLogRow>(env.DB.prepare("SELECT created_at, source, method, outcome, status, status_text, error, preview FROM rss_fetch_attempts WHERE created_at >= ? ORDER BY created_at DESC LIMIT 200").bind(since));
   const bySource: Record<string, number> = {};
   const byResult: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
+  const attemptStats: RssAttemptStats = {
+    cron: { success: 0, failure: 0 },
+    rssTest: { success: 0, failure: 0 }
+  };
   for (const row of rows) {
     bySource[row.source] = (bySource[row.source] || 0) + 1;
     const resultKey = `${row.method}_${row.outcome}`;
     byResult[resultKey] = (byResult[resultKey] || 0) + 1;
     const statusKey = row.status == null ? "error" : String(row.status);
     byStatus[statusKey] = (byStatus[statusKey] || 0) + 1;
+    const bucket = row.source === "sync" ? attemptStats.cron : row.source === "rss_test" ? attemptStats.rssTest : null;
+    if (bucket) {
+      if (row.outcome === "success") bucket.success++;
+      if (row.outcome === "failure") bucket.failure++;
+    }
   }
   return {
-    windowHours: 24,
-    since,
-    totalAttempts: rows.length,
-    bySource,
-    byResult,
-    byStatus,
-    recentSamples: rows.slice(0, 20).map((row) => ({
-      createdAt: row.created_at,
-      source: row.source,
-      method: row.method,
-      outcome: row.outcome,
-      status: row.status,
-      statusText: row.status_text,
-      error: row.error,
-      preview: row.preview
-    }))
+    attemptStats,
+    failureSummary: {
+      windowHours: 24,
+      since,
+      totalAttempts: rows.length,
+      bySource,
+      byResult,
+      byStatus,
+      recentSamples: rows.slice(0, 20).map((row) => ({
+        createdAt: row.created_at,
+        source: row.source,
+        method: row.method,
+        outcome: row.outcome,
+        status: row.status,
+        statusText: row.status_text,
+        error: row.error,
+        preview: row.preview
+      }))
+    }
   };
-}
-
-export async function getRssAttemptStats(env: Env): Promise<RssAttemptStats> {
-  await cleanupOldRssAttemptLogs(env);
-  const rows = await all<{ source: string; outcome: string }>(env.DB.prepare("SELECT source, outcome FROM rss_fetch_attempts WHERE created_at >= ?").bind(new Date(Date.now() - 24 * 3600 * 1000).toISOString()));
-  const stats: RssAttemptStats = {
-    cron: { success: 0, failure: 0 },
-    rssTest: { success: 0, failure: 0 }
-  };
-  for (const row of rows) {
-    const bucket = row.source === "sync" ? stats.cron : row.source === "rss_test" ? stats.rssTest : null;
-    if (!bucket) continue;
-    if (row.outcome === "success") bucket.success++;
-    if (row.outcome === "failure") bucket.failure++;
-  }
-  return stats;
 }

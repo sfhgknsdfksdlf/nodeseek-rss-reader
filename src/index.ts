@@ -3,8 +3,8 @@ import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
-import { renderHome } from "./render";
-import { getRssAttemptStats, getRssFailureSummary, safeSyncRss, testRssFetch } from "./rss";
+import { profileRenderHome, renderHome } from "./render";
+import { getRssAttemptDiagnostics, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
 import type { Env, HomeTimings, User } from "./types";
@@ -141,6 +141,8 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
 
 async function debugStatus(request: Request, env: Env): Promise<Response> {
   if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确" }, 401);
+  const url = new URL(request.url);
+  const live = url.searchParams.get("live") === "1";
   const startedAt = Date.now();
   const timings: Record<string, number> = {};
   const measure = async <T>(key: string, fn: () => Promise<T>): Promise<T> => {
@@ -155,9 +157,16 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const sync = Object.fromEntries(syncRows.map((row) => [row.key, { value: row.value, updatedAt: row.updated_at }]));
   const postCount = await measure("postCountMs", async () => (await env.DB.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count || 0);
   const latestPost = await measure("latestPostMs", async () => env.DB.prepare("SELECT guid, title, link, published_at, fetched_at FROM posts ORDER BY published_at DESC LIMIT 1").first<{ guid: string; title: string; link: string; published_at: string; fetched_at: string }>());
-  const rssResults = await measure("rssTestMs", async () => testRssFetch(env));
-  const rssAttemptStats = await measure("rssAttemptStatsMs", async () => getRssAttemptStats(env));
-  const failureSummary = await measure("failureSummaryMs", async () => getRssFailureSummary(env));
+  const rssResults = live ? await measure("rssTestMs", async () => testRssFetch(env)) : [];
+  const rssDiagnostics = await measure("rssDiagnosticsMs", async () => getRssAttemptDiagnostics(env));
+  const homeTimings: HomeTimings = { queryPosts: {}, render: {} };
+  await measure("homeProfileMs", async () => {
+    const homeUrl = new URL(request.url);
+    homeUrl.pathname = "/";
+    homeUrl.search = "";
+    const pageData = await queryPosts(env, null, homeUrl, homeTimings.queryPosts);
+    await profileRenderHome(env, null, pageData, homeTimings);
+  });
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -185,7 +194,8 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
       lastCleanupAt: sync.last_cleanup_at?.value || "",
       rows: syncRows
     },
-    rss: { ok: !!latestRss, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssAttemptStats, failureSummary }
+    home: { path: "/", timings: homeTimings },
+    rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
 }
 
@@ -275,32 +285,7 @@ async function handleFetch(request: Request, env: Env): Promise<Response> {
     const link = await markReadAndGetLink(env, user, Number(openMatch[1]));
     return link ? Response.redirect(link, 302) : new Response("Not found", { status: 404 });
   }
-  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) {
-    const debugRequested = url.searchParams.get("debug") === "1" || request.headers.get("x-debug-timings") === "1" || !!env.ADMIN_SECRET && isAdmin(request, env);
-    const timings: HomeTimings | undefined = debugRequested ? { queryPosts: {}, render: {} } : undefined;
-    const posts = await queryPosts(env, user, url, timings?.queryPosts);
-    const response = await renderHome(env, user, posts, await adminStatus(request, env), timings);
-    if (debugRequested && timings) {
-      const existing = response.headers.get("Server-Timing");
-      const extra = [
-        timings.totalMs != null ? `home_total;dur=${Math.round(timings.totalMs)}` : null,
-        timings.queryPosts?.totalMs != null ? `query_posts_total;dur=${Math.round(timings.queryPosts.totalMs)}` : null,
-        timings.queryPosts?.countMs != null ? `query_posts_count;dur=${Math.round(timings.queryPosts.countMs)}` : null,
-        timings.queryPosts?.scanMs != null ? `query_posts_scan;dur=${Math.round(timings.queryPosts.scanMs)}` : null,
-        timings.queryPosts?.blockMs != null ? `query_posts_block;dur=${Math.round(timings.queryPosts.blockMs)}` : null,
-        timings.queryPosts?.searchMs != null ? `query_posts_search;dur=${Math.round(timings.queryPosts.searchMs)}` : null,
-        timings.render?.groupsMs != null ? `render_groups;dur=${Math.round(timings.render.groupsMs)}` : null,
-        timings.render?.postsMs != null ? `render_posts;dur=${Math.round(timings.render.postsMs)}` : null,
-        timings.render?.titleHighlightMs != null ? `render_title_highlight;dur=${Math.round(timings.render.titleHighlightMs)}` : null,
-        timings.render?.bodyHighlightMs != null ? `render_body_highlight;dur=${Math.round(timings.render.bodyHighlightMs)}` : null,
-        timings.render?.htmlMs != null ? `render_html;dur=${Math.round(timings.render.htmlMs)}` : null
-      ].filter((item): item is string => !!item);
-      const headers = new Headers(response.headers);
-      headers.set("Server-Timing", [existing, ...extra].filter(Boolean).join(", "));
-      return new Response(await response.text(), { status: response.status, headers });
-    }
-    return response;
-  }
+  if (url.pathname === "/" || /^\/page\/\d+$/.test(url.pathname)) return renderHome(env, user, await queryPosts(env, user, url), await adminStatus(request, env));
   return new Response("Not found", { status: 404 });
 }
 
