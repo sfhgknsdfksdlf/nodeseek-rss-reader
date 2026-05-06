@@ -113,13 +113,6 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     return { posts, page, pageSize, totalPages, hasNextPage: page < totalPages, board, query, syncError };
   }
 
-  const args: unknown[] = [];
-  let sql = "SELECT id, title, content_text, author, board_key, published_at FROM posts ";
-  if (board) {
-    sql += "WHERE board_key = ? ";
-    args.push(board);
-  }
-  sql += "ORDER BY published_at DESC LIMIT ? OFFSET ?";
   const chunkSize = 500;
   let matched = 0;
   const pagePostIds: number[] = [];
@@ -132,9 +125,22 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const countStart = Date.now();
   const total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${board ? "WHERE board_key = ?" : ""}`).bind(...(board ? [board] : []))))?.count || 0;
   setTiming("countMs", Date.now() - countStart);
-  scan: for (let offset = 0; ; offset += chunkSize) {
+  let cursorPublishedAt: string | null = null;
+  let cursorId: number | null = null;
+  scan: for (;;) {
     scannedChunks++;
-    const chunk = await all<PostScanRow>(env.DB.prepare(sql).bind(...args, chunkSize, offset));
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (board) {
+      where.push("board_key = ?");
+      args.push(board);
+    }
+    if (cursorPublishedAt !== null && cursorId !== null) {
+      where.push("(published_at < ? OR (published_at = ? AND id < ?))");
+      args.push(cursorPublishedAt, cursorPublishedAt, cursorId);
+    }
+    const sql = `SELECT id, title, content_text, author, board_key, published_at FROM posts ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY published_at DESC, id DESC LIMIT ?`;
+    const chunk = await all<PostScanRow>(env.DB.prepare(sql).bind(...args, chunkSize));
     if (!chunk.length) break;
     for (const post of chunk) {
       const blockStart = Date.now();
@@ -154,6 +160,9 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
         break scan;
       }
     }
+    const last = chunk[chunk.length - 1];
+    cursorPublishedAt = last.published_at;
+    cursorId = last.id;
     if (chunk.length < chunkSize) break;
   }
   setTiming("scanMs", Date.now() - scanStart);
