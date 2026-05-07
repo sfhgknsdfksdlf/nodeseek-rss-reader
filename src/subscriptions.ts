@@ -16,39 +16,66 @@ function pushKey(userId: number, subscriptionId: number, postId: number, channel
   return `${userId}:${subscriptionId}:${postId}:${channel}`;
 }
 
-export async function processSubscriptions(env: Env, posts: Post[]): Promise<void> {
-  if (!posts.length) return;
+export interface SubscriptionProcessTimings {
+  loadSubsMs: number;
+  loadSentMs: number;
+  compileRegexMs: number;
+  buildPostTextsMs: number;
+  matchMs: number;
+  sendMs: number;
+  totalMs: number;
+}
+
+export async function processSubscriptions(env: Env, posts: Post[]): Promise<SubscriptionProcessTimings> {
+  const startedAt = Date.now();
+  if (!posts.length) return { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
+  const loadSubsStartedAt = Date.now();
   const subs = await all<SubscriptionWithUser>(env.DB.prepare(`
     SELECT s.*, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code, u.telegram_bind_code_expires_at
     FROM subscriptions s
     JOIN users u ON u.id = s.user_id
     ORDER BY s.id DESC
   `));
-  if (!subs.length) return;
+  const loadSubsMs = Date.now() - loadSubsStartedAt;
+  if (!subs.length) return { loadSubsMs, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
   const postIds = posts.map((post) => post.id);
   const placeholders = postIds.map(() => "?").join(",");
+  const loadSentStartedAt = Date.now();
   const logRows = await all<{ user_id: number; subscription_id: number; post_id: number; channel: string }>(
     env.DB.prepare(`SELECT user_id, subscription_id, post_id, channel FROM push_logs WHERE post_id IN (${placeholders})`).bind(...postIds)
   );
+  const loadSentMs = Date.now() - loadSentStartedAt;
   const sent = new Set(logRows.map((row) => pushKey(row.user_id, row.subscription_id, row.post_id, row.channel)));
+  const compileStartedAt = Date.now();
   const compiledSubs = subs.map((sub) => ({ sub, regex: safeRegex(sub.pattern) })).filter((item): item is { sub: SubscriptionWithUser; regex: RegExp } => !!item.regex);
-  if (!compiledSubs.length) return;
+  const compileRegexMs = Date.now() - compileStartedAt;
+  if (!compiledSubs.length) return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
+  const buildPostTextsStartedAt = Date.now();
   const settings = await runtimeSettings(env);
   const postTexts = new Map(posts.map((post) => [post.id, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
+  const buildPostTextsMs = Date.now() - buildPostTextsStartedAt;
+  const matchStartedAt = Date.now();
+  let sendMs = 0;
   for (const { sub, regex } of compiledSubs) {
     const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code, telegram_bind_code_expires_at: sub.telegram_bind_code_expires_at };
     for (const post of posts) {
       if (!regex.test(postTexts.get(post.id) || "")) continue;
       if (sub.send_email && !sent.has(pushKey(user.id, sub.id, post.id, "email"))) {
+        const sendStartedAt = Date.now();
         await sendBrevo(env, user, sub, post, settings);
+        sendMs += Date.now() - sendStartedAt;
         sent.add(pushKey(user.id, sub.id, post.id, "email"));
       }
       if (sub.send_telegram && !sent.has(pushKey(user.id, sub.id, post.id, "telegram"))) {
+        const sendStartedAt = Date.now();
         await sendTelegram(env, user, sub, post, settings);
+        sendMs += Date.now() - sendStartedAt;
         sent.add(pushKey(user.id, sub.id, post.id, "telegram"));
       }
     }
   }
+  const matchMs = Date.now() - matchStartedAt;
+  return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs, matchMs, sendMs, totalMs: Date.now() - startedAt };
 }
 
 export async function createSubscription(request: Request, env: Env, user: User): Promise<Response> {

@@ -336,31 +336,36 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
-    const startedAt = Date.now();
-    const result = await safeSyncRss(env);
-    let processSubscriptionsMs = 0;
-    const shouldProcessSubscriptions = result.ok && !result.firstSync;
-    if (shouldProcessSubscriptions) {
-      const processStartedAt = Date.now();
-      await processSubscriptions(env, result.insertedPosts);
-      processSubscriptionsMs = Date.now() - processStartedAt;
-    }
-    const cleanupStartedAt = Date.now();
-    await cleanupOldData(env);
-    const cleanupOldDataMs = Date.now() - cleanupStartedAt;
-    await recordCronTiming(env, {
-      recordedAt: new Date().toISOString(),
-      ok: result.ok,
-      firstSync: result.firstSync,
-      inserted: result.inserted,
-      ranProcessSubscriptions: shouldProcessSubscriptions,
-      timings: {
-        rssSync: result.timings || { fetchRssMs: 0, parseItemsMs: 0, insertPostsMs: 0, writeStateMs: 0, totalMs: 0 },
-        processSubscriptionsMs,
-        cleanupOldDataMs,
-        totalMs: Date.now() - startedAt
-      },
-      ...(result.error ? { error: result.error } : {})
-    });
+  const startedAt = Date.now();
+  const result = await safeSyncRss(env);
+  let subscriptionTimings = { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
+  const shouldProcessSubscriptions = result.ok && !result.firstSync;
+  if (shouldProcessSubscriptions) {
+    subscriptionTimings = await processSubscriptions(env, result.insertedPosts);
   }
+  const cleanupStartedAt = Date.now();
+  await cleanupOldData(env);
+  const cleanupOldDataMs = Date.now() - cleanupStartedAt;
+  await recordCronTiming(env, {
+    recordedAt: new Date().toISOString(),
+    ok: result.ok,
+    firstSync: result.firstSync,
+    inserted: result.inserted,
+    ranProcessSubscriptions: shouldProcessSubscriptions,
+    timings: {
+      rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 },
+      processSubscriptionsMs: subscriptionTimings.totalMs,
+      cleanupOldDataMs,
+      totalMs: Date.now() - startedAt
+    },
+    cpu: {
+      rssParseItemsMs: result.cpu?.parseItemsMs || 0,
+      processSubscriptionsCompileMs: subscriptionTimings.compileRegexMs,
+      processSubscriptionsMatchMs: subscriptionTimings.matchMs,
+      cleanupPrepMs: 0,
+      totalMs: (result.cpu?.parseItemsMs || 0) + subscriptionTimings.compileRegexMs + subscriptionTimings.matchMs
+    },
+    ...(result.error ? { error: result.error } : {})
+  });
+}
 };

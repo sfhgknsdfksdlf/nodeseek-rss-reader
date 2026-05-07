@@ -169,36 +169,37 @@ async function recordRssAttempt(env: Env, source: string, strategy: string, outc
     .run();
 }
 
-async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: string, strategy: FetchStrategy): Promise<{ ok: true; xml: string; strategy: string } | { ok: false; message: string }> {
+async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: string, strategy: FetchStrategy): Promise<{ ok: true; xml: string; strategy: string; fetchMs: number } | { ok: false; message: string; fetchMs: number }> {
+  const startedAt = Date.now();
   try {
     const res = await fetchWithStrategy(rssUrl, strategy);
     const text = await res.text();
     const preview = text.slice(0, 120);
     if (res.ok) {
       await recordRssAttempt(env, source, strategy.name, "success", res.status, res.statusText, undefined, preview);
-      return { ok: true, xml: text, strategy: strategy.name };
+      return { ok: true, xml: text, strategy: strategy.name, fetchMs: Date.now() - startedAt };
     }
     const message = `${logMethod}: ${res.status} ${res.statusText} ${preview}`.trim();
     await recordRssAttempt(env, source, strategy.name, "failure", res.status, res.statusText, undefined, preview);
-    return { ok: false, message };
+    return { ok: false, message, fetchMs: Date.now() - startedAt };
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
     await recordRssAttempt(env, source, strategy.name, "failure", undefined, undefined, messageText);
-    return { ok: false, message: `${logMethod}: ${messageText}` };
+    return { ok: false, message: `${logMethod}: ${messageText}`, fetchMs: Date.now() - startedAt };
   }
 }
 
-async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string }> {
+async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number; writeStateMs: number } }> {
   const rssStrategy = rssFetchStrategies[0];
   const browserStrategy = rssFetchStrategies[1];
   const firstDelaySeconds = randomIntInclusive(21, 24);
   const retryDelaySeconds = randomIntInclusive(21, 24);
   await sleep(firstDelaySeconds * 1000);
   const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
-  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy };
+  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy, timings: { fetchRssMs: rssResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: 0, writeStateMs: 0 } };
   await sleep(retryDelaySeconds * 1000);
   const browserResult = await tryStrategy(env, "sync", "browser", rssUrl, browserStrategy);
-  if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy };
+  if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy, timings: { fetchRssMs: rssResult.fetchMs + browserResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: browserResult.fetchMs, writeStateMs: 0 } };
   const errors = [rssResult.message, browserResult.message];
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
@@ -213,8 +214,15 @@ async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Pr
 
 export interface RssSyncTiming {
   fetchRssMs: number;
+  fetchFirstStrategyMs: number;
+  fetchRetryStrategyMs: number;
   parseItemsMs: number;
+  parseItemCount: number;
+  prepareInsertMs: number;
+  insertLoopMs: number;
+  insertedPostLoadMs: number;
   insertPostsMs: number;
+  writeSyncStateMs: number;
   writeStateMs: number;
   totalMs: number;
 }
@@ -225,6 +233,10 @@ export interface RssSyncResult {
   insertedPosts: Post[];
   strategy: string;
   timings: RssSyncTiming;
+  cpu: {
+    parseItemsMs: number;
+    parseItemCount: number;
+  };
 }
 
 export interface SafeRssSyncResult {
@@ -234,13 +246,17 @@ export interface SafeRssSyncResult {
   ok: boolean;
   strategy?: string;
   timings?: RssSyncTiming;
+  cpu?: {
+    parseItemsMs: number;
+    parseItemCount: number;
+  };
   error?: string;
 }
 
 export async function syncRss(env: Env): Promise<RssSyncResult> {
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
   const fetchStartedAt = Date.now();
-  const { xml, strategy } = await fetchRssXml(env, rssUrl);
+  const { xml, strategy, timings: fetchTimings } = await fetchRssXml(env, rssUrl);
   const fetchRssMs = Date.now() - fetchStartedAt;
   const parseStartedAt = Date.now();
   const items = parseItems(xml);
@@ -249,9 +265,13 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   let inserted = 0;
   const insertedPosts: Post[] = [];
   const insertStartedAt = Date.now();
+  const prepareInsertStartedAt = Date.now();
+  const insertStmt = env.DB.prepare("INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  const prepareInsertMs = Date.now() - prepareInsertStartedAt;
+  const insertedPostLoadStartedAt = Date.now();
   for (const item of items) {
     const fetchedAt = nowIso();
-    const result = await env.DB.prepare("INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    const result = await insertStmt
       .bind(item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, fetchedAt)
       .run();
     if (result.meta.changes) {
@@ -260,23 +280,26 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
       if (post) insertedPosts.push(post);
     }
   }
-  const insertPostsMs = Date.now() - insertStartedAt;
+  const insertedPostLoadMs = Date.now() - insertedPostLoadStartedAt;
+  const insertLoopMs = Date.now() - insertStartedAt;
   const writeStateStartedAt = Date.now();
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('first_sync_done', '1', ?), ('last_sync_at', ?, ?), ('last_sync_error', '', ?), ('last_sync_strategy', ?, ?)").bind(nowIso(), nowIso(), nowIso(), nowIso(), strategy, nowIso()).run();
-  const writeStateMs = Date.now() - writeStateStartedAt;
-  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs, parseItemsMs, insertPostsMs, writeStateMs, totalMs: Date.now() - fetchStartedAt } };
+  const writeSyncStateMs = Date.now() - writeStateStartedAt;
+  const writeStateMs = fetchTimings.writeStateMs + writeSyncStateMs;
+  const insertPostsMs = insertLoopMs + insertedPostLoadMs;
+  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertLoopMs, insertedPostLoadMs, insertPostsMs, writeSyncStateMs, writeStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
 }
 
 export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
   try {
     const result = await syncRss(env);
-    return { inserted: result.inserted, firstSync: result.firstSync, insertedPosts: result.insertedPosts, ok: true, strategy: result.strategy, timings: result.timings };
+    return { inserted: result.inserted, firstSync: result.firstSync, insertedPosts: result.insertedPosts, ok: true, strategy: result.strategy, timings: result.timings, cpu: result.cpu };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("RSS sync failed", message);
     await setSyncState(env, "last_sync_error", message);
     await setSyncState(env, "last_sync_at", nowIso());
-    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, parseItemsMs: 0, insertPostsMs: 0, writeStateMs: 0, totalMs: 0 } };
+    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
   }
 }
 

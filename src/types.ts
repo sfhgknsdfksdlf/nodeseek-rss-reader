@@ -117,13 +117,27 @@ export interface CronTimingSnapshot {
   timings: {
     rssSync: {
       fetchRssMs: number;
+      fetchFirstStrategyMs: number;
+      fetchRetryStrategyMs: number;
       parseItemsMs: number;
+      parseItemCount: number;
+      prepareInsertMs: number;
+      insertLoopMs: number;
+      insertedPostLoadMs: number;
       insertPostsMs: number;
+      writeSyncStateMs: number;
       writeStateMs: number;
       totalMs: number;
     };
     processSubscriptionsMs: number;
     cleanupOldDataMs: number;
+    totalMs: number;
+  };
+  cpu: {
+    rssParseItemsMs: number;
+    processSubscriptionsCompileMs: number;
+    processSubscriptionsMatchMs: number;
+    cleanupPrepMs: number;
     totalMs: number;
   };
   error?: string;
