@@ -1,7 +1,7 @@
 import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
-import type { CronTimingSnapshot, Env, NewPostForSubscription, Post } from "./types";
+import type { CronTimingSnapshot, Env, Post } from "./types";
 
 interface RssItem {
   guid: string;
@@ -234,7 +234,7 @@ export interface RssSyncTiming {
 export interface RssSyncResult {
   inserted: number;
   firstSync: boolean;
-  insertedPosts: NewPostForSubscription[];
+  insertedPosts: Post[];
   strategy: string;
   timings: RssSyncTiming;
   cpu: {
@@ -246,7 +246,7 @@ export interface RssSyncResult {
 export interface SafeRssSyncResult {
   inserted: number;
   firstSync: boolean;
-  insertedPosts: NewPostForSubscription[];
+  insertedPosts: Post[];
   ok: boolean;
   strategy?: string;
   timings?: RssSyncTiming;
@@ -267,15 +267,22 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const parseItemsMs = Date.now() - parseStartedAt;
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
   let inserted = 0;
-  const insertedPosts: NewPostForSubscription[] = [];
+  const insertedPosts: Post[] = [];
   const insertStartedAt = Date.now();
   const prepareInsertStartedAt = Date.now();
-  const insertRows = items.filter((item) => !!item.guid).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
+  const guids = items.map((item) => item.guid).filter((guid) => !!guid);
+  const existingGuids = new Set<string>();
+  if (guids.length) {
+    const placeholders = guids.map(() => "?").join(",");
+    const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...guids));
+    for (const row of rows) existingGuids.add(row.guid);
+  }
+  const insertRows = items.filter((item) => item.guid && !existingGuids.has(item.guid)).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
   const prepareInsertMs = Date.now() - prepareInsertStartedAt;
   let insertBindRunMs = 0;
   let insertLookupMs = 0;
   let insertNewCount = 0;
-  let insertExistingCount = 0;
+  let insertExistingCount = existingGuids.size;
   const batchStartedAt = Date.now();
   if (insertRows.length) {
     const sql = "INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -284,23 +291,33 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
     for (let index = 0; index < results.length; index++) {
       const result = results[index];
       const { item, values } = insertRows[index];
-      if (result.meta.changes) {
-        insertNewCount++;
+      if (result.meta.changes) insertNewCount++;
+      else insertExistingCount++;
+    }
+    if (insertNewCount) {
+      const lookupStartedAt = Date.now();
+      const insertedGuids = insertRows.map((row) => row.item.guid);
+      const placeholders = insertedGuids.map(() => "?").join(",");
+      const idRows = await all<{ id: number; guid: string }>(env.DB.prepare(`SELECT id, guid FROM posts WHERE guid IN (${placeholders})`).bind(...insertedGuids));
+      const idsByGuid = new Map(idRows.map((row) => [row.guid, row.id]));
+      for (const row of insertRows) {
+        const id = idsByGuid.get(row.item.guid);
+        if (!id) continue;
         inserted++;
         insertedPosts.push({
-          guid: item.guid,
-          title: item.title,
-          link: item.link,
-          content_html: item.contentHtml,
-          content_text: item.contentText,
-          author: item.author || null,
-          board_key: item.board || null,
-          published_at: item.publishedAt,
-          fetched_at: values[8] as string
+          id,
+          guid: row.item.guid,
+          title: row.item.title,
+          link: row.item.link,
+          content_html: row.item.contentHtml,
+          content_text: row.item.contentText,
+          author: row.item.author || null,
+          board_key: row.item.board || null,
+          published_at: row.item.publishedAt,
+          fetched_at: row.values[8] as string
         });
-      } else {
-        insertExistingCount++;
       }
+      insertLookupMs = Date.now() - lookupStartedAt;
     }
   }
   const insertLoopMs = Date.now() - insertStartedAt;
