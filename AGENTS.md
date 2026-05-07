@@ -41,6 +41,43 @@
 - Generated deploy config is root `wrangler.generated.jsonc`; edit `wrangler.jsonc` and `scripts/cloudflare-build.mjs`, not generated output.
 - `nodeseek.js` and `rss.nodeseek.com.har` are local reference artifacts; do not commit them unless explicitly asked.
 
+## Project Structure
+- `src/board.ts`: board key normalization and board-specific helpers.
+- `src/db.ts`: thin D1 helpers and JSON/cookie utilities.
+- `src/filters.ts`: regex safety, highlighting, HTML helpers.
+- `src/time.ts`: time/date helpers.
+- `src/types.ts`: shared Env, model, and timing types.
+- `src/index.ts`: request routing, scheduled cron entry, `/api/debug/status`.
+- `src/rss.ts`: RSS fetch, parse, sync, and RSS attempt diagnostics.
+- `src/posts.ts`: homepage / `/api/posts` query, pagination, search, block filtering.
+- `src/subscriptions.ts`: subscription regex matching and notification dispatch.
+- `src/notifications.ts`: Brevo / Telegram senders and push logging.
+- `src/cleanup.ts`: retention cleanup for posts, read states, push logs, sessions.
+- `src/settings.ts`: runtime settings load/save and admin configuration.
+- `src/auth.ts`: registration, login, sessions, Telegram binding.
+- `src/render.ts`: SSR HTML shell and client script.
+- `src/styles.ts`: all CSS and responsive layout.
+- `migrations/`: numbered D1 schema migrations; never rewrite deployed ones.
+- `scripts/cloudflare-build.mjs`: Cloudflare build/deploy config generator; keep generated config at repo root.
+
+## Where to Look
+- RSS / cron slowness: `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts`.
+- Homepage slowness: `src/posts.ts`, `src/render.ts`.
+- Notification dedupe / push logs: `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0001_initial.sql`, `migrations/0009_push_logs_post_guid.sql`.
+- Admin / debug status: `src/index.ts`, `src/settings.ts`.
+
+## Current Conventions
+- Keep RSS sync limited to `https://rss.nodeseek.com/`.
+- Prefer D1-backed state; avoid introducing new storage.
+- Keep homepage card layout and CSS centralized in `src/styles.ts`.
+- Preserve root `wrangler.generated.jsonc` and root `wrangler.jsonc` generation flow.
+- When changing push dedupe, use `push_logs.post_guid`; do not reintroduce `post_id`-based dedupe in new code.
+
+## Gotchas
+- `posts.guid` is the stable RSS identity; use it for RSS-side de-duplication.
+- `posts.id` still exists for persisted rows and read-state relations, but new RSS notification flow should not depend on re-reading full rows.
+- Cron diagnostics in `/api/debug/status` are temporary investigation aids; avoid adding more unless they explain a concrete regression.
+
 ## Commands
 - Typecheck: `npm run typecheck`.
 - Build-script syntax check: `node --check scripts/cloudflare-build.mjs`.
@@ -59,8 +96,9 @@
 
 ## Data And Migrations
 - Add schema changes as new numbered SQL files; never rewrite deployed migrations.
-- Current migration chain: `0001_initial` through `0008_posts_keyset_indexes`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
+- Current migration chain: `0001_initial` through `0009_push_logs_post_guid`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
 - `0008_posts_keyset_indexes` supports home-page keyset scans with `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)`; confirm remote indexes with `wrangler d1 execute ... "SELECT name FROM sqlite_master WHERE type='index' AND name IN (...)"` when diagnosing deep-page slowness.
+- `0009_push_logs_post_guid` moves push-log idempotency from `post_id` to `post_guid`; preserve this direction in new dedupe code.
 - `ADMIN_SECRET` authenticates `/admin?token=...` and encrypts D1-stored Brevo/Telegram settings; changing it requires re-entering encrypted settings.
 - PBKDF2 iterations must stay `<= 100000`; Workers reject higher counts.
 
