@@ -115,7 +115,13 @@ export interface CronTimingSnapshot {
   inserted: number;
   ranProcessSubscriptions: boolean;
   timings: {
-    safeSyncRssMs: number;
+    rssSync: {
+      fetchRssMs: number;
+      parseItemsMs: number;
+      insertPostsMs: number;
+      writeStateMs: number;
+      totalMs: number;
+    };
     processSubscriptionsMs: number;
     cleanupOldDataMs: number;
     totalMs: number;

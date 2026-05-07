@@ -337,9 +337,7 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
     const startedAt = Date.now();
-    const syncStartedAt = Date.now();
     const result = await safeSyncRss(env);
-    const safeSyncRssMs = Date.now() - syncStartedAt;
     let processSubscriptionsMs = 0;
     const shouldProcessSubscriptions = result.ok && !result.firstSync;
     if (shouldProcessSubscriptions) {
@@ -350,14 +348,14 @@ export default {
     const cleanupStartedAt = Date.now();
     await cleanupOldData(env);
     const cleanupOldDataMs = Date.now() - cleanupStartedAt;
-    void recordCronTiming(env, {
+    await recordCronTiming(env, {
       recordedAt: new Date().toISOString(),
       ok: result.ok,
       firstSync: result.firstSync,
       inserted: result.inserted,
       ranProcessSubscriptions: shouldProcessSubscriptions,
       timings: {
-        safeSyncRssMs,
+        rssSync: result.timings || { fetchRssMs: 0, parseItemsMs: 0, insertPostsMs: 0, writeStateMs: 0, totalMs: 0 },
         processSubscriptionsMs,
         cleanupOldDataMs,
         totalMs: Date.now() - startedAt

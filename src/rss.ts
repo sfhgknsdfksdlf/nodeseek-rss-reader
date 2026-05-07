@@ -211,13 +211,44 @@ async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Pr
   await setSyncState(env, "last_cron_timing", JSON.stringify(snapshot));
 }
 
-export async function syncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; insertedPosts: Post[] }> {
+export interface RssSyncTiming {
+  fetchRssMs: number;
+  parseItemsMs: number;
+  insertPostsMs: number;
+  writeStateMs: number;
+  totalMs: number;
+}
+
+export interface RssSyncResult {
+  inserted: number;
+  firstSync: boolean;
+  insertedPosts: Post[];
+  strategy: string;
+  timings: RssSyncTiming;
+}
+
+export interface SafeRssSyncResult {
+  inserted: number;
+  firstSync: boolean;
+  insertedPosts: Post[];
+  ok: boolean;
+  strategy?: string;
+  timings?: RssSyncTiming;
+  error?: string;
+}
+
+export async function syncRss(env: Env): Promise<RssSyncResult> {
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
+  const fetchStartedAt = Date.now();
   const { xml, strategy } = await fetchRssXml(env, rssUrl);
+  const fetchRssMs = Date.now() - fetchStartedAt;
+  const parseStartedAt = Date.now();
   const items = parseItems(xml);
+  const parseItemsMs = Date.now() - parseStartedAt;
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
   let inserted = 0;
   const insertedPosts: Post[] = [];
+  const insertStartedAt = Date.now();
   for (const item of items) {
     const fetchedAt = nowIso();
     const result = await env.DB.prepare("INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -229,19 +260,23 @@ export async function syncRss(env: Env): Promise<{ inserted: number; firstSync: 
       if (post) insertedPosts.push(post);
     }
   }
+  const insertPostsMs = Date.now() - insertStartedAt;
+  const writeStateStartedAt = Date.now();
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('first_sync_done', '1', ?), ('last_sync_at', ?, ?), ('last_sync_error', '', ?), ('last_sync_strategy', ?, ?)").bind(nowIso(), nowIso(), nowIso(), nowIso(), strategy, nowIso()).run();
-  return { inserted, firstSync: first, insertedPosts };
+  const writeStateMs = Date.now() - writeStateStartedAt;
+  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs, parseItemsMs, insertPostsMs, writeStateMs, totalMs: Date.now() - fetchStartedAt } };
 }
 
-export async function safeSyncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; insertedPosts: Post[]; ok: boolean; error?: string }> {
+export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
   try {
-    return { ...(await syncRss(env)), ok: true };
+    const result = await syncRss(env);
+    return { inserted: result.inserted, firstSync: result.firstSync, insertedPosts: result.insertedPosts, ok: true, strategy: result.strategy, timings: result.timings };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("RSS sync failed", message);
     await setSyncState(env, "last_sync_error", message);
     await setSyncState(env, "last_sync_at", nowIso());
-    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message };
+    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, parseItemsMs: 0, insertPostsMs: 0, writeStateMs: 0, totalMs: 0 } };
   }
 }
 
