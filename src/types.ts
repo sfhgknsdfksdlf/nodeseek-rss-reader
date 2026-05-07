@@ -36,6 +36,8 @@ export interface Post {
   is_read?: number;
 }
 
+export type NewPostForSubscription = Omit<Post, "id"> & { id?: number };
+
 export interface HighlightGroup {
   id: number;
   user_id: number;

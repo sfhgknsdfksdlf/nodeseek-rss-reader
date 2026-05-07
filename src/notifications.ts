@@ -1,15 +1,16 @@
 import { nowIso } from "./db";
 import { runtimeSettings } from "./settings";
 import type { RuntimeSettings } from "./settings";
-import type { Env, Post, Subscription, User } from "./types";
+import type { Env, NewPostForSubscription, Subscription, User } from "./types";
 
-async function logPush(env: Env, userId: number, subscriptionId: number, postId: number, channel: string, status: string, error = ""): Promise<void> {
+async function logPush(env: Env, userId: number, subscriptionId: number, postId: number | undefined, channel: string, status: string, error = ""): Promise<void> {
+  if (!postId) return;
   await env.DB.prepare("INSERT OR IGNORE INTO push_logs (user_id, subscription_id, post_id, channel, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .bind(userId, subscriptionId, postId, channel, status, error || null, nowIso())
     .run();
 }
 
-export async function sendBrevo(env: Env, user: User, sub: Subscription, post: Post, cachedSettings?: RuntimeSettings): Promise<void> {
+export async function sendBrevo(env: Env, user: User, sub: Subscription, post: NewPostForSubscription, cachedSettings?: RuntimeSettings): Promise<void> {
   const settings = cachedSettings || await runtimeSettings(env);
   if (!settings.brevoApiKey || !settings.mailFrom || !user.email) return;
   try {
@@ -29,7 +30,7 @@ export async function sendBrevo(env: Env, user: User, sub: Subscription, post: P
   }
 }
 
-export async function sendTelegram(env: Env, user: User, sub: Subscription, post: Post, cachedSettings?: RuntimeSettings): Promise<void> {
+export async function sendTelegram(env: Env, user: User, sub: Subscription, post: NewPostForSubscription, cachedSettings?: RuntimeSettings): Promise<void> {
   const settings = cachedSettings || await runtimeSettings(env);
   if (!settings.telegramBotToken || !user.telegram_chat_id) return;
   try {

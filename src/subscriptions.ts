@@ -2,7 +2,7 @@ import { all, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { sendBrevo, sendTelegram } from "./notifications";
 import { runtimeSettings } from "./settings";
-import type { Env, Post, Subscription, User } from "./types";
+import type { Env, NewPostForSubscription, Subscription, User } from "./types";
 
 interface SubscriptionWithUser extends Subscription {
   username: string;
@@ -10,10 +10,6 @@ interface SubscriptionWithUser extends Subscription {
   telegram_chat_id: string | null;
   telegram_bind_code: string | null;
   telegram_bind_code_expires_at: string | null;
-}
-
-function pushKey(userId: number, subscriptionId: number, postId: number, channel: string): string {
-  return `${userId}:${subscriptionId}:${postId}:${channel}`;
 }
 
 export interface SubscriptionProcessTimings {
@@ -26,7 +22,7 @@ export interface SubscriptionProcessTimings {
   totalMs: number;
 }
 
-export async function processSubscriptions(env: Env, posts: Post[]): Promise<SubscriptionProcessTimings> {
+export async function processSubscriptions(env: Env, posts: NewPostForSubscription[]): Promise<SubscriptionProcessTimings> {
   const startedAt = Date.now();
   if (!posts.length) return { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
   const loadSubsStartedAt = Date.now();
@@ -38,39 +34,31 @@ export async function processSubscriptions(env: Env, posts: Post[]): Promise<Sub
   `));
   const loadSubsMs = Date.now() - loadSubsStartedAt;
   if (!subs.length) return { loadSubsMs, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
-  const postIds = posts.map((post) => post.id);
-  const placeholders = postIds.map(() => "?").join(",");
   const loadSentStartedAt = Date.now();
-  const logRows = await all<{ user_id: number; subscription_id: number; post_id: number; channel: string }>(
-    env.DB.prepare(`SELECT user_id, subscription_id, post_id, channel FROM push_logs WHERE post_id IN (${placeholders})`).bind(...postIds)
-  );
   const loadSentMs = Date.now() - loadSentStartedAt;
-  const sent = new Set(logRows.map((row) => pushKey(row.user_id, row.subscription_id, row.post_id, row.channel)));
   const compileStartedAt = Date.now();
   const compiledSubs = subs.map((sub) => ({ sub, regex: safeRegex(sub.pattern) })).filter((item): item is { sub: SubscriptionWithUser; regex: RegExp } => !!item.regex);
   const compileRegexMs = Date.now() - compileStartedAt;
   if (!compiledSubs.length) return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
   const buildPostTextsStartedAt = Date.now();
   const settings = await runtimeSettings(env);
-  const postTexts = new Map(posts.map((post) => [post.id, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
+  const postTexts = new Map(posts.map((post) => [post.guid, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
   const buildPostTextsMs = Date.now() - buildPostTextsStartedAt;
   const matchStartedAt = Date.now();
   let sendMs = 0;
   for (const { sub, regex } of compiledSubs) {
     const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code, telegram_bind_code_expires_at: sub.telegram_bind_code_expires_at };
     for (const post of posts) {
-      if (!regex.test(postTexts.get(post.id) || "")) continue;
-      if (sub.send_email && !sent.has(pushKey(user.id, sub.id, post.id, "email"))) {
+      if (!regex.test(postTexts.get(post.guid) || "")) continue;
+      if (sub.send_email) {
         const sendStartedAt = Date.now();
         await sendBrevo(env, user, sub, post, settings);
         sendMs += Date.now() - sendStartedAt;
-        sent.add(pushKey(user.id, sub.id, post.id, "email"));
       }
-      if (sub.send_telegram && !sent.has(pushKey(user.id, sub.id, post.id, "telegram"))) {
+      if (sub.send_telegram) {
         const sendStartedAt = Date.now();
         await sendTelegram(env, user, sub, post, settings);
         sendMs += Date.now() - sendStartedAt;
-        sent.add(pushKey(user.id, sub.id, post.id, "telegram"));
       }
     }
   }

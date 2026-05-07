@@ -1,7 +1,7 @@
 import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
-import type { CronTimingSnapshot, Env, Post } from "./types";
+import type { CronTimingSnapshot, Env, NewPostForSubscription, Post } from "./types";
 
 interface RssItem {
   guid: string;
@@ -234,7 +234,7 @@ export interface RssSyncTiming {
 export interface RssSyncResult {
   inserted: number;
   firstSync: boolean;
-  insertedPosts: Post[];
+  insertedPosts: NewPostForSubscription[];
   strategy: string;
   timings: RssSyncTiming;
   cpu: {
@@ -246,7 +246,7 @@ export interface RssSyncResult {
 export interface SafeRssSyncResult {
   inserted: number;
   firstSync: boolean;
-  insertedPosts: Post[];
+  insertedPosts: NewPostForSubscription[];
   ok: boolean;
   strategy?: string;
   timings?: RssSyncTiming;
@@ -267,31 +267,40 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const parseItemsMs = Date.now() - parseStartedAt;
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
   let inserted = 0;
-  const insertedPosts: Post[] = [];
+  const insertedPosts: NewPostForSubscription[] = [];
   const insertStartedAt = Date.now();
   const prepareInsertStartedAt = Date.now();
-  const insertStmt = env.DB.prepare("INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  const insertRows = items.filter((item) => !!item.guid).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
   const prepareInsertMs = Date.now() - prepareInsertStartedAt;
   let insertBindRunMs = 0;
   let insertLookupMs = 0;
   let insertNewCount = 0;
   let insertExistingCount = 0;
-  for (const item of items) {
-    const fetchedAt = nowIso();
-    const bindRunStartedAt = Date.now();
-    const result = await insertStmt
-      .bind(item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, fetchedAt)
-      .run();
-    insertBindRunMs += Date.now() - bindRunStartedAt;
-    if (result.meta.changes) {
-      insertNewCount++;
-      inserted++;
-      const lookupStartedAt = Date.now();
-      const post = await one<Post>(env.DB.prepare("SELECT * FROM posts WHERE guid = ?").bind(item.guid));
-      insertLookupMs += Date.now() - lookupStartedAt;
-      if (post) insertedPosts.push(post);
-    } else {
-      insertExistingCount++;
+  const batchStartedAt = Date.now();
+  if (insertRows.length) {
+    const sql = "INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    const statements = insertRows.map((row) => env.DB.prepare(sql).bind(...row.values));
+    const results = await env.DB.batch(statements);
+    for (let index = 0; index < results.length; index++) {
+      const result = results[index];
+      const { item, values } = insertRows[index];
+      if (result.meta.changes) {
+        insertNewCount++;
+        inserted++;
+        insertedPosts.push({
+          guid: item.guid,
+          title: item.title,
+          link: item.link,
+          content_html: item.contentHtml,
+          content_text: item.contentText,
+          author: item.author || null,
+          board_key: item.board || null,
+          published_at: item.publishedAt,
+          fetched_at: values[8] as string
+        });
+      } else {
+        insertExistingCount++;
+      }
     }
   }
   const insertLoopMs = Date.now() - insertStartedAt;
@@ -301,6 +310,7 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
   const writeStateMs = fetchTimings.writeStateMs + writeSyncStateMs;
   const insertPostsMs = insertLoopMs + insertedPostLoadMs;
+  insertBindRunMs = Date.now() - batchStartedAt;
   return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertBindRunMs, insertLookupMs, insertNewCount, insertExistingCount, insertLoopMs, insertedPostLoadMs, insertPostsMs, writeSyncStateMs, writeStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
 }
 
