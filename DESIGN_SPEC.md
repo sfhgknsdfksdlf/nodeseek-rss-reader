@@ -81,6 +81,9 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - RSS fetch attempts, both successes and failures, are written to D1 as structured records in `rss_fetch_attempts`.
 - Attempt records are retained for 24 hours and exposed in admin diagnostics; old `rss_fetch_failures` rows are ignored by new diagnostics.
 - `GET /api/debug/status?token=ADMIN_SECRET` includes backend timing fields plus `rss.attemptStats` for `cron.success`, `cron.failure`, `rssTest.success`, and `rssTest.failure`, while preserving raw `rss.results` output and `rss.failureSummary`.
+- `/api/debug/status` also exposes a structured `cronTiming` object that breaks down the latest cron execution into per-step durations, at minimum: `safeSyncRssMs`, `processSubscriptionsMs`, `cleanupOldDataMs`, `totalMs`, and an `updatedAt` timestamp for the snapshot.
+- The cron timing snapshot is captured asynchronously from the scheduled path so normal cron execution is not blocked by diagnostics writes.
+- The debug payload should keep the current RSS diagnostics unchanged and only add the cron timing breakdown as an additional top-level field.
 - `/api/debug/status` does not run live RSS fetch diagnostics by default; append `live=1` to run `/api/rss-test` style fetch checks.
 
 ## Home Page Timing And Scanning
