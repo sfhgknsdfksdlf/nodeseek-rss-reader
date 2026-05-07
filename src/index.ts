@@ -4,10 +4,10 @@ import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
-import { getRssAttemptDiagnostics, safeSyncRss, testRssFetch } from "./rss";
+import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
-import type { Env, HomeTimingSnapshot, HomeTimings, User } from "./types";
+import type { CronTimingSnapshot, Env, HomeTimingSnapshot, HomeTimings, User } from "./types";
 
 const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader"><rect width="128" height="128" rx="30" fill="#fff"/><rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/><path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/><circle cx="38" cy="91" r="8" fill="#111"/><path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/><path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/></svg>`;
 const manifest = { name: "NodeSeek RSS Reader", short_name: "NodeSeek RSS", start_url: "/", display: "standalone", background_color: "#000000", theme_color: "#000000", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
@@ -160,6 +160,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const rssResults = live ? await measure("rssTestMs", async () => testRssFetch(env)) : [];
   const rssDiagnostics = await measure("rssDiagnosticsMs", async () => getRssAttemptDiagnostics(env));
   const lastHomeTiming = await measure("homeTimingMs", async () => getLastHomeTiming(env));
+  const lastCronTiming = await measure("cronTimingMs", async () => getLastCronTiming(env));
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -188,8 +189,20 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
       rows: syncRows
     },
     home: lastHomeTiming,
+    cronTiming: lastCronTiming,
     rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
+}
+
+async function getLastCronTiming(env: Env): Promise<CronTimingSnapshot | null> {
+  const row = await env.DB.prepare("SELECT value, updated_at FROM sync_state WHERE key = 'last_cron_timing' LIMIT 1").first<{ value: string; updated_at: string }>();
+  if (!row?.value) return null;
+  try {
+    const parsed = JSON.parse(row.value) as CronTimingSnapshot;
+    return { ...parsed, recordedAt: row.updated_at || parsed.recordedAt };
+  } catch {
+    return null;
+  }
 }
 
 async function getLastHomeTiming(env: Env): Promise<HomeTimingSnapshot | null> {
@@ -323,8 +336,33 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
+    const startedAt = Date.now();
+    const syncStartedAt = Date.now();
     const result = await safeSyncRss(env);
-    if (result.ok && !result.firstSync) await processSubscriptions(env, result.insertedPosts);
+    const safeSyncRssMs = Date.now() - syncStartedAt;
+    let processSubscriptionsMs = 0;
+    const shouldProcessSubscriptions = result.ok && !result.firstSync;
+    if (shouldProcessSubscriptions) {
+      const processStartedAt = Date.now();
+      await processSubscriptions(env, result.insertedPosts);
+      processSubscriptionsMs = Date.now() - processStartedAt;
+    }
+    const cleanupStartedAt = Date.now();
     await cleanupOldData(env);
+    const cleanupOldDataMs = Date.now() - cleanupStartedAt;
+    void recordCronTiming(env, {
+      recordedAt: new Date().toISOString(),
+      ok: result.ok,
+      firstSync: result.firstSync,
+      inserted: result.inserted,
+      ranProcessSubscriptions: shouldProcessSubscriptions,
+      timings: {
+        safeSyncRssMs,
+        processSubscriptionsMs,
+        cleanupOldDataMs,
+        totalMs: Date.now() - startedAt
+      },
+      ...(result.error ? { error: result.error } : {})
+    });
   }
 };

@@ -107,3 +107,18 @@ export interface HomeTimingSnapshot {
   recordedAt: string;
   timings: HomeTimings;
 }
+
+export interface CronTimingSnapshot {
+  recordedAt: string;
+  ok: boolean;
+  firstSync: boolean;
+  inserted: number;
+  ranProcessSubscriptions: boolean;
+  timings: {
+    safeSyncRssMs: number;
+    processSubscriptionsMs: number;
+    cleanupOldDataMs: number;
+    totalMs: number;
+  };
+  error?: string;
+}

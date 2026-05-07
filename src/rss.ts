@@ -1,7 +1,7 @@
 import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
-import type { Env, Post } from "./types";
+import type { CronTimingSnapshot, Env, Post } from "./types";
 
 interface RssItem {
   guid: string;
@@ -207,6 +207,10 @@ async function setSyncState(env: Env, key: string, value: string): Promise<void>
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)").bind(key, value, nowIso()).run();
 }
 
+async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Promise<void> {
+  await setSyncState(env, "last_cron_timing", JSON.stringify(snapshot));
+}
+
 export async function syncRss(env: Env): Promise<{ inserted: number; firstSync: boolean; insertedPosts: Post[] }> {
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
   const { xml, strategy } = await fetchRssXml(env, rssUrl);
@@ -239,6 +243,10 @@ export async function safeSyncRss(env: Env): Promise<{ inserted: number; firstSy
     await setSyncState(env, "last_sync_at", nowIso());
     return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message };
   }
+}
+
+export async function recordCronTiming(env: Env, snapshot: CronTimingSnapshot): Promise<void> {
+  await setCronTimingSnapshot(env, snapshot);
 }
 
 export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
