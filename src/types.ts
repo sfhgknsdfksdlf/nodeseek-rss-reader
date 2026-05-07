@@ -122,6 +122,10 @@ export interface CronTimingSnapshot {
       parseItemsMs: number;
       parseItemCount: number;
       prepareInsertMs: number;
+      insertBindRunMs: number;
+      insertLookupMs: number;
+      insertNewCount: number;
+      insertExistingCount: number;
       insertLoopMs: number;
       insertedPostLoadMs: number;
       insertPostsMs: number;

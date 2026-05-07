@@ -219,6 +219,10 @@ export interface RssSyncTiming {
   parseItemsMs: number;
   parseItemCount: number;
   prepareInsertMs: number;
+  insertBindRunMs: number;
+  insertLookupMs: number;
+  insertNewCount: number;
+  insertExistingCount: number;
   insertLoopMs: number;
   insertedPostLoadMs: number;
   insertPostsMs: number;
@@ -268,26 +272,36 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const prepareInsertStartedAt = Date.now();
   const insertStmt = env.DB.prepare("INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
   const prepareInsertMs = Date.now() - prepareInsertStartedAt;
-  const insertedPostLoadStartedAt = Date.now();
+  let insertBindRunMs = 0;
+  let insertLookupMs = 0;
+  let insertNewCount = 0;
+  let insertExistingCount = 0;
   for (const item of items) {
     const fetchedAt = nowIso();
+    const bindRunStartedAt = Date.now();
     const result = await insertStmt
       .bind(item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, fetchedAt)
       .run();
+    insertBindRunMs += Date.now() - bindRunStartedAt;
     if (result.meta.changes) {
+      insertNewCount++;
       inserted++;
+      const lookupStartedAt = Date.now();
       const post = await one<Post>(env.DB.prepare("SELECT * FROM posts WHERE guid = ?").bind(item.guid));
+      insertLookupMs += Date.now() - lookupStartedAt;
       if (post) insertedPosts.push(post);
+    } else {
+      insertExistingCount++;
     }
   }
-  const insertedPostLoadMs = Date.now() - insertedPostLoadStartedAt;
   const insertLoopMs = Date.now() - insertStartedAt;
+  const insertedPostLoadMs = insertLookupMs;
   const writeStateStartedAt = Date.now();
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('first_sync_done', '1', ?), ('last_sync_at', ?, ?), ('last_sync_error', '', ?), ('last_sync_strategy', ?, ?)").bind(nowIso(), nowIso(), nowIso(), nowIso(), strategy, nowIso()).run();
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
   const writeStateMs = fetchTimings.writeStateMs + writeSyncStateMs;
   const insertPostsMs = insertLoopMs + insertedPostLoadMs;
-  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertLoopMs, insertedPostLoadMs, insertPostsMs, writeSyncStateMs, writeStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
+  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertBindRunMs, insertLookupMs, insertNewCount, insertExistingCount, insertLoopMs, insertedPostLoadMs, insertPostsMs, writeSyncStateMs, writeStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
 }
 
 export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
@@ -299,7 +313,7 @@ export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
     console.error("RSS sync failed", message);
     await setSyncState(env, "last_sync_error", message);
     await setSyncState(env, "last_sync_at", nowIso());
-    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
+    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertLookupMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
   }
 }
 
