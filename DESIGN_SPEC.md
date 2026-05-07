@@ -62,7 +62,7 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `sync_state.last_home_timing` stores the latest normal home-page server timing snapshot for `/api/debug/status`.
 - RSS sync checks the current feed item `guid` values against `posts.guid` in one D1 query before inserting; only truly new RSS items are inserted.
 - Subscription matching consumes the in-memory list of newly discovered RSS items instead of re-reading inserted rows from D1.
-- Push notification idempotency uses `push_logs` and should be preserved; if subscription matching does not have numeric `posts.id`, dedupe/logging must use a stable post identifier such as `guid` rather than dropping dedupe entirely.
+- Push notification idempotency uses `push_logs` and is keyed by `post_guid` rather than numeric `post_id` so the RSS sync path can avoid re-reading inserted rows from D1.
 
 ## API
 
