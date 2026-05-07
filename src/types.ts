@@ -36,6 +36,8 @@ export interface Post {
   is_read?: number;
 }
 
+export type RssNewPost = Omit<Post, "id" | "is_read">;
+
 export interface HighlightGroup {
   id: number;
   user_id: number;

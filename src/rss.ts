@@ -1,7 +1,7 @@
 import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
-import type { CronTimingSnapshot, Env, Post } from "./types";
+import type { CronTimingSnapshot, Env, Post, RssNewPost } from "./types";
 
 interface RssItem {
   guid: string;
@@ -234,7 +234,7 @@ export interface RssSyncTiming {
 export interface RssSyncResult {
   inserted: number;
   firstSync: boolean;
-  insertedPosts: Post[];
+  insertedPosts: RssNewPost[];
   strategy: string;
   timings: RssSyncTiming;
   cpu: {
@@ -246,7 +246,7 @@ export interface RssSyncResult {
 export interface SafeRssSyncResult {
   inserted: number;
   firstSync: boolean;
-  insertedPosts: Post[];
+  insertedPosts: RssNewPost[];
   ok: boolean;
   strategy?: string;
   timings?: RssSyncTiming;
@@ -267,7 +267,7 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const parseItemsMs = Date.now() - parseStartedAt;
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
   let inserted = 0;
-  const insertedPosts: Post[] = [];
+  const insertedPosts: RssNewPost[] = [];
   const insertStartedAt = Date.now();
   const prepareInsertStartedAt = Date.now();
   const guids = items.map((item) => item.guid).filter((guid) => !!guid);
@@ -291,33 +291,23 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
     for (let index = 0; index < results.length; index++) {
       const result = results[index];
       const { item, values } = insertRows[index];
-      if (result.meta.changes) insertNewCount++;
-      else insertExistingCount++;
-    }
-    if (insertNewCount) {
-      const lookupStartedAt = Date.now();
-      const insertedGuids = insertRows.map((row) => row.item.guid);
-      const placeholders = insertedGuids.map(() => "?").join(",");
-      const idRows = await all<{ id: number; guid: string }>(env.DB.prepare(`SELECT id, guid FROM posts WHERE guid IN (${placeholders})`).bind(...insertedGuids));
-      const idsByGuid = new Map(idRows.map((row) => [row.guid, row.id]));
-      for (const row of insertRows) {
-        const id = idsByGuid.get(row.item.guid);
-        if (!id) continue;
+      if (result.meta.changes) {
+        insertNewCount++;
         inserted++;
         insertedPosts.push({
-          id,
-          guid: row.item.guid,
-          title: row.item.title,
-          link: row.item.link,
-          content_html: row.item.contentHtml,
-          content_text: row.item.contentText,
-          author: row.item.author || null,
-          board_key: row.item.board || null,
-          published_at: row.item.publishedAt,
-          fetched_at: row.values[8] as string
+          guid: item.guid,
+          title: item.title,
+          link: item.link,
+          content_html: item.contentHtml,
+          content_text: item.contentText,
+          author: item.author || null,
+          board_key: item.board || null,
+          published_at: item.publishedAt,
+          fetched_at: values[8] as string
         });
+      } else {
+        insertExistingCount++;
       }
-      insertLookupMs = Date.now() - lookupStartedAt;
     }
   }
   const insertLoopMs = Date.now() - insertStartedAt;
