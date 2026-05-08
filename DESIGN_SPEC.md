@@ -29,23 +29,25 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 
 ## Modules
 
-- `src/index.ts`: Worker entry, routing, cron handler.
-- `src/types.ts`: shared environment and model types.
-- `src/db.ts`: D1 helpers and SQL utilities.
+- `src/index.ts`: Worker entry, routing, cron handler, debug status.
+- `src/types.ts`: shared environment, model, and timing types.
+- `src/db.ts`: D1 helpers and SQL/cookie utilities.
 - `src/auth.ts`: registration, login, logout, sessions, PBKDF2 password hashing.
-- `src/rss.ts`: fetch and parse NodeSeek RSS, record structured RSS fetch attempt logs.
+- `src/rss.ts`: fetch, parse, sync, and record structured RSS fetch attempt logs.
 - `src/posts.ts`: post list query, pagination, search, block filtering, read state.
 - `src/filters.ts`: regex validation, matching, highlight rendering.
-- `src/subscriptions.ts`: subscription matching and deduplicated push dispatch.
-- `src/notifications.ts`: Brevo and Telegram notification sending.
-- `src/render.ts`: server-rendered HTML and client interaction script.
+- `src/subscriptions.ts`: subscription matching and push dispatch.
+- `src/notifications.ts`: Brevo and Telegram senders plus push logging.
+- `src/cleanup.ts`: retention cleanup for posts, read states, push logs, sessions.
+- `src/settings.ts`: runtime settings load/save and admin configuration.
+- `src/render.ts`: server-rendered HTML shell and client interaction script.
 - `src/styles.ts`: responsive black/white/OLED CSS.
 - `src/time.ts`: Beijing time formatting.
 - `src/board.ts`: board key to Chinese display mapping.
 
 ## Data Model
 
-- `users(id, username, password_hash, password_salt, email, telegram_chat_id, telegram_bind_code, created_at, updated_at)`
+- `users(id, username, password_hash, password_salt, email, telegram_chat_id, telegram_bind_code, telegram_bind_code_expires_at, created_at, updated_at)`
 - `sessions(id, user_id, expires_at, created_at)`
 - `admin_sessions(id, expires_at, created_at)`
 - `app_settings(key, value, encrypted, updated_at)`
@@ -55,14 +57,14 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `highlight_rules(id, group_id, pattern, created_at)`
 - `block_rules(id, user_id, pattern, created_at)`
 - `subscriptions(id, user_id, pattern, send_email, send_telegram, created_at, updated_at)`
-- `push_logs(id, user_id, subscription_id, post_id, channel, status, error, created_at)`
+- `push_logs(id, user_id, subscription_id, post_guid, channel, status, error, created_at)`
 - `sync_state(key, value, updated_at)`
 - `rss_fetch_failures(id, source, method, status, status_text, error, preview, created_at)` legacy table no longer read by diagnostics.
 - `rss_fetch_attempts(id, source, method, outcome, status, status_text, error, preview, created_at)`
 - `sync_state.last_home_timing` stores the latest normal home-page server timing snapshot for `/api/debug/status`.
 - RSS sync checks the current feed item `guid` values against `posts.guid` in one D1 query before inserting; only truly new RSS items are inserted.
 - Subscription matching consumes the in-memory list of newly discovered RSS items instead of re-reading inserted rows from D1.
-- Push notification idempotency uses `push_logs` and is keyed by `post_guid` rather than numeric `post_id` so the RSS sync path can avoid re-reading inserted rows from D1.
+- Push notification idempotency uses `push_logs.post_guid` rather than numeric `post_id` so the RSS sync path can avoid re-reading inserted rows from D1.
 
 ## API
 
