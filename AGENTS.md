@@ -1,143 +1,131 @@
-# OpenCode 行为规范: 严格规范驱动开发 (Strict SDD)
+# PROJECT KNOWLEDGE BASE
 
-你现在处于“严格规范驱动”模式。除非用户明确允许，否则禁止跳过设计阶段直接编码，禁止添加任何用户未提及的功能。
+**Generated:** 2026-09-03
+**Commit:** 95d3b14
+**Branch:** main
 
-## 核心原则
-1. **禁止幻觉**: 严禁根据“常识”或“最佳实践”自动补全用户未提及的业务逻辑。
-2. **两阶段执行**: 
-   - 阶段一：设计 (Design Phase)。必须先输出 `DESIGN_SPEC.md`。
-   - 阶段二：实现 (Implementation Phase)。必须在用户确认设计后，严格按设计稿编码。
-3. **字面服从**: 严格按照用户输入的文字描述进行解析，宁可提问，不可猜测。
+## OVERVIEW
 
-## 阶段工作流
+Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as an RSS reader. The Worker owns SSR pages, API routing, cron RSS synchronization, authentication, per-user rules, subscriptions, notifications, and diagnostics.
 
-### 1. 设计阶段 (Mandatory)
-当用户提交需求时，你必须首先生成或更新项目根目录下的 `DESIGN_SPEC.md`。
-- **输出要求**:
-  - 模块结构、API 定义、数据模型。
-  - 明确标出用户输入的原始需求点。
-- **暂停指令**: 完成文档后，必须输出：“设计文档已生成，请检查。确认无误后请输入 /build 或‘开始编码’。”
+## STRUCTURE
 
-### 2. 编码阶段 (Post-Approval)
-仅在收到确认指令后开始。
-- **代码一致性**: 生成的函数名、变量名、文件路径必须与 `DESIGN_SPEC.md` 保持 100% 一致。
-- **范围控制**: 仅编写实现设计稿所需的最少代码。严禁引入额外的第三方库（除非用户指定）。
+```text
+./
+├── src/                    # Worker routes and application modules
+├── migrations/             # Sequential D1 schema migrations
+├── scripts/                # Cloudflare build/deploy config generation
+├── DESIGN_SPEC.md          # SDD requirements and approved designs
+├── DESIGN_D1_PAGINATION.md # Pagination/rule-cache design constraints
+├── README.md               # Deployment and administrator setup
+└── wrangler.jsonc          # Source Worker/D1/cron configuration
+```
 
-## 交互约束
-- **术语映射**: 将用户的描述转成专业术语，与用户沟通时使用“用户的口语描述（专业术语）”的方式。
-- **澄清机制**: 如果用户输入含糊不清，必须列出 2-3 个理解选项让用户选择，而不是自动选择其中之一。
+This is one package, not a monorepo. `migrations/` and `scripts/` are independent operational domains, but their current size does not warrant child `AGENTS.md` files.
 
+## CODE MAP
 
-## 触发命令
-- `/start`: 重置状态，等待接收原始需求以开始设计。
-- `/spec`: 仅更新设计文档，不修改代码。
+| Symbol/module | Location | Role |
+|---|---|---|
+| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration, debug status |
+| RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, diagnostics |
+| Home query | `src/posts.ts` | Page/board/search query, filtering, read state |
+| SSR shell/client script | `src/render.ts` | HTML rendering and browser interactions |
+| Runtime settings | `src/settings.ts` | D1-backed settings and admin configuration |
+| Auth/session | `src/auth.ts` | Registration, login, cookies, Telegram binding |
+| Rules | `src/rules.ts` | User-isolated rule loading/version/payload |
+| Subscriptions | `src/subscriptions.ts` | Regex matching and notification dispatch |
+| Notification senders | `src/notifications.ts` | Brevo/Telegram requests and GUID push logs |
+| D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, sessions |
+| Shared types | `src/types.ts` | `Env`, model, page, and timing contracts |
 
-# Repository Instructions
+## WHERE TO LOOK
 
-## Shape
-- Cloudflare Workers + D1 app for only `https://rss.nodeseek.com/`; do not add KV/other storage unless explicitly requested.
-- Main Worker entry: `src/index.ts`; SSR HTML: `src/render.ts`; all CSS: `src/styles.ts`; RSS sync/parser/diagnostics: `src/rss.ts`.
-- D1 stores posts, users, sessions, read state, settings, rules, subscriptions, push logs, sync state, and RSS attempt diagnostics.
-- Generated deploy config is root `wrangler.generated.jsonc`; edit `wrangler.jsonc` and `scripts/cloudflare-build.mjs`, not generated output.
-- `nodeseek.js` and `rss.nodeseek.com.har` are local reference artifacts; do not commit them unless explicitly asked.
+| Task | Location | Notes |
+|---|---|---|
+| RSS/cron latency | `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts` | Inspect `/api/debug/status`; preserve structured timings |
+| Homepage latency | `src/posts.ts`, `src/render.ts` | Preserve page size and scan behavior |
+| Notification dedupe | `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0009*.sql`, `migrations/0010*.sql` | Use `post_guid`, never `post_id` |
+| Admin/debug routes | `src/index.ts`, `src/settings.ts` | Admin secret/session boundaries are security-sensitive |
+| User rule handoff | `src/rules.ts`, `src/render.ts` | Payload/version/cache keys stay user-scoped |
+| Schema changes | `migrations/` | Add a numbered migration; never rewrite deployed migrations |
+| Deploy config | `scripts/cloudflare-build.mjs`, `wrangler.jsonc` | Never hand-edit generated `wrangler.generated.jsonc` |
 
-## Project Structure
-- `src/board.ts`: board key normalization and board-specific helpers.
-- `src/db.ts`: thin D1 helpers and JSON/cookie utilities.
-- `src/filters.ts`: regex safety, highlighting, HTML helpers.
-- `src/time.ts`: time/date helpers.
-- `src/types.ts`: shared Env, model, and timing types.
-- `src/index.ts`: request routing, scheduled cron entry, `/api/debug/status`.
-- `src/rss.ts`: RSS fetch, parse, sync, and RSS attempt diagnostics.
-- `src/posts.ts`: homepage / `/api/posts` query, pagination, search, block filtering.
-- `src/subscriptions.ts`: subscription regex matching and notification dispatch.
-- `src/notifications.ts`: Brevo / Telegram senders and push logging.
-- `src/cleanup.ts`: retention cleanup for posts, read states, push logs, sessions.
-- `src/settings.ts`: runtime settings load/save and admin configuration.
-- `src/auth.ts`: registration, login, sessions, Telegram binding.
-- `src/render.ts`: SSR HTML shell and client script.
-- `src/styles.ts`: all CSS and responsive layout.
-- `migrations/`: numbered D1 schema migrations; never rewrite deployed ones.
-- `scripts/cloudflare-build.mjs`: Cloudflare build/deploy config generator; keep generated config at repo root.
+## STRICT SDD
 
-## Where to Look
-- RSS / cron slowness: `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts`.
-- Homepage slowness: `src/posts.ts`, `src/render.ts`.
-- Notification dedupe / push logs: `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0001_initial.sql`, `migrations/0009_push_logs_post_guid.sql`.
-- Admin / debug status: `src/index.ts`, `src/settings.ts`.
+- Design first: every requested feature requires an approved `DESIGN_SPEC.md` section before implementation.
+- The design documents modules, APIs, data models, and original requirement points.
+- Implement the approved design literally. Do not invent business logic, routes, storage, dependencies, or UI features.
+- If requirements are ambiguous, present 2–3 interpretations and ask before implementing.
+- `/spec` updates design only; `/build` or explicit approval starts implementation.
 
-## Current Conventions
-- Keep RSS sync limited to `https://rss.nodeseek.com/`.
-- Prefer D1-backed state; avoid introducing new storage.
-- Keep homepage card layout and CSS centralized in `src/styles.ts`.
-- Preserve root `wrangler.generated.jsonc` and root `wrangler.jsonc` generation flow.
-- When changing push dedupe, use `push_logs.post_guid`; do not reintroduce `post_id`-based dedupe in new code.
-- Keep routing boundaries in `src/index.ts`: API paths are handled there, while non-API page requests query posts and render through `renderHome`.
-- Keep rule handoff user-isolated: `src/rules.ts` versions and prepares the SSR payload, and `src/render.ts` hands complete logged-in non-search payloads to the browser, which blocks before highlighting. Cache keys and payloads must remain scoped to the user ID.
+## CONVENTIONS
 
-## Gotchas
-- `posts.guid` is the stable RSS identity; use it for RSS-side de-duplication.
-- `posts.id` still exists for persisted rows and read-state relations, but new RSS notification flow should not depend on re-reading full rows.
-- Cron diagnostics in `/api/debug/status` are temporary investigation aids; avoid adding more unless they explain a concrete regression.
+- TypeScript is strict/no-emit; target Workers and Web APIs, not Node-only APIs.
+- D1 owns all persistent state. Do not add KV, Durable Objects, R2, or another store without an explicit request.
+- RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
+- Normal post cards must link to the source URL with a real external `<a target="_blank">`; `/post/:id/open` is not the normal open path.
+- Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
+- Keep homepage card CSS in `src/styles.ts`; preserve the rounded black/white UI and OLED pure-black dark mode.
+- Listings use runtime `page_size` (default 100, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
 
-## Commands
-- Typecheck: `npm run typecheck`.
-- Build-script syntax check: `node --check scripts/cloudflare-build.mjs`.
-- Local dev: `npm run dev`.
-- Local D1 migrations: `npm run db:migrate:local`; remote migrations: `npm run db:migrate`.
-- Cloudflare GitHub build/deploy command is exactly `npm run deploy`; deploy from already generated config with `npm run deploy:generated`.
-- No test or lint scripts are defined in `package.json`; do not invent them.
-- In this workspace, `npm run typecheck` and TypeScript LSP are blocked when local compiler and language-server dependencies are absent. Use `git diff --check` and `node --check scripts/cloudflare-build.mjs` as available verification, and report those limitations rather than inventing tests.
+## ANTI-PATTERNS (THIS PROJECT)
 
-## Deploy And Config
-- `npm run deploy` runs `scripts/cloudflare-build.mjs`, finds/creates D1, writes both `wrangler.generated.jsonc` and root `wrangler.jsonc` with `DB`, applies migrations, dry-runs deploy, then `wrangler deploy --config wrangler.generated.jsonc`.
-- Branch `factory` maps to Worker/D1 `nodeseek-rss-reader-factory`; all other branches default to `nodeseek-rss-reader`.
-- Keep generated config at repo root; migrations previously broke when generated config was moved under `.wrangler/`.
-- `wrangler d1 create` output is parsed as text because Cloudflare build logs may not support `--json` there.
-- Runtime `Cannot read properties of undefined (reading 'prepare')` means missing D1 binding named `DB`; `/health` is the fastest DB/table check.
-- `wrangler.jsonc` enables cron `*/1 * * * *` and `observability.enabled`; use Workers Logs for cron/RSS diagnosis.
+- Do not skip design approval or change scope beyond it.
+- Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks.
+- Do not rewrite deployed migrations. Add sequential files instead.
+- Do not use `push_logs.post_id`; the final schema and dedupe paths use `push_logs.post_guid` exclusively.
+- Do not confuse `read_states.post_id` with notification-log identity.
+- Do not commit local reference artifacts such as `nodeseek.js` or `rss.nodeseek.com.har` unless requested.
 
-## Data And Migrations
-- Add schema changes as new numbered SQL files; never rewrite deployed migrations.
-- Current migration chain: `0001_initial` through `0009_push_logs_post_guid`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
-- `0008_posts_keyset_indexes` supports home-page keyset scans with `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)`; confirm remote indexes with `wrangler d1 execute ... "SELECT name FROM sqlite_master WHERE type='index' AND name IN (...)"` when diagnosing deep-page slowness.
-- `0009_push_logs_post_guid` moves push-log idempotency from `post_id` to `post_guid`; preserve this direction in new dedupe code.
-- `ADMIN_SECRET` authenticates `/admin?token=...` and encrypts D1-stored Brevo/Telegram settings; changing it requires re-entering encrypted settings.
-- PBKDF2 iterations must stay `<= 100000`; Workers reject higher counts.
+## DATA AND MIGRATIONS
 
-## RSS Sync
-- Current scheduled sync sleeps random `A=21..24s`, tries `rss`, and on failure sleeps random `B=21..24s` before trying `browser`.
-- `/api/rss-test` is fast diagnostics only: same order `rss -> browser`, no sleeps.
-- `src/rss.ts` uses `cf.cacheTtl = 60`; NodeSeek RSS often returns nginx `503`, so keep structured diagnostics before changing cron frequency or headers.
-- `/api/debug/status?token=ADMIN_SECRET` does not run live RSS fetches by default; append `live=1` to run `/api/rss-test` style diagnostics.
-- `rss_fetch_attempts` records both successes and failures with keys like `rss_success`, `rss_failure`, `browser_success`, `browser_failure` in `/api/debug/status?token=ADMIN_SECRET` under `rss.failureSummary`; `rss.attemptStats` also summarizes cron vs rss-test success/failure.
-- `safeSyncRss()` catches cron errors and records `sync_state.last_sync_error`; Cloudflare cron logs can show `outcome: ok` even when RSS sync failed.
+- Current chain is `0001_initial` through `0010_rebuild_push_logs_without_post_id`.
+- `0009` moved push idempotency to `post_guid`; `0010` removed legacy `push_logs.post_id`, its FK, unique constraint, and index.
+- `0008_posts_keyset_indexes` supports `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)` scans.
+- Push logs retain GUIDs independently of post retention; do not add an FK from `post_guid` to `posts.guid`.
+- `ADMIN_SECRET` secures admin settings and encrypted Brevo/Telegram values. PBKDF2 iterations must remain `<= 100000`.
 
-## Runtime Behavior
-- Post cards must open the original RSS `link` with real `<a target="_blank">`; do not route normal opens through `/post/:id/open`.
-- Read state is D1-backed for logged-in users and localStorage-backed for anonymous users.
-- `runtimeSettings(env).pageSize` controls every listing path. The D1 `page_size` setting defaults to `100`, falls back to `100` for invalid values, and is clamped to `10..500` when saved.
-- Pagination has no exact total-page calculation. The SSR pager always shows the requested page through `page + 3`, with previous clamped to page 1 and next pointing to `page + 1`; valid out-of-range requests return an empty page. Search still scans server-side across RSS posts in D1.
-- Telegram bind codes are 24-hour codes from `GET /api/account`; bound users should not see a bind code until they clear Telegram binding.
+## RUNTIME AND HOTSPOTS
 
-## Hotspots
-- `src/posts.ts`: search/block rules force Worker-side filtering; keep `page=N` URLs/UI, but scan only until the current page is filled, use keyset pagination, and do not load `content_html` until the final 50 post IDs are known.
-- Slow-path scan chunk size is intentionally `1000`; check `home.timings.queryPosts.scannedChunks`, `matchedPosts`, and `scanMs` in `/api/debug/status` before changing it.
-- `/api/debug/status` shows the latest real home-page timing from `sync_state.last_home_timing`; it is written with `ctx.waitUntil()` so timing writes should not block normal page responses.
-- `src/subscriptions.ts`: matching can become users x subscriptions x posts; batch reads/log checks and avoid repeated `runtimeSettings(env)` in notification loops.
-- Precompile regexes per request/task; avoid `new RegExp` per post/rule comparison.
+- Scheduled sync waits 21..24s before RSS and before browser fallback after failure. `/api/rss-test` is the no-sleep diagnostic path.
+- `src/rss.ts` uses `cf.cacheTtl = 60`; preserve attempt diagnostics because upstream often returns 503.
+- `/api/debug/status?token=ADMIN_SECRET` is non-live unless `live=1`; `safeSyncRss()` records cron failure in `sync_state.last_sync_error`.
+- Search/block rules require Worker-side filtering. In `src/posts.ts`, scan only until the requested page fills; defer `content_html` until final IDs are known.
+- Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
+- Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
+- Rule payloads must be scoped to the logged-in user; browser processing blocks before highlighting.
 
-## UI And Admin
-- Preserve black/white rounded responsive UI with OLED pure black dark mode.
-- Header brand `NodeSeek RSS Reader` links to `/`; do not add a separate homepage button.
-- Post card fields stay limited to title, body, username / board / time; username click only copies username and shows one-line toast.
-- Settings tabs stay one row; highlight/block/subscription keyword areas share chip layout and scroll within capped height; destructive actions require confirmation.
-- Floating top/bottom buttons use `nd-jump-group`/`nd-jump-item` styling around `bottom: 200px`; GitHub footer points to `https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader` and shows stars.
-- Admin page is standalone `/admin?token=ADMIN_SECRET`, not a settings tab; preserve inline Brevo API-key guidance if touching admin forms.
-- Admin setup docs should use bilingual UI labels like `Workers 和 Pages / Workers & Pages` and mention clicking blank space under Secret input to enable Save.
-- Import/export is current-tab only; import overwrites the current tab's rules.
+## UI AND ADMIN
 
-## Git
-- Remote is `https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader.git`; pushing needs user credentials.
-- Do not force push `main`.
-- If committing as the repo owner, use one-off author flags rather than persistent git config: `git -c user.name="sfhgknsdfksdlf" -c user.email="113858507+sfhgknsdfksdlf@users.noreply.github.com" commit ...`.
+- Header brand links to `/`; do not add a second homepage button.
+- Keep post cards to title, body, username, board, and time; username click only copies and shows a one-line toast.
+- Settings tabs stay one row; destructive operations require confirmation.
+- Admin is standalone `/admin?token=ADMIN_SECRET`, not a settings tab.
+- Floating top/bottom controls use `nd-jump-group`/`nd-jump-item` near `bottom: 200px`.
+
+## COMMANDS
+
+```bash
+npm run typecheck             # tsc --noEmit; requires installed dependencies
+npm run dev                   # wrangler dev
+npm run db:migrate:local      # apply local D1 migrations
+npm run db:migrate            # apply remote D1 migrations
+npm run deploy                # generate config, migrate, dry-run, deploy
+node --check scripts/cloudflare-build.mjs
+git diff --check
+```
+
+No test or lint scripts are defined. If TypeScript/Wrangler dependencies or the TS language server are absent, report that limitation instead of installing dependencies or inventing tests.
+
+## DEPLOY AND CONFIG
+
+- `npm run deploy` runs the generator, applies remote migrations, verifies D1, dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
+- Branch `factory` maps to Worker/D1 `nodeseek-rss-reader-factory`; all other branches use `nodeseek-rss-reader`.
+- Generated config stays at repository root; moving it under `.wrangler/` previously broke migrations.
+- Missing `DB` produces `Cannot read properties of undefined (reading 'prepare')`; `/health` is the quickest binding/table check.
+
+## GIT
+
+- Remote: `https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader.git`; do not force-push `main`.
+- When committing as the owner, use one-off `git -c user.name=... -c user.email=... commit` flags rather than persistent Git configuration.

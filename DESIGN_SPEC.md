@@ -163,6 +163,83 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - Subscription matching consumes the in-memory list of newly discovered RSS items instead of re-reading inserted rows from D1.
 - Push notification idempotency uses `push_logs.post_guid` rather than numeric `post_id` so the RSS sync path can avoid re-reading inserted rows from D1.
 
+## Push Log `post_id` Retirement (Approved)
+
+### User's Original Requirement
+
+- “彻底淘汰 `push_logs.post_id`、清理历史 schema 包袱”（completely retire the legacy `push_logs.post_id` column and remove the historical schema debt).
+
+### Scope
+
+- Add `migrations/0010_rebuild_push_logs_without_post_id.sql`; do not rewrite deployed migrations `0001` through `0009`.
+- Rebuild the existing `push_logs` table so its final schema contains no `post_id` column, no `post_id` foreign key, no `UNIQUE (user_id, subscription_id, post_id, channel)` constraint, and no `idx_push_logs_post_id` index.
+- Preserve existing push-log rows and their primary keys.
+- Keep runtime notification idempotency, lookup, and retention cleanup based exclusively on `post_guid`.
+- Do not add a permanent business table or any storage other than D1.
+
+### Final Data Model
+
+After migration `0010`, `push_logs` is exactly:
+
+```text
+push_logs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  subscription_id INTEGER NOT NULL,
+  post_guid TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  status TEXT NOT NULL,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (user_id, subscription_id, post_guid, channel),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
+)
+```
+
+The retained indexes are:
+
+- `idx_push_logs_created_at` on `push_logs(created_at)` for retention cleanup.
+- A unique index or equivalent table-level unique constraint on `(user_id, subscription_id, post_guid, channel)` for notification idempotency.
+
+There is deliberately no foreign key from `push_logs.post_guid` to `posts.guid`. Push logs have their own retention period and must remain valid when an associated post has already been deleted.
+
+### Migration Procedure
+
+Migration `0010` must perform the following operations atomically in the migration's normal D1 execution context:
+
+1. Validate that every existing `push_logs` row has a usable GUID, using the current `post_guid` value or the matching `posts.guid` selected by legacy `post_id`.
+2. Abort the migration if any row cannot obtain a non-empty GUID. Historical rows must not be silently dropped.
+3. Create a temporary replacement table with the final schema above.
+4. Copy all historical rows, preserving `id`, and set the replacement `post_guid` to the existing non-empty value, otherwise the GUID recovered through `posts.id = push_logs.post_id`.
+5. Remove the legacy `push_logs` table and rename the replacement table to `push_logs`.
+6. Recreate `idx_push_logs_created_at` and the GUID-based uniqueness index/constraint.
+7. Leave no temporary table and no `post_id` index behind.
+
+The migration must not disable foreign-key enforcement outside the migration operation and must not modify `posts`, `subscriptions`, or user data.
+
+### Runtime Contracts
+
+- `src/notifications.ts` continues inserting push logs with `post_guid` and never queries or writes a numeric post ID.
+- `src/subscriptions.ts` continues loading prior deliveries and building idempotency keys from `(user_id, subscription_id, post_guid, channel)`.
+- `src/cleanup.ts` continues removing post-related push logs through `post_guid`; `read_states.post_id` is unrelated and remains unchanged.
+- No runtime compatibility fallback may reintroduce `push_logs.post_id`.
+
+### API Definition
+
+- No HTTP route, request body, response body, or UI behavior changes.
+- Notification delivery and deduplication retain their current externally visible behavior; this change only makes the persisted schema match the existing GUID-based runtime contract.
+
+### Verification
+
+- Apply the full migration chain `0001` through `0010` to a fresh local D1 database.
+- Apply `0010` to a database already at `0009` containing representative historical `push_logs` rows and verify all rows and IDs are preserved.
+- Verify `PRAGMA table_info(push_logs)` contains `post_guid` as `NOT NULL` and contains no `post_id`.
+- Verify `PRAGMA foreign_key_list(push_logs)` contains only the `users` and `subscriptions` relationships.
+- Verify `PRAGMA index_list(push_logs)` contains the created-at index and GUID idempotency uniqueness, and contains no `idx_push_logs_post_id`.
+- Verify a GUID-only push-log insert succeeds and a duplicate `(user_id, subscription_id, post_guid, channel)` insert is ignored by the existing `INSERT OR IGNORE` path.
+- Run `npm run typecheck` when local TypeScript dependencies are available, `git diff --check`, and the repository's local D1 migration command.
+
 ## API
 
 - `GET /`, `GET /page/:page`: SSR post list.
