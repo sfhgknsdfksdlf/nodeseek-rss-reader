@@ -1,37 +1,14 @@
 import { all, one } from "./db";
 import { normalizeBoard } from "./board";
 import { postTextForBlock, safeRegex } from "./filters";
-import type { BlockRule, Env, HighlightGroup, HomeTimings, PageData, Post, User } from "./types";
-
-export const pageSize = 50;
+import { getBlockRules, getHighlightGroups } from "./rules";
+import { runtimeSettings } from "./settings";
+import type { Env, HomeTimings, PageData, Post, User } from "./types";
 
 type PostScanRow = Pick<Post, "id" | "title" | "content_text" | "author" | "board_key" | "published_at">;
 
-export async function getBlockRules(env: Env, user: User | null): Promise<BlockRule[]> {
-  if (!user) return [];
-  return all<BlockRule>(env.DB.prepare("SELECT * FROM block_rules WHERE user_id = ? ORDER BY id DESC").bind(user.id));
-}
-
-export async function getHighlightGroups(env: Env, user: User | null): Promise<HighlightGroup[]> {
-  if (!user) return [];
-  const rows = await all<{ id: number; user_id: number; name: string; color: string; pattern: string | null }>(env.DB.prepare(`
-    SELECT hg.id, hg.user_id, hg.name, hg.color, hr.pattern
-    FROM highlight_groups hg
-    LEFT JOIN highlight_rules hr ON hr.group_id = hg.id
-    WHERE hg.user_id = ?
-    ORDER BY hg.id DESC, hr.id DESC
-  `).bind(user.id));
-  const byId = new Map<number, HighlightGroup>();
-  for (const row of rows) {
-    let group = byId.get(row.id);
-    if (!group) {
-      group = { id: row.id, user_id: row.user_id, name: row.name, color: row.color, patterns: [] };
-      byId.set(row.id, group);
-    }
-    if (row.pattern) group.patterns.push(row.pattern);
-  }
-  return [...byId.values()];
-}
+// Keep bound offsets well below SQLite/D1 integer limits while allowing ordinary page numbers.
+const MAX_PAGE_OFFSET = 2_000_000_000;
 
 function allowedByBlocks(post: Pick<Post, "title" | "content_text" | "author">, blocks: RegExp[]): boolean {
   const text = postTextForBlock(post);
@@ -67,8 +44,12 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const totalStart = Date.now();
   const board = normalizeBoard(url.searchParams.get("board"));
   const query = (url.searchParams.get("q") || "").trim();
+  const pageSize = (await runtimeSettings(env)).pageSize;
   const urlPage = /\/page\/(\d+)/.exec(url.pathname)?.[1];
-  const requestedPage = Math.max(1, Number(url.searchParams.get("page") || urlPage || "1") || 1);
+  const rawPage = url.searchParams.get("page") || urlPage || "1";
+  const parsedPage = Number(rawPage);
+  const maxPage = Math.floor(MAX_PAGE_OFFSET / pageSize) + 1;
+  const requestedPage = Number.isSafeInteger(parsedPage) ? Math.min(maxPage, Math.max(1, parsedPage)) : 1;
   const setTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
     if (timings) timings[key] = value;
   };
@@ -82,13 +63,7 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const queryRegex = query ? safeRegex(query) : null;
   setTiming("searchRegexCompileMs", Date.now() - searchRegexStart);
   if (!query && blocks.length === 0) {
-    const countStart = Date.now();
-    const where = board ? "WHERE board_key = ?" : "";
-    const countArgs = board ? [board] : [];
-    const total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${where}`).bind(...countArgs)))?.count || 0;
-    setTiming("countMs", Date.now() - countStart);
-    const totalPages = Math.max(1, Math.ceil(total / pageSize));
-    const page = Math.min(requestedPage, totalPages);
+    const page = requestedPage;
     const offset = (page - 1) * pageSize;
     const args: unknown[] = [];
     let sql = "SELECT p.*, " + (user ? "CASE WHEN r.post_id IS NULL THEN 0 ELSE 1 END" : "0") + " AS is_read FROM posts p ";
@@ -105,9 +80,9 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     const dbPageStart = Date.now();
     const posts = await all<Post>(env.DB.prepare(sql).bind(...args));
     setTiming("dbPageMs", Date.now() - dbPageStart);
-    const syncError = total === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+    const syncError = posts.length === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
     setTiming("totalMs", Date.now() - totalStart);
-    return { posts, page, pageSize, totalPages, board, query, syncError };
+    return { posts, page, pageSize, board, query, syncError };
   }
 
   const chunkSize = 1000;
@@ -119,12 +94,6 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   let stoppedAtPageLimit = false;
   let scannedChunks = 0;
   const scanStart = Date.now();
-  let total = 0;
-  if (!query) {
-    const countStart = Date.now();
-    total = (await one<{ count: number }>(env.DB.prepare(`SELECT COUNT(*) AS count FROM posts ${board ? "WHERE board_key = ?" : ""}`).bind(...(board ? [board] : []))))?.count || 0;
-    setTiming("countMs", Date.now() - countStart);
-  }
   let cursorPublishedAt: string | null = null;
   let cursorId: number | null = null;
   scan: for (;;) {
@@ -164,19 +133,17 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     if (chunk.length < chunkSize) break;
   }
   setTiming("scanMs", Date.now() - scanStart);
-  const pageHasRows = pagePostIds.length > 0;
-  const page = pageHasRows ? requestedPage : Math.max(1, requestedPage - 1);
-  const totalPages = query ? (stoppedAtPageLimit ? requestedPage + 1 : Math.max(1, page)) : Math.max(1, Math.ceil(total / pageSize));
+  const page = requestedPage;
   const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
   setTiming("scannedChunks", scannedChunks);
   setTiming("matchedPosts", matched);
   setTiming("limitedScan", 1);
   setTiming("hasNextPage", stoppedAtPageLimit ? 1 : 0);
   const dbPageStart = Date.now();
-  const posts = await postsByIds(env, user, pageHasRows ? pagePostIds : lastPagePostIds);
+  const posts = await postsByIds(env, user, pagePostIds);
   setTiming("dbPageMs", Date.now() - dbPageStart);
   setTiming("totalMs", Date.now() - totalStart);
-  return { posts, page, pageSize, totalPages, board, query, syncError };
+  return { posts, page, pageSize, board, query, syncError };
 }
 
 export async function markReadAndGetLink(env: Env, user: User | null, postId: number): Promise<string | null> {

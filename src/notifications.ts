@@ -1,15 +1,15 @@
 import { nowIso } from "./db";
 import { runtimeSettings } from "./settings";
 import type { RuntimeSettings } from "./settings";
-import type { Env, Post, Subscription, User } from "./types";
+import type { Env, RssNewPost, Subscription, User } from "./types";
 
-async function logPush(env: Env, userId: number, subscriptionId: number, postId: number, channel: string, status: string, error = ""): Promise<void> {
-  await env.DB.prepare("INSERT OR IGNORE INTO push_logs (user_id, subscription_id, post_id, channel, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(userId, subscriptionId, postId, channel, status, error || null, nowIso())
+async function logPush(env: Env, userId: number, subscriptionId: number, postGuid: string, channel: string, status: string, error = ""): Promise<void> {
+  await env.DB.prepare("INSERT OR IGNORE INTO push_logs (user_id, subscription_id, post_guid, channel, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(userId, subscriptionId, postGuid, channel, status, error || null, nowIso())
     .run();
 }
 
-export async function sendBrevo(env: Env, user: User, sub: Subscription, post: Post, cachedSettings?: RuntimeSettings): Promise<void> {
+export async function sendBrevo(env: Env, user: User, sub: Subscription, post: RssNewPost, cachedSettings?: RuntimeSettings): Promise<void> {
   const settings = cachedSettings || await runtimeSettings(env);
   if (!settings.brevoApiKey || !settings.mailFrom || !user.email) return;
   try {
@@ -23,13 +23,13 @@ export async function sendBrevo(env: Env, user: User, sub: Subscription, post: P
         htmlContent: `<p>${post.title}</p><p>${post.content_text.slice(0, 300)}</p><p><a href="${post.link}">打开原帖</a></p>`
       })
     });
-    await logPush(env, user.id, sub.id, post.id, "email", res.ok ? "sent" : "failed", res.ok ? "" : await res.text());
+    await logPush(env, user.id, sub.id, post.guid, "email", res.ok ? "sent" : "failed", res.ok ? "" : await res.text());
   } catch (err) {
-    await logPush(env, user.id, sub.id, post.id, "email", "failed", err instanceof Error ? err.message : String(err));
+    await logPush(env, user.id, sub.id, post.guid, "email", "failed", err instanceof Error ? err.message : String(err));
   }
 }
 
-export async function sendTelegram(env: Env, user: User, sub: Subscription, post: Post, cachedSettings?: RuntimeSettings): Promise<void> {
+export async function sendTelegram(env: Env, user: User, sub: Subscription, post: RssNewPost, cachedSettings?: RuntimeSettings): Promise<void> {
   const settings = cachedSettings || await runtimeSettings(env);
   if (!settings.telegramBotToken || !user.telegram_chat_id) return;
   try {
@@ -39,8 +39,8 @@ export async function sendTelegram(env: Env, user: User, sub: Subscription, post
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: user.telegram_chat_id, text, disable_web_page_preview: false })
     });
-    await logPush(env, user.id, sub.id, post.id, "telegram", res.ok ? "sent" : "failed", res.ok ? "" : await res.text());
+    await logPush(env, user.id, sub.id, post.guid, "telegram", res.ok ? "sent" : "failed", res.ok ? "" : await res.text());
   } catch (err) {
-    await logPush(env, user.id, sub.id, post.id, "telegram", "failed", err instanceof Error ? err.message : String(err));
+    await logPush(env, user.id, sub.id, post.guid, "telegram", "failed", err instanceof Error ? err.message : String(err));
   }
 }

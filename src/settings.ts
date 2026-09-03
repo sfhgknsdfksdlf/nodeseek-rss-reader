@@ -12,6 +12,7 @@ export interface RuntimeSettings {
   readStateRetentionDays: number;
   postRetentionDays: number;
   pushLogRetentionDays: number;
+  pageSize: number;
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -55,6 +56,13 @@ function clampDays(value: unknown, fallback: number): number {
   return Math.min(3650, Math.max(1, number));
 }
 
+function clampPageSize(value: unknown): number {
+  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) return 100;
+  const number = Number(value);
+  if (!Number.isInteger(number)) return 100;
+  return Math.min(500, Math.max(10, number));
+}
+
 async function getRawSetting(env: Env, key: string): Promise<{ value: string; encrypted: number } | null> {
   return one<{ value: string; encrypted: number }>(env.DB.prepare("SELECT value, encrypted FROM app_settings WHERE key = ?").bind(key));
 }
@@ -78,7 +86,7 @@ export async function setSetting(env: Env, key: string, value: string): Promise<
 }
 
 export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
-  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, postDays, pushDays] = await Promise.all([
+  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, postDays, pushDays, pageSize] = await Promise.all([
     getSetting(env, "brevo_api_key"),
     getSetting(env, "telegram_bot_token"),
     getSetting(env, "telegram_bot_username"),
@@ -86,7 +94,8 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
     getSetting(env, "mail_from_name"),
     getSetting(env, "read_state_retention_days"),
     getSetting(env, "post_retention_days"),
-    getSetting(env, "push_log_retention_days")
+    getSetting(env, "push_log_retention_days"),
+    getSetting(env, "page_size")
   ]);
   return {
     brevoApiKey: brevoApiKey || env.BREVO_API_KEY || "",
@@ -96,7 +105,8 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
     mailFromName: mailFromName || env.MAIL_FROM_NAME || "NodeSeek RSS Reader",
     readStateRetentionDays: clampDays(readDays || env.READ_STATE_RETENTION_DAYS, 7),
     postRetentionDays: clampDays(postDays || env.POST_RETENTION_DAYS, 365),
-    pushLogRetentionDays: clampDays(pushDays || env.PUSH_LOG_RETENTION_DAYS, 30)
+    pushLogRetentionDays: clampDays(pushDays || env.PUSH_LOG_RETENTION_DAYS, 30),
+    pageSize: clampPageSize(pageSize)
   };
 }
 
@@ -134,7 +144,8 @@ export async function adminSettingsResponse(request: Request, env: Env): Promise
     mailFromName: settings.mailFromName,
     readStateRetentionDays: settings.readStateRetentionDays,
     postRetentionDays: settings.postRetentionDays,
-    pushLogRetentionDays: settings.pushLogRetentionDays
+    pushLogRetentionDays: settings.pushLogRetentionDays,
+    pageSize: settings.pageSize
   });
 }
 
@@ -149,6 +160,7 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
     readStateRetentionDays?: unknown;
     postRetentionDays?: unknown;
     pushLogRetentionDays?: unknown;
+    pageSize?: unknown;
   };
   const updates: Array<[string, string]> = [];
   if (typeof body.mailFrom === "string") updates.push(["mail_from", body.mailFrom.trim()]);
@@ -159,6 +171,7 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
   updates.push(["read_state_retention_days", String(clampDays(body.readStateRetentionDays, 7))]);
   updates.push(["post_retention_days", String(clampDays(body.postRetentionDays, 365))]);
   updates.push(["push_log_retention_days", String(clampDays(body.pushLogRetentionDays, 30))]);
+  updates.push(["page_size", String(clampPageSize(body.pageSize))]);
   for (const [key, value] of updates) await setSetting(env, key, value);
   return json({ ok: true });
 }
@@ -202,6 +215,15 @@ function adminSetupHtml(error = ""): string {
 }
 
 function adminPageHtml(token: string): string {
+  const html = baseAdminPageHtml(token);
+  const pageSizeField = '<label>每页数量 / Page size<input name="pageSize" id="pageSize" type="number" min="10" max="500" step="1" required value="100"><span class="muted">有效范围：10-500，默认 100</span></label>';
+  return html
+    .replace('<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>', '<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>' + pageSizeField)
+    .replace("$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()", "$('#pushLogRetentionDays').value=s.pushLogRetentionDays;$('#pageSize').value=s.pageSize;loadUsers()")
+    .replace("body.pushLogRetentionDays=Number(body.pushLogRetentionDays);", "body.pushLogRetentionDays=Number(body.pushLogRetentionDays);body.pageSize=Number(body.pageSize);");
+}
+
+function baseAdminPageHtml(token: string): string {
   const safeToken = token.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch));
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeSeek RSS Reader 管理员</title><style>:root{color-scheme:light dark}body{font-family:system-ui;margin:0;background:#f8f8f8;color:#111}.wrap{max-width:860px;margin:0 auto;padding:14px}.card{display:grid;gap:10px;background:#fff;border:1px solid #ddd;border-radius:18px;padding:14px;margin-bottom:14px}input,button{font:inherit;border:1px solid #ddd;border-radius:12px;padding:.5rem}.primary{background:#1663ff;border-color:#1663ff;color:#fff}.danger{background:#d71920;border-color:#d71920;color:#fff}label{display:grid;gap:4px}.muted{color:#666}.user{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border:1px solid #ddd;border-radius:14px;padding:10px}.user b{overflow:hidden;text-overflow:ellipsis}.stats{font-size:12px;color:#666}details{border:1px solid #ddd;border-radius:14px;padding:10px}summary{cursor:pointer;font-weight:700}li{margin:.25rem 0}@media(prefers-color-scheme:dark){body{background:#000;color:#f5f5f5}.card,input,button,.user,details{background:#000;color:#f5f5f5;border-color:#2a2a2a}.muted,.stats{color:#aaa}}</style><body><main class="wrap"><h1>管理员配置</h1><form class="card" id="adminForm"><label>Brevo API Key<input name="brevoApiKey" id="brevoApiKey"></label><details><summary>查看 Brevo API Key 获取教程</summary><ol><li>打开 <a href="https://www.brevo.com/" target="_blank" rel="noreferrer">Brevo 官网</a> 并注册或登录账号。</li><li>进入 Brevo 控制台后，打开右上角账号菜单。</li><li>进入「SMTP & API」。</li><li>切换到「API Keys」。也可以直接尝试打开 <a href="https://app.brevo.com/settings/keys/api" target="_blank" rel="noreferrer">Brevo API Keys 页面</a>。</li><li>点击「Generate a new API key」。</li><li>名称可填写 <b>NodeSeek RSS Reader</b>。</li><li>复制生成的 API Key，粘贴到本页的「Brevo API Key」。</li><li>继续填写「发件邮箱」和「发件人名称」，然后点击保存。</li></ol><p class="muted">注意：发件邮箱必须是 Brevo 允许发送的邮箱或已验证域名下的邮箱；如果邮件发不出去，请先在 Brevo 检查 Sender / Domain 是否已验证。API Key 保存后不会明文显示，留空保存不会覆盖旧 Key。</p></details><label>发件邮箱<input name="mailFrom" id="mailFrom"></label><label>发件人名称<input name="mailFromName" id="mailFromName"></label><label>Telegram Bot Token<input name="telegramBotToken" id="telegramBotToken"></label><label>Telegram Bot 用户名<input name="telegramBotUsername" id="telegramBotUsername" placeholder="@your_bot_name"></label><label>已读保留天数<input name="readStateRetentionDays" id="readStateRetentionDays" type="number" min="1" max="3650"></label><label>RSS帖子保留天数<input name="postRetentionDays" id="postRetentionDays" type="number" min="1" max="3650"></label><label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label><button class="primary">保存</button><a href="/">返回阅读器</a><p class="muted">管理链接包含 SECRET，请不要分享。请保存当前完整链接为书签。</p></form><section class="card"><h2>用户管理</h2><button type="button" id="refreshUsers">刷新用户列表</button><div id="users" class="muted">加载中</div></section></main><script>const token='${safeToken}';const $=s=>document.querySelector(s);function toast(m){alert(m)}async function load(){const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token));if(!r.ok){toast('管理员 token 不正确');return}const s=await r.json();$('#brevoApiKey').placeholder=s.brevoApiKeyConfigured?'已配置，留空不修改':'未配置';$('#telegramBotToken').placeholder=s.telegramBotTokenConfigured?'已配置，留空不修改':'未配置';$('#telegramBotUsername').value=s.telegramBotUsername||'';$('#mailFrom').value=s.mailFrom||'';$('#mailFromName').value=s.mailFromName||'';$('#readStateRetentionDays').value=s.readStateRetentionDays;$('#postRetentionDays').value=s.postRetentionDays;$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()}async function loadUsers(){const r=await fetch('/api/admin/users?token='+encodeURIComponent(token));if(!r.ok){$('#users').textContent='用户列表加载失败';return}const data=await r.json();$('#users').innerHTML=data.users.length?data.users.map(u=>'<div class="user"><div><b>'+u.username+'</b><div class="stats">邮箱 '+(u.email?'已绑定':'未绑定')+' · TG '+(u.telegram_chat_id?'已绑定':'未绑定')+' · 高亮 '+u.highlight_group_count+' · 屏蔽 '+u.block_rule_count+' · 订阅 '+u.subscription_count+' · 已读 '+u.read_count+'</div></div><button class="danger" data-del="'+u.id+'" data-name="'+u.username+'">删除</button></div>').join(''):'暂无用户'}$('#refreshUsers').onclick=loadUsers;document.addEventListener('click',async e=>{const b=e.target;if(!b.dataset.del)return;if(!confirm('确认删除用户 '+b.dataset.name+'？该用户的阅读状态、高亮、屏蔽、订阅和推送日志都会被删除。'))return;const r=await fetch('/api/admin/users/'+b.dataset.del+'?token='+encodeURIComponent(token),{method:'DELETE'});toast(r.ok?'已删除':'删除失败');loadUsers()});$('#adminForm').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));body.readStateRetentionDays=Number(body.readStateRetentionDays);body.postRetentionDays=Number(body.postRetentionDays);body.pushLogRetentionDays=Number(body.pushLogRetentionDays);const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});toast(r.ok?'已保存':'保存失败')};load()</script></body></html>`;
 }

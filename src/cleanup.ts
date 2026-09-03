@@ -16,7 +16,7 @@ export async function cleanupOldData(env: Env): Promise<void> {
   await env.DB.prepare("DELETE FROM read_states WHERE opened_at < ?").bind(readCutoff).run();
   await env.DB.prepare("DELETE FROM push_logs WHERE created_at < ?").bind(pushCutoff).run();
   await env.DB.prepare("DELETE FROM read_states WHERE post_id IN (SELECT id FROM posts WHERE published_at < ?)").bind(postCutoff).run();
-  await env.DB.prepare("DELETE FROM push_logs WHERE post_id IN (SELECT id FROM posts WHERE published_at < ?)").bind(postCutoff).run();
+  await env.DB.prepare("DELETE FROM push_logs WHERE post_guid IN (SELECT guid FROM posts WHERE published_at < ?)").bind(postCutoff).run();
   await env.DB.prepare("DELETE FROM posts WHERE published_at < ?").bind(postCutoff).run();
   await env.DB.prepare("DELETE FROM admin_sessions WHERE expires_at < ?").bind(nowIso()).run();
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('last_cleanup_at', ?, ?)").bind(nowIso(), nowIso()).run();

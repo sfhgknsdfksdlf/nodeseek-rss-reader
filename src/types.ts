@@ -36,6 +36,8 @@ export interface Post {
   is_read?: number;
 }
 
+export type RssNewPost = Omit<Post, "id" | "is_read">;
+
 export interface HighlightGroup {
   id: number;
   user_id: number;
@@ -62,7 +64,6 @@ export interface PageData {
   posts: Post[];
   page: number;
   pageSize: number;
-  totalPages: number;
   board: string;
   query: string;
   syncError?: string;
@@ -106,4 +107,43 @@ export interface HomeTimingSnapshot {
   postCount: number;
   recordedAt: string;
   timings: HomeTimings;
+}
+
+export interface CronTimingSnapshot {
+  recordedAt: string;
+  ok: boolean;
+  firstSync: boolean;
+  inserted: number;
+  ranProcessSubscriptions: boolean;
+  timings: {
+    rssSync: {
+      fetchRssMs: number;
+      fetchFirstStrategyMs: number;
+      fetchRetryStrategyMs: number;
+      parseItemsMs: number;
+      parseItemCount: number;
+      prepareInsertMs: number;
+      insertBindRunMs: number;
+      insertLookupMs: number;
+      insertNewCount: number;
+      insertExistingCount: number;
+      insertLoopMs: number;
+      insertedPostLoadMs: number;
+      insertPostsMs: number;
+      writeSyncStateMs: number;
+      writeStateMs: number;
+      totalMs: number;
+    };
+    processSubscriptionsMs: number;
+    cleanupOldDataMs: number;
+    totalMs: number;
+  };
+  cpu: {
+    rssParseItemsMs: number;
+    processSubscriptionsCompileMs: number;
+    processSubscriptionsMatchMs: number;
+    cleanupPrepMs: number;
+    totalMs: number;
+  };
+  error?: string;
 }

@@ -8,13 +8,30 @@ export function escapeAttr(value: string): string {
   return escapeHtml(value).replace(/`/g, "&#96;");
 }
 
+export function safeHttpUrl(value: string, fallback = "#"): string {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export function safeRegex(pattern: string): RegExp | null {
-  if (!pattern || pattern.length > 200) return null;
+  if (!pattern || pattern.length > 200 || regexHasBacktrackingHazard(pattern)) return null;
   try {
     return new RegExp(pattern, "i");
   } catch {
     return null;
   }
+}
+
+// Reject the common nested-quantifier shape such as (a+)+. This is not a
+// general regex timeout; valid simple expressions remain supported.
+export function regexHasBacktrackingHazard(pattern: string): boolean {
+  return /\((?:[^()\\]|\.)*[+*](?:[^()\\]|\.)*\)(?:[+*]|\{\d+(?:,\d*)?\})/.test(pattern)
+    || /(?:^|[^\w\\])(?:[\w\\](?:[+*]|\{\d+(?:,\d*)?\})){2}/.test(pattern)
+    || /\((?:[^()\\]|\.)*\|(?:[^()\\]|\.)*\)(?:[+*]|\{\d+(?:,\d*)?\})/.test(pattern);
 }
 
 export function regexMatches(pattern: string, text: string): boolean {
@@ -39,7 +56,7 @@ export function sanitizePostHtml(raw: string): string {
   html = html.replace(/<(?!\/?(?:p|br|a|img|blockquote|code|pre|strong|em|ul|ol|li)\b)[^>]+>/gi, "");
   html = html.replace(/<a\b([^>]*)>/gi, (_m, attrs: string) => {
     const href = /href\s*=\s*["']([^"']+)["']/i.exec(attrs)?.[1] || "#";
-    return `<a href="${escapeAttr(href)}" target="_blank" rel="noreferrer">`;
+    return `<a href="${escapeAttr(safeHttpUrl(href))}" target="_blank" rel="noreferrer">`;
   });
   html = html.replace(/<img\b([^>]*)>/gi, (_m, attrs: string) => {
     const src = /src\s*=\s*["']([^"']+)["']/i.exec(attrs)?.[1] || "";

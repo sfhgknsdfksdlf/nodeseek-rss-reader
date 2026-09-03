@@ -4,10 +4,11 @@ import { all, json, readJson } from "./db";
 import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
-import { getRssAttemptDiagnostics, safeSyncRss, testRssFetch } from "./rss";
+import { getHighlightGroups, getInitialRulePayload } from "./rules";
+import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
-import type { Env, HomeTimingSnapshot, HomeTimings, User } from "./types";
+import type { CronTimingSnapshot, Env, HomeTimingSnapshot, HomeTimings, User } from "./types";
 
 const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader"><rect width="128" height="128" rx="30" fill="#fff"/><rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/><path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/><circle cx="38" cy="91" r="8" fill="#111"/><path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/><path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/></svg>`;
 const manifest = { name: "NodeSeek RSS Reader", short_name: "NodeSeek RSS", start_url: "/", display: "standalone", background_color: "#000000", theme_color: "#000000", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
@@ -17,23 +18,7 @@ function requireUser(user: User | null): Response | null {
 }
 
 async function listHighlights(env: Env, user: User): Promise<Response> {
-  const rows = await all<{ id: number; user_id: number; name: string; color: string; pattern: string | null }>(env.DB.prepare(`
-    SELECT hg.id, hg.user_id, hg.name, hg.color, hr.pattern
-    FROM highlight_groups hg
-    LEFT JOIN highlight_rules hr ON hr.group_id = hg.id
-    WHERE hg.user_id = ?
-    ORDER BY hg.id DESC, hr.id DESC
-  `).bind(user.id));
-  const byId = new Map<number, { id: number; user_id: number; name: string; color: string; patterns: string[] }>();
-  for (const row of rows) {
-    let group = byId.get(row.id);
-    if (!group) {
-      group = { id: row.id, user_id: row.user_id, name: row.name, color: row.color, patterns: [] };
-      byId.set(row.id, group);
-    }
-    if (row.pattern) group.patterns.push(row.pattern);
-  }
-  return json([...byId.values()]);
+  return json(await getHighlightGroups(env, user));
 }
 
 async function handleApi(request: Request, env: Env, user: User | null, url: URL): Promise<Response> {
@@ -160,6 +145,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const rssResults = live ? await measure("rssTestMs", async () => testRssFetch(env)) : [];
   const rssDiagnostics = await measure("rssDiagnosticsMs", async () => getRssAttemptDiagnostics(env));
   const lastHomeTiming = await measure("homeTimingMs", async () => getLastHomeTiming(env));
+  const lastCronTiming = await measure("cronTimingMs", async () => getLastCronTiming(env));
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -188,8 +174,20 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
       rows: syncRows
     },
     home: lastHomeTiming,
+    cronTiming: lastCronTiming,
     rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
+}
+
+async function getLastCronTiming(env: Env): Promise<CronTimingSnapshot | null> {
+  const row = await env.DB.prepare("SELECT value, updated_at FROM sync_state WHERE key = 'last_cron_timing' LIMIT 1").first<{ value: string; updated_at: string }>();
+  if (!row?.value) return null;
+  try {
+    const parsed = JSON.parse(row.value) as CronTimingSnapshot;
+    return { ...parsed, recordedAt: row.updated_at || parsed.recordedAt };
+  } catch {
+    return null;
+  }
 }
 
 async function getLastHomeTiming(env: Env): Promise<HomeTimingSnapshot | null> {
@@ -300,10 +298,11 @@ async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): P
   }
   if (isHomeRoute && homeTimings) {
     const pageData = await queryPosts(env, user, url, homeTimings.queryPosts);
+    const initialRules = await getInitialRulePayload(env, user, url.searchParams.get("rulesVersion"), url.searchParams.get("rulesCache") === "1");
     const adminStatusStart = Date.now();
     const admin = await adminStatus(request, env);
     homeTimings.adminStatusMs = Date.now() - adminStatusStart;
-    const response = await renderHome(env, user, pageData, admin, homeTimings);
+    const response = await renderHome(env, user, pageData, admin, homeTimings, initialRules);
     homeTimings.totalMs = Date.now() - homeStart;
     ctx.waitUntil(storeLastHomeTiming(env, { path: url.pathname, query: url.searchParams.get("q") || "", board: url.searchParams.get("board") || "", page: pageData.page, user: !!user, postCount: pageData.posts.length, recordedAt: new Date().toISOString(), timings: homeTimings }));
     return response;
@@ -323,8 +322,36 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
-    const result = await safeSyncRss(env);
-    if (result.ok && !result.firstSync) await processSubscriptions(env, result.insertedPosts);
-    await cleanupOldData(env);
+  const startedAt = Date.now();
+  const result = await safeSyncRss(env);
+  let subscriptionTimings = { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
+  const shouldProcessSubscriptions = result.ok && !result.firstSync;
+  if (shouldProcessSubscriptions) {
+    subscriptionTimings = await processSubscriptions(env, result.insertedPosts);
   }
+  const cleanupStartedAt = Date.now();
+  await cleanupOldData(env);
+  const cleanupOldDataMs = Date.now() - cleanupStartedAt;
+  await recordCronTiming(env, {
+    recordedAt: new Date().toISOString(),
+    ok: result.ok,
+    firstSync: result.firstSync,
+    inserted: result.inserted,
+    ranProcessSubscriptions: shouldProcessSubscriptions,
+    timings: {
+      rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertLookupMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 },
+      processSubscriptionsMs: subscriptionTimings.totalMs,
+      cleanupOldDataMs,
+      totalMs: Date.now() - startedAt
+    },
+    cpu: {
+      rssParseItemsMs: result.cpu?.parseItemsMs || 0,
+      processSubscriptionsCompileMs: subscriptionTimings.compileRegexMs,
+      processSubscriptionsMatchMs: subscriptionTimings.matchMs,
+      cleanupPrepMs: 0,
+      totalMs: (result.cpu?.parseItemsMs || 0) + subscriptionTimings.compileRegexMs + subscriptionTimings.matchMs
+    },
+    ...(result.error ? { error: result.error } : {})
+  });
+}
 };

@@ -1,5 +1,102 @@
 # NodeSeek RSS Reader Design Spec
 
+## Oh My OpenAgent Model Configuration (Pending Approval)
+
+### Original Requirement
+
+- Modify `C:\Users\Administrator\.config\opencode\oh-my-openagent.jsonc`.
+- Set the `极复杂模型` group to `vllmproxy2/claude-opus-5`.
+- Set the `普通强模型` group to `vllmproxy1/gpt-5.6-sol`.
+- Set the `简单/廉价模型` group to `vllmproxy1/gpt-5.6-terra`.
+
+### Configuration Scope
+
+- Preserve the existing agent/category membership from the approved model
+  allocation document.
+- Apply the model values to the corresponding `agents` or `categories`
+  entries in `oh-my-openagent.jsonc`.
+- Do not add providers, change agent names, change group membership, or alter
+  unrelated configuration fields.
+
+### Required Mapping
+
+- `极复杂模型`: `metis`, `prometheus` -> `vllmproxy2/claude-opus-5`
+- `普通强模型`: `hephaestus`, `sisyphus`, `oracle`, `librarian`, `explore`,
+  `multimodal-looker`, `momus`, `atlas`, `visual-engineering`, `artistry`,
+  `ultrabrain`, `deep` -> `vllmproxy1/gpt-5.6-sol`
+- `简单/廉价模型`: `quick`, `unspecified-low`, `unspecified-high`, `writing`
+  -> `vllmproxy1/gpt-5.6-terra`
+
+### Verification
+
+- Parse the JSONC configuration without changing its syntax.
+- Verify every listed name has the requested model value.
+- Verify unrelated configuration is preserved.
+
+## Model Allocation Document (Approved)
+
+### Original Requirement
+
+- Create `C:\Users\Administrator\.config\opencode\模型分配.txt`.
+- Assign `metis` and `prometheus` to the extremely complex model tier.
+- Assign the remaining twelve entries, including `hephaestus`, to the normal
+  strong-model tier.
+- Assign four selected entries to the simple/low-cost model tier.
+
+### Scope And Data Model
+
+This change creates one plain-text decision document only. It does not modify
+`opencode.json`, `oh-my-openagent.jsonc`, agent registration, providers, or
+model identifiers.
+
+The document contains three fixed sections:
+
+1. `极复杂模型（2 个）`
+   - `metis`
+   - `prometheus`
+2. `普通强模型（12 个）`
+   - `hephaestus`
+   - `sisyphus`
+   - `oracle`
+   - `librarian`
+   - `explore`
+   - `multimodal-looker`
+   - `momus`
+   - `atlas`
+   - `visual-engineering`
+   - `artistry`
+   - `ultrabrain`
+   - `deep`
+3. `简单/廉价模型（4 个）`
+   - `quick`
+   - `unspecified-low`
+   - `unspecified-high`
+   - `writing`
+
+### Selection Rationale
+
+- `hephaestus` is assigned to the normal strong-model tier.
+- `metis` is the high-value pre-planning gap analysis agent.
+- `prometheus` is the strategic planning and interview agent.
+- The normal tier retains orchestration, planning, consultation, review,
+  documentation retrieval, codebase search, multimodal analysis, visual work,
+  creative work, hard reasoning, and autonomous research/execution
+  capabilities.
+- The simple tier contains quick changes, low-effort fallback work,
+  high-effort fallback work as requested, and prose tasks.
+
+### Complete Candidate Coverage
+
+All 18 names in the user's original list are included exactly once. The final
+partition is `2 + 12 + 4 = 18`; there are no
+excluded names.
+
+### Verification
+
+- Verify `C:\Users\Administrator\.config\opencode\模型分配.txt` exists.
+- Verify it has exactly the three sections above and contains 2, 12, and 4
+  entries respectively.
+
 ## Original Requirements
 
 - Build a fresh architecture without referencing any local NodeSeek RSS Reader implementation.
@@ -29,23 +126,25 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 
 ## Modules
 
-- `src/index.ts`: Worker entry, routing, cron handler.
-- `src/types.ts`: shared environment and model types.
-- `src/db.ts`: D1 helpers and SQL utilities.
+- `src/index.ts`: Worker entry, routing, cron handler, debug status.
+- `src/types.ts`: shared environment, model, and timing types.
+- `src/db.ts`: D1 helpers and SQL/cookie utilities.
 - `src/auth.ts`: registration, login, logout, sessions, PBKDF2 password hashing.
-- `src/rss.ts`: fetch and parse NodeSeek RSS, record structured RSS fetch attempt logs.
+- `src/rss.ts`: fetch, parse, sync, and record structured RSS fetch attempt logs.
 - `src/posts.ts`: post list query, pagination, search, block filtering, read state.
 - `src/filters.ts`: regex validation, matching, highlight rendering.
-- `src/subscriptions.ts`: subscription matching and deduplicated push dispatch.
-- `src/notifications.ts`: Brevo and Telegram notification sending.
-- `src/render.ts`: server-rendered HTML and client interaction script.
+- `src/subscriptions.ts`: subscription matching and push dispatch.
+- `src/notifications.ts`: Brevo and Telegram senders plus push logging.
+- `src/cleanup.ts`: retention cleanup for posts, read states, push logs, sessions.
+- `src/settings.ts`: runtime settings load/save and admin configuration.
+- `src/render.ts`: server-rendered HTML shell and client interaction script.
 - `src/styles.ts`: responsive black/white/OLED CSS.
 - `src/time.ts`: Beijing time formatting.
 - `src/board.ts`: board key to Chinese display mapping.
 
 ## Data Model
 
-- `users(id, username, password_hash, password_salt, email, telegram_chat_id, telegram_bind_code, created_at, updated_at)`
+- `users(id, username, password_hash, password_salt, email, telegram_chat_id, telegram_bind_code, telegram_bind_code_expires_at, created_at, updated_at)`
 - `sessions(id, user_id, expires_at, created_at)`
 - `admin_sessions(id, expires_at, created_at)`
 - `app_settings(key, value, encrypted, updated_at)`
@@ -55,11 +154,14 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `highlight_rules(id, group_id, pattern, created_at)`
 - `block_rules(id, user_id, pattern, created_at)`
 - `subscriptions(id, user_id, pattern, send_email, send_telegram, created_at, updated_at)`
-- `push_logs(id, user_id, subscription_id, post_id, channel, status, error, created_at)`
+- `push_logs(id, user_id, subscription_id, post_guid, channel, status, error, created_at)`
 - `sync_state(key, value, updated_at)`
 - `rss_fetch_failures(id, source, method, status, status_text, error, preview, created_at)` legacy table no longer read by diagnostics.
 - `rss_fetch_attempts(id, source, method, outcome, status, status_text, error, preview, created_at)`
 - `sync_state.last_home_timing` stores the latest normal home-page server timing snapshot for `/api/debug/status`.
+- RSS sync checks the current feed item `guid` values against `posts.guid` in one D1 query before inserting; only truly new RSS items are inserted.
+- Subscription matching consumes the in-memory list of newly discovered RSS items instead of re-reading inserted rows from D1.
+- Push notification idempotency uses `push_logs.post_guid` rather than numeric `post_id` so the RSS sync path can avoid re-reading inserted rows from D1.
 
 ## API
 
@@ -81,6 +183,9 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - RSS fetch attempts, both successes and failures, are written to D1 as structured records in `rss_fetch_attempts`.
 - Attempt records are retained for 24 hours and exposed in admin diagnostics; old `rss_fetch_failures` rows are ignored by new diagnostics.
 - `GET /api/debug/status?token=ADMIN_SECRET` includes backend timing fields plus `rss.attemptStats` for `cron.success`, `cron.failure`, `rssTest.success`, and `rssTest.failure`, while preserving raw `rss.results` output and `rss.failureSummary`.
+- `/api/debug/status` also exposes a structured `cronTiming` object that breaks down the latest cron execution into per-step durations, at minimum: `safeSyncRssMs`, `processSubscriptionsMs`, `cleanupOldDataMs`, `totalMs`, and an `updatedAt` timestamp for the snapshot.
+- The cron timing snapshot is captured asynchronously from the scheduled path so normal cron execution is not blocked by diagnostics writes.
+- The debug payload should keep the current RSS diagnostics unchanged and only add the cron timing breakdown as an additional top-level field.
 - `/api/debug/status` does not run live RSS fetch diagnostics by default; append `live=1` to run `/api/rss-test` style fetch checks.
 
 ## Home Page Timing And Scanning

@@ -41,6 +41,45 @@
 - Generated deploy config is root `wrangler.generated.jsonc`; edit `wrangler.jsonc` and `scripts/cloudflare-build.mjs`, not generated output.
 - `nodeseek.js` and `rss.nodeseek.com.har` are local reference artifacts; do not commit them unless explicitly asked.
 
+## Project Structure
+- `src/board.ts`: board key normalization and board-specific helpers.
+- `src/db.ts`: thin D1 helpers and JSON/cookie utilities.
+- `src/filters.ts`: regex safety, highlighting, HTML helpers.
+- `src/time.ts`: time/date helpers.
+- `src/types.ts`: shared Env, model, and timing types.
+- `src/index.ts`: request routing, scheduled cron entry, `/api/debug/status`.
+- `src/rss.ts`: RSS fetch, parse, sync, and RSS attempt diagnostics.
+- `src/posts.ts`: homepage / `/api/posts` query, pagination, search, block filtering.
+- `src/subscriptions.ts`: subscription regex matching and notification dispatch.
+- `src/notifications.ts`: Brevo / Telegram senders and push logging.
+- `src/cleanup.ts`: retention cleanup for posts, read states, push logs, sessions.
+- `src/settings.ts`: runtime settings load/save and admin configuration.
+- `src/auth.ts`: registration, login, sessions, Telegram binding.
+- `src/render.ts`: SSR HTML shell and client script.
+- `src/styles.ts`: all CSS and responsive layout.
+- `migrations/`: numbered D1 schema migrations; never rewrite deployed ones.
+- `scripts/cloudflare-build.mjs`: Cloudflare build/deploy config generator; keep generated config at repo root.
+
+## Where to Look
+- RSS / cron slowness: `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts`.
+- Homepage slowness: `src/posts.ts`, `src/render.ts`.
+- Notification dedupe / push logs: `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0001_initial.sql`, `migrations/0009_push_logs_post_guid.sql`.
+- Admin / debug status: `src/index.ts`, `src/settings.ts`.
+
+## Current Conventions
+- Keep RSS sync limited to `https://rss.nodeseek.com/`.
+- Prefer D1-backed state; avoid introducing new storage.
+- Keep homepage card layout and CSS centralized in `src/styles.ts`.
+- Preserve root `wrangler.generated.jsonc` and root `wrangler.jsonc` generation flow.
+- When changing push dedupe, use `push_logs.post_guid`; do not reintroduce `post_id`-based dedupe in new code.
+- Keep routing boundaries in `src/index.ts`: API paths are handled there, while non-API page requests query posts and render through `renderHome`.
+- Keep rule handoff user-isolated: `src/rules.ts` versions and prepares the SSR payload, and `src/render.ts` hands complete logged-in non-search payloads to the browser, which blocks before highlighting. Cache keys and payloads must remain scoped to the user ID.
+
+## Gotchas
+- `posts.guid` is the stable RSS identity; use it for RSS-side de-duplication.
+- `posts.id` still exists for persisted rows and read-state relations, but new RSS notification flow should not depend on re-reading full rows.
+- Cron diagnostics in `/api/debug/status` are temporary investigation aids; avoid adding more unless they explain a concrete regression.
+
 ## Commands
 - Typecheck: `npm run typecheck`.
 - Build-script syntax check: `node --check scripts/cloudflare-build.mjs`.
@@ -48,6 +87,7 @@
 - Local D1 migrations: `npm run db:migrate:local`; remote migrations: `npm run db:migrate`.
 - Cloudflare GitHub build/deploy command is exactly `npm run deploy`; deploy from already generated config with `npm run deploy:generated`.
 - No test or lint scripts are defined in `package.json`; do not invent them.
+- In this workspace, `npm run typecheck` and TypeScript LSP are blocked when local compiler and language-server dependencies are absent. Use `git diff --check` and `node --check scripts/cloudflare-build.mjs` as available verification, and report those limitations rather than inventing tests.
 
 ## Deploy And Config
 - `npm run deploy` runs `scripts/cloudflare-build.mjs`, finds/creates D1, writes both `wrangler.generated.jsonc` and root `wrangler.jsonc` with `DB`, applies migrations, dry-runs deploy, then `wrangler deploy --config wrangler.generated.jsonc`.
@@ -59,8 +99,9 @@
 
 ## Data And Migrations
 - Add schema changes as new numbered SQL files; never rewrite deployed migrations.
-- Current migration chain: `0001_initial` through `0008_posts_keyset_indexes`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
+- Current migration chain: `0001_initial` through `0009_push_logs_post_guid`; `rss_fetch_failures` is legacy, new diagnostics read `rss_fetch_attempts` only.
 - `0008_posts_keyset_indexes` supports home-page keyset scans with `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)`; confirm remote indexes with `wrangler d1 execute ... "SELECT name FROM sqlite_master WHERE type='index' AND name IN (...)"` when diagnosing deep-page slowness.
+- `0009_push_logs_post_guid` moves push-log idempotency from `post_id` to `post_guid`; preserve this direction in new dedupe code.
 - `ADMIN_SECRET` authenticates `/admin?token=...` and encrypts D1-stored Brevo/Telegram settings; changing it requires re-entering encrypted settings.
 - PBKDF2 iterations must stay `<= 100000`; Workers reject higher counts.
 
@@ -75,7 +116,8 @@
 ## Runtime Behavior
 - Post cards must open the original RSS `link` with real `<a target="_blank">`; do not route normal opens through `/post/:id/open`.
 - Read state is D1-backed for logged-in users and localStorage-backed for anonymous users.
-- Each page shows 50 posts; search must cover all RSS posts in D1, not just the latest page/window.
+- `runtimeSettings(env).pageSize` controls every listing path. The D1 `page_size` setting defaults to `100`, falls back to `100` for invalid values, and is clamped to `10..500` when saved.
+- Pagination has no exact total-page calculation. The SSR pager always shows the requested page through `page + 3`, with previous clamped to page 1 and next pointing to `page + 1`; valid out-of-range requests return an empty page. Search still scans server-side across RSS posts in D1.
 - Telegram bind codes are 24-hour codes from `GET /api/account`; bound users should not see a bind code until they clear Telegram binding.
 
 ## Hotspots
