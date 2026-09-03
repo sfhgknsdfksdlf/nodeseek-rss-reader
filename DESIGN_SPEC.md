@@ -131,8 +131,8 @@ No existing local Reader code is used. The requested `workspace/nodeseek.js` qui
 - `src/db.ts`: D1 helpers and SQL/cookie utilities.
 - `src/auth.ts`: registration, login, logout, sessions, PBKDF2 password hashing.
 - `src/rss.ts`: fetch, parse, sync, and record structured RSS fetch attempt logs.
-- `src/posts.ts`: post list query, pagination, search, block filtering, read state.
-- `src/filters.ts`: regex validation, matching, highlight rendering.
+- `src/posts.ts`: post list query, pagination, title/body search, read state.
+- `src/filters.ts`: HTML sanitization and regex safety helpers used by server-side search and browser rule processing.
 - `src/subscriptions.ts`: subscription matching and push dispatch.
 - `src/notifications.ts`: Brevo and Telegram senders plus push logging.
 - `src/cleanup.ts`: retention cleanup for posts, read states, push logs, sessions.

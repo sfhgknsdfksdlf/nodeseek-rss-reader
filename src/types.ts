@@ -75,9 +75,6 @@ export interface HomeTimings {
   adminStatusMs?: number;
   queryPosts?: {
     totalMs?: number;
-    blockRulesLoadMs?: number;
-    blockRegexCompileMs?: number;
-    blockMatchMs?: number;
     searchRegexCompileMs?: number;
     searchMatchMs?: number;
     countMs?: number;
@@ -90,10 +87,7 @@ export interface HomeTimings {
   };
   render?: {
     totalMs?: number;
-    highlightGroupsLoadMs?: number;
     postsHtmlMs?: number;
-    titleHighlightMs?: number;
-    bodyHighlightMs?: number;
     htmlShellMs?: number;
   };
 }

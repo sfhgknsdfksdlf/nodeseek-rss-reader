@@ -1,6 +1,5 @@
 import { boardOptions, displayBoard } from "./board";
-import { escapeAttr, escapeHtml, highlightHtml, highlightText, postTextForBlock, safeHttpUrl, sanitizePostHtml } from "./filters";
-import { getHighlightGroups } from "./rules";
+import { escapeAttr, escapeHtml, postTextForBlock, safeHttpUrl, sanitizePostHtml } from "./filters";
 import { formatBeijingTime } from "./time";
 import type { Env, HomeTimings, PageData, Post, User } from "./types";
 import type { RulePayload } from "./rules";
@@ -21,20 +20,9 @@ function pager(data: PageData, rulesVersion: string): string {
   return `<nav class="pager"><a class="page" href="${pageUrl(Math.max(1, data.page - 1), data, rulesVersion)}">上一页</a>${pages.map((p) => `<a class="page ${p === data.page ? "current" : ""}" href="${pageUrl(p, data, rulesVersion)}">${p}</a>`).join("")}<a class="page" href="${pageUrl(data.page + 1, data, rulesVersion)}">下一页</a></nav>`;
 }
 
-function addRenderTiming(timings: HomeTimings | undefined, key: keyof NonNullable<HomeTimings["render"]>, value: number): void {
-  if (!timings?.render) return;
-  timings.render[key] = (timings.render[key] || 0) + value;
-}
-
-function renderPost(post: Post, groups: Awaited<ReturnType<typeof getHighlightGroups>>, timings?: HomeTimings, clientRulesMode = false): string {
+function renderPost(post: Post): string {
   const link = escapeAttr(safeHttpUrl(post.link));
-  const titleStart = Date.now();
-  const title = clientRulesMode ? escapeHtml(post.title) : highlightText(post.title, groups);
-  addRenderTiming(timings, "titleHighlightMs", Date.now() - titleStart);
-  const bodyStart = Date.now();
-  const body = highlightHtml(sanitizePostHtml(post.content_html), clientRulesMode ? [] : groups);
-  addRenderTiming(timings, "bodyHighlightMs", Date.now() - bodyStart);
-  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-rule-text="${escapeAttr(postTextForBlock(post))}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${title}</a></div><div class="body">${body}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
+  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-rule-text="${escapeAttr(postTextForBlock(post))}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${escapeHtml(post.title)}</a></div><div class="body">${sanitizePostHtml(post.content_html)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
 }
 
 function safeJson(value: unknown): string {
@@ -44,24 +32,19 @@ function safeJson(value: unknown): string {
 export async function renderHome(env: Env, user: User | null, data: PageData, admin: { adminSecretConfigured: boolean; adminAuthenticated: boolean }, timings?: HomeTimings, initialRules?: RulePayload): Promise<Response> {
   const renderStart = Date.now();
   if (timings) timings.render ||= {};
-  const groupsStart = Date.now();
-  // Only a complete payload can safely enter the hidden-until-processed client
-  // pipeline. Cache-hit responses omit the payload but keep SSR rendering.
+  // Only a complete payload can safely enter the hidden-until-processed client pipeline.
   const clientRulesMode = Boolean(
     user &&
-      !data.query &&
       initialRules?.userId === user.id &&
       Array.isArray(initialRules.blockRules) &&
       Array.isArray(initialRules.highlightGroups),
   );
-  const groups = clientRulesMode ? [] : initialRules?.highlightGroups || await getHighlightGroups(env, user);
-  if (timings?.render) timings.render.highlightGroupsLoadMs = Date.now() - groupsStart;
   const boardSelect = `<select name="board">${boardOptions.map(([value, label]) => `<option value="${escapeAttr(value)}" ${value === data.board ? "selected" : ""}>${label}</option>`).join("")}</select>`;
   const empty = data.syncError ? `<p class="muted">暂无帖子。RSS 获取失败：${escapeHtml(data.syncError)}。请打开 <a href="/api/rss-test">/api/rss-test</a> 查看请求测试结果。</p>` : `<p class="muted">暂无帖子</p>`;
   const adminNotice = adminNoticeHtml(admin);
   const github = `<footer class="footer"><a class="github-link" href="https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader" target="_blank" rel="noreferrer" aria-label="GitHub nodeseek-rss-reader"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.09.68-.22.68-.49 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.3 9.3 0 0 1 12 6.99c.85 0 1.7.12 2.5.35 1.9-1.33 2.74-1.05 2.74-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.95.68 1.92 0 1.38-.01 2.5-.01 2.84 0 .27.18.59.69.49A10.12 10.12 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg><span>nodeseek-rss-reader</span><span id="githubStars" class="muted">★</span></a></footer>`;
   const postsHtmlStart = Date.now();
-  const postsHtml = data.posts.map((p) => renderPost(p, groups, timings, clientRulesMode)).join("") || empty;
+  const postsHtml = data.posts.map((p) => renderPost(p)).join("") || empty;
   if (timings?.render) timings.render.postsHtmlMs = Date.now() - postsHtmlStart;
   const htmlShellStart = Date.now();
   const rulesVersion = initialRules?.rulesVersion || "anonymous";
@@ -97,13 +80,15 @@ function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('sh
 async function api(method,url,body){const r=await fetch(url,{method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){let e='失败';try{e=(await r.json()).error||e}catch{}toast(e)}return r}
 const initialRulesState=(()=>{const node=$('#nd-initial-data');if(!node)return {valid:false,data:{}};try{const data=JSON.parse(node.textContent||'');return {valid:!!data&&typeof data==='object'&&(data.userId===null||typeof data.userId==='number')&&typeof data.rulesVersion==='string',data}}catch{return {valid:false,data:{}}}})();
 const initialRules=initialRulesState.data;
+const searchQuery=new URLSearchParams(location.search).get('q')?.trim()||'';
 function rulesKey(userId){return 'nd-rules:'+String(userId)}
  function regexHasBacktrackingHazard(pattern){return /\((?:[^()\\]|\.)*[+*](?:[^()\\]|\.)*\)(?:[+*]|\{\d+(?:,\d*)?\})/.test(pattern)||/(?:^|[^\w\\])(?:[\w\\](?:[+*]|\{\d+(?:,\d*)?\})){2}/.test(pattern)||/\((?:[^()\\]|\.)*\|(?:[^()\\]|\.)*\)(?:[+*]|\{\d+(?:,\d*)?\})/.test(pattern)}
  function clientRegex(pattern){if(typeof pattern!=='string'||!pattern||pattern.length>200||regexHasBacktrackingHazard(pattern))return null;try{return new RegExp(pattern,'i')}catch{return null}}
 function loadRules(){if(!initialRules.userId)return {blockRules:[],highlightGroups:[]};const key=rulesKey(initialRules.userId);let cached=null;try{cached=JSON.parse(localStorage.getItem(key)||'null')}catch{try{localStorage.removeItem(key)}catch{}}if(Array.isArray(initialRules.blockRules)||Array.isArray(initialRules.highlightGroups)){const next={userId:initialRules.userId,rulesVersion:String(initialRules.rulesVersion||''),blockRules:Array.isArray(initialRules.blockRules)?initialRules.blockRules:[],highlightGroups:Array.isArray(initialRules.highlightGroups)?initialRules.highlightGroups:[]};try{localStorage.setItem(key,JSON.stringify(next))}catch{}cached=next}if(!cached||cached.userId!==initialRules.userId||cached.rulesVersion!==initialRules.rulesVersion)return null;return {blockRules:Array.isArray(cached.blockRules)?cached.blockRules:[],highlightGroups:Array.isArray(cached.highlightGroups)?cached.highlightGroups:[]}}
 function highlightCard(card,groups){for(const mark of card.querySelectorAll('mark'))mark.replaceWith(document.createTextNode(mark.textContent||''));for(const group of groups){if(!group||typeof group.color!=='string'||!/^#[0-9a-f]{6}$/i.test(group.color)||!Array.isArray(group.patterns))continue;for(const pattern of group.patterns){const re=clientRegex(pattern);if(!re)continue;const global=new RegExp(re.source,'gi');for(const container of card.querySelectorAll('.title,.body')){const walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);const nodes=[];while(walker.nextNode())nodes.push(walker.currentNode);for(const node of nodes){const value=node.nodeValue||'';global.lastIndex=0;let last=0,match;const fragment=document.createDocumentFragment();while((match=global.exec(value))){if(!match[0]){global.lastIndex++;continue}if(match.index>last)fragment.append(document.createTextNode(value.slice(last,match.index)));const mark=document.createElement('mark');mark.style.background=group.color;mark.textContent=match[0];fragment.append(mark);last=match.index+match[0].length}if(last){if(last<value.length)fragment.append(document.createTextNode(value.slice(last)));node.parentNode?.replaceChild(fragment,node)}}}}}}
-function applyRules(){if(!initialRulesState.valid||!initialRules.clientRules)return initialRulesState.valid;const rules=loadRules();if(!rules)return false;const blocks=rules.blockRules.map(r=>clientRegex(r&&r.pattern)).filter(Boolean);for(const card of $$('.card')){const text=card.dataset.ruleText||[card.querySelector('.title')?.textContent,card.querySelector('.body')?.textContent,card.querySelector('.author')?.textContent].filter(Boolean).join('\n');if(blocks.some(re=>re.test(text)))card.remove()}for(const card of $$('.card'))highlightCard(card,rules.highlightGroups);return true}
- try{if(initialRules.clientRules&&applyRules()){$('#nd-initial-data')?.remove();document.body.classList.remove('nd-client-rules-active')}}catch{}
+function applySearchHighlight(){if(!searchQuery)return;const searchGroups=[{color:'#ffeb3b',patterns:[searchQuery]}];for(const card of $$('.card'))highlightCard(card,searchGroups)}
+ function applyRules(){if(!initialRulesState.valid||!initialRules.clientRules)return initialRulesState.valid;const rules=loadRules();if(!rules)return false;if(!searchQuery){const blocks=rules.blockRules.map(r=>clientRegex(r&&r.pattern)).filter(Boolean);for(const card of $$('.card')){const text=card.dataset.ruleText||[card.querySelector('.title')?.textContent,card.querySelector('.body')?.textContent,card.querySelector('.author')?.textContent].filter(Boolean).join('\n');if(blocks.some(re=>re.test(text)))card.remove()}}const searchGroups=searchQuery?[{color:'#ffeb3b',patterns:[searchQuery]}]:[];for(const card of $$('.card'))highlightCard(card,searchGroups.concat(rules.highlightGroups));return true}
+ try{if(initialRules.clientRules){if(applyRules()){$('#nd-initial-data')?.remove();document.body.classList.remove('nd-client-rules-active')}}else{applySearchHighlight()}}catch{}
 $$('[data-dialog]').forEach(b=>b.onclick=()=>{document.getElementById(b.dataset.dialog).showModal(); if(b.dataset.dialog==='settings') loadTab(window.settingTab||'highlights')});
 $$('[data-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 $$('[data-auth]').forEach(f=>f.onsubmit=async e=>{e.preventDefault();const r=await api('POST',f.dataset.auth,Object.fromEntries(new FormData(f)));if(r.ok) location.reload()});

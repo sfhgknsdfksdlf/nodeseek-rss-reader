@@ -272,9 +272,10 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const prepareInsertStartedAt = Date.now();
   const guids = items.map((item) => item.guid).filter((guid) => !!guid);
   const existingGuids = new Set<string>();
-  if (guids.length) {
-    const placeholders = guids.map(() => "?").join(",");
-    const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...guids));
+  for (let offset = 0; offset < guids.length; offset += 100) {
+    const guidChunk = guids.slice(offset, offset + 100);
+    const placeholders = guidChunk.map(() => "?").join(",");
+    const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...guidChunk));
     for (const row of rows) existingGuids.add(row.guid);
   }
   const insertRows = items.filter((item) => item.guid && !existingGuids.has(item.guid)).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));

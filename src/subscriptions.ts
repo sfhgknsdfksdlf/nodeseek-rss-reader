@@ -40,10 +40,15 @@ export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promi
   if (!subs.length) return { loadSubsMs, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
   const loadSentStartedAt = Date.now();
   const postGuids = posts.map((post) => post.guid);
-  const placeholders = postGuids.map(() => "?").join(",");
-  const logRows = await all<{ user_id: number; subscription_id: number; post_guid: string; channel: string }>(
-    env.DB.prepare(`SELECT user_id, subscription_id, post_guid, channel FROM push_logs WHERE post_guid IN (${placeholders})`).bind(...postGuids)
-  );
+  const logRows: { user_id: number; subscription_id: number; post_guid: string; channel: string }[] = [];
+  for (let offset = 0; offset < postGuids.length; offset += 100) {
+    const guidChunk = postGuids.slice(offset, offset + 100);
+    const placeholders = guidChunk.map(() => "?").join(",");
+    const rows = await all<{ user_id: number; subscription_id: number; post_guid: string; channel: string }>(
+      env.DB.prepare(`SELECT user_id, subscription_id, post_guid, channel FROM push_logs WHERE post_guid IN (${placeholders})`).bind(...guidChunk)
+    );
+    logRows.push(...rows);
+  }
   const sent = new Set(logRows.map((row) => pushKey(row.user_id, row.subscription_id, row.post_guid, row.channel)));
   const loadSentMs = Date.now() - loadSentStartedAt;
   const compileStartedAt = Date.now();

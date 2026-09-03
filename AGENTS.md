@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-03
-**Commit:** 95d3b14
-**Branch:** main
+**Generated:** 2026-09-04
+**Commit:** 774004a
+**Branch:** 0903
 
 ## OVERVIEW
 
@@ -29,7 +29,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 |---|---|---|
 | Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration, debug status |
 | RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, diagnostics |
-| Home query | `src/posts.ts` | Page/board/search query, filtering, read state |
+| Home query | `src/posts.ts` | Page/board query, title/body search, pagination, read state |
 | SSR shell/client script | `src/render.ts` | HTML rendering and browser interactions |
 | Runtime settings | `src/settings.ts` | D1-backed settings and admin configuration |
 | Auth/session | `src/auth.ts` | Registration, login, cookies, Telegram binding |
@@ -67,7 +67,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Normal post cards must link to the source URL with a real external `<a target="_blank">`; `/post/:id/open` is not the normal open path.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
 - Keep homepage card CSS in `src/styles.ts`; preserve the rounded black/white UI and OLED pure-black dark mode.
-- Listings use runtime `page_size` (default 100, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
+- Listings use runtime `page_size` (default 99, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
@@ -91,7 +91,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Scheduled sync waits 21..24s before RSS and before browser fallback after failure. `/api/rss-test` is the no-sleep diagnostic path.
 - `src/rss.ts` uses `cf.cacheTtl = 60`; preserve attempt diagnostics because upstream often returns 503.
 - `/api/debug/status?token=ADMIN_SECRET` is non-live unless `live=1`; `safeSyncRss()` records cron failure in `sync_state.last_sync_error`.
-- Search/block rules require Worker-side filtering. In `src/posts.ts`, scan only until the requested page fills; defer `content_html` until final IDs are known.
+- Worker search matches only `title` and `content_text`; browser rules use the synced payload. Ordinary listings apply block rules in the browser, search results skip block rules, and highlights render in the browser. In `src/posts.ts`, scan only until the requested page fills; defer `content_html` until final IDs are known.
 - Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
 - Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
 - Rule payloads must be scoped to the logged-in user; browser processing blocks before highlighting.

@@ -73,8 +73,7 @@ export async function getRulesVersion(env: Env, user: User | null): Promise<stri
 export async function getInitialRulePayload(env: Env, user: User | null, clientVersion: string | null, clientCacheCapable = false): Promise<RulePayload> {
   const rulesVersion = await getRulesVersion(env, user);
   const payload: RulePayload = { userId: user?.id || null, rulesVersion };
-  // A matching URL version is usable only when the client explicitly confirms its cache works.
-  if (user && !(clientCacheCapable && clientVersion === rulesVersion)) {
+  if (user) {
     const [blockRules, highlightGroups] = await Promise.all([getBlockRules(env, user), getHighlightGroups(env, user)]);
     payload.blockRules = blockRules;
     payload.highlightGroups = highlightGroups;

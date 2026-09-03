@@ -1,4 +1,4 @@
-import type { HighlightGroup, Post } from "./types";
+import type { Post } from "./types";
 
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch));
@@ -65,35 +65,6 @@ export function sanitizePostHtml(raw: string): string {
     return `<img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}" loading="lazy">`;
   });
   return html.trim();
-}
-
-export function highlightText(text: string, groups: HighlightGroup[]): string {
-  let output = escapeHtml(text);
-  for (const group of groups) {
-    for (const pattern of group.patterns) {
-      const re = safeRegex(pattern);
-      if (!re) continue;
-      output = output.replace(new RegExp(re.source, "gi"), (match) => `<mark style="background:${escapeAttr(group.color)}">${match}</mark>`);
-    }
-  }
-  return output;
-}
-
-function highlightEscapedText(text: string, groups: HighlightGroup[]): string {
-  let output = text;
-  for (const group of groups) {
-    for (const pattern of group.patterns) {
-      const re = safeRegex(pattern);
-      if (!re) continue;
-      output = output.replace(new RegExp(re.source, "gi"), (match) => `<mark style="background:${escapeAttr(group.color)}">${match}</mark>`);
-    }
-  }
-  return output;
-}
-
-export function highlightHtml(html: string, groups: HighlightGroup[]): string {
-  if (!groups.some((group) => group.patterns.length)) return html;
-  return html.split(/(<[^>]+>)/g).map((part) => part.startsWith("<") ? part : highlightEscapedText(part, groups)).join("");
 }
 
 export function postTextForBlock(post: Pick<Post, "title" | "content_text" | "author">): string {

@@ -1,7 +1,6 @@
 import { all, one } from "./db";
 import { normalizeBoard } from "./board";
-import { postTextForBlock, safeRegex } from "./filters";
-import { getBlockRules, getHighlightGroups } from "./rules";
+import { safeRegex } from "./filters";
 import { runtimeSettings } from "./settings";
 import type { Env, HomeTimings, PageData, Post, User } from "./types";
 
@@ -10,33 +9,33 @@ type PostScanRow = Pick<Post, "id" | "title" | "content_text" | "author" | "boar
 // Keep bound offsets well below SQLite/D1 integer limits while allowing ordinary page numbers.
 const MAX_PAGE_OFFSET = 2_000_000_000;
 
-function allowedByBlocks(post: Pick<Post, "title" | "content_text" | "author">, blocks: RegExp[]): boolean {
-  const text = postTextForBlock(post);
-  return !blocks.some((rule) => rule.test(text));
+function postTextForSearch(post: Pick<Post, "title" | "content_text">): string {
+  return `${post.title}\n${post.content_text}`;
 }
 
-function postTextForSearch(post: Pick<Post, "title" | "content_text" | "author" | "board_key">): string {
-  return `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`;
-}
-
-function allowedBySearch(post: Pick<Post, "title" | "content_text" | "author" | "board_key">, queryRegex: RegExp | null): boolean {
+function allowedBySearch(post: Pick<Post, "title" | "content_text">, queryRegex: RegExp | null): boolean {
   if (!queryRegex) return true;
   return queryRegex.test(postTextForSearch(post));
 }
 
 async function postsByIds(env: Env, user: User | null, ids: number[]): Promise<Post[]> {
   if (!ids.length) return [];
-  const placeholders = ids.map(() => "?").join(",");
   const order = new Map(ids.map((id, index) => [id, index]));
-  const args: unknown[] = [];
-  let sql = "SELECT p.*, " + (user ? "CASE WHEN r.post_id IS NULL THEN 0 ELSE 1 END" : "0") + ` AS is_read FROM posts p `;
-  if (user) {
-    sql += "LEFT JOIN read_states r ON r.post_id = p.id AND r.user_id = ? ";
-    args.push(user.id);
+  const chunkSize = user ? 99 : 100;
+  const posts: Post[] = [];
+  for (let offset = 0; offset < ids.length; offset += chunkSize) {
+    const idChunk = ids.slice(offset, offset + chunkSize);
+    const placeholders = idChunk.map(() => "?").join(",");
+    const args: unknown[] = [];
+    let sql = "SELECT p.*, " + (user ? "CASE WHEN r.post_id IS NULL THEN 0 ELSE 1 END" : "0") + ` AS is_read FROM posts p `;
+    if (user) {
+      sql += "LEFT JOIN read_states r ON r.post_id = p.id AND r.user_id = ? ";
+      args.push(user.id);
+    }
+    sql += `WHERE p.id IN (${placeholders})`;
+    args.push(...idChunk);
+    posts.push(...await all<Post>(env.DB.prepare(sql).bind(...args)));
   }
-  sql += `WHERE p.id IN (${placeholders})`;
-  args.push(...ids);
-  const posts = await all<Post>(env.DB.prepare(sql).bind(...args));
   return posts.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
 }
 
@@ -53,16 +52,10 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const setTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
     if (timings) timings[key] = value;
   };
-  const blocksStart = Date.now();
-  const blocks = await getBlockRules(env, user);
-  setTiming("blockRulesLoadMs", Date.now() - blocksStart);
-  const blockRegexStart = Date.now();
-  const blockRegexes = blocks.map((rule) => safeRegex(rule.pattern)).filter((rule): rule is RegExp => !!rule);
-  setTiming("blockRegexCompileMs", Date.now() - blockRegexStart);
   const searchRegexStart = Date.now();
   const queryRegex = query ? safeRegex(query) : null;
   setTiming("searchRegexCompileMs", Date.now() - searchRegexStart);
-  if (!query && blocks.length === 0) {
+  if (!query) {
     const page = requestedPage;
     const offset = (page - 1) * pageSize;
     const args: unknown[] = [];
@@ -88,7 +81,6 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const chunkSize = 1000;
   let matched = 0;
   const pagePostIds: number[] = [];
-  const lastPagePostIds: number[] = [];
   const start = (requestedPage - 1) * pageSize;
   const end = start + pageSize;
   let stoppedAtPageLimit = false;
@@ -111,16 +103,11 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     const sql = `SELECT id, title, content_text, author, board_key, published_at FROM posts ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY published_at DESC, id DESC LIMIT ?`;
     const chunk = await all<PostScanRow>(env.DB.prepare(sql).bind(...args, chunkSize));
     if (!chunk.length) break;
-    const blockStart = Date.now();
-    const blockAllowed = blockRegexes.length ? chunk.filter((post) => allowedByBlocks(post, blockRegexes)) : chunk;
-    if (timings) timings.blockMatchMs = (timings.blockMatchMs || 0) + (Date.now() - blockStart);
     const searchStart = Date.now();
-    const searchAllowed = queryRegex ? blockAllowed.filter((post) => allowedBySearch(post, queryRegex)) : blockAllowed;
+    const searchAllowed = queryRegex ? chunk.filter((post) => allowedBySearch(post, queryRegex)) : chunk;
     if (timings) timings.searchMatchMs = (timings.searchMatchMs || 0) + (Date.now() - searchStart);
     for (const post of searchAllowed) {
       if (matched >= start && matched < end) pagePostIds.push(post.id);
-      lastPagePostIds.push(post.id);
-      if (lastPagePostIds.length > pageSize) lastPagePostIds.shift();
       matched++;
       if (matched >= end) {
         stoppedAtPageLimit = true;
