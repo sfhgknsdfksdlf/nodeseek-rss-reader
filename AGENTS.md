@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-05
-**Commit:** a08c5b7
-**Branch:** 0905
+**Generated:** 2026-09-06
+**Commit:** 1c099b3
+**Branch:** factory
 
 ## OVERVIEW
 
@@ -39,6 +39,10 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | Subscriptions | `src/subscriptions.ts` | Regex matching and notification dispatch |
 | Notification senders | `src/notifications.ts` | Brevo/Telegram requests and GUID push logs |
 | D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, sessions |
+| Shared helpers | `src/db.ts` | D1 `one`/`all` helpers, JSON responses, body parsing, cookie/session-cookie builders |
+| HTML/regex safety | `src/filters.ts` | Escaping, `safeHttpUrl`, `safeRegex` + ReDoS-hazard guard, `sanitizePostHtml` whitelist sanitizer, post text builders |
+| Board helpers | `src/board.ts` | Board name normalization and option lists for render |
+| Time display | `src/time.ts` | `formatBeijingTime` (UTC+8, same-day `今天 HH:MM`) |
 | Shared types | `src/types.ts` | `Env`, model, page, and timing contracts |
 
 ## WHERE TO LOOK
@@ -131,7 +135,11 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 ## DEPLOY AND CONFIG
 
 - `npm run deploy` runs the generator, applies remote migrations, verifies D1, dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
-- Branch `factory` maps to Worker/D1 `nodeseek-rss-reader-factory`; all other branches use `nodeseek-rss-reader`. `WORKER_NAME` / `D1_DATABASE_NAME` env vars override these names.
+- All deployments use Worker/D1 `nodeseek-rss-reader`; per-branch environment isolation comes from separate Cloudflare accounts, not branch logic. `WORKER_NAME` / `D1_DATABASE_NAME` env vars override these names.
+- Cloudflare Workers Builds injects only `WORKERS_CI_BRANCH` (never `CF_PAGES_BRANCH`/`CF_BRANCH`/`GITHUB_REF_NAME`/`BRANCH`); the old env-var chain therefore never fired in CF builds — root cause of the factory incidents. The script is intentionally branch-agnostic; do not reintroduce branch detection.
+- A Workers Builds project can only deploy the Worker it is connected to: on config `name` mismatch, CI overrides the name (warning; it may also auto-open a PR editing `wrangler.jsonc`). Both account projects must be named `nodeseek-rss-reader`.
+- `npm run cf:build` is preparation-only (D1 create/reuse, migrations, table verify, dry-run — no deploy); `npm run deploy:generated` is final-deploy-only. The build script rewrites BOTH `wrangler.generated.jsonc` and the root `wrangler.jsonc` (name + D1 binding) — that is why the committed root config carries no binding.
+- Before pushing the `factory` branch, the factory-connected build project in the production account must be deleted, or that project rebuilds and redeploys production.
 - The build generator applies ALL pending migrations (not just `0001` as stale README wording suggests).
 - Generated config stays at repository root; moving it under `.wrangler/` previously broke migrations.
 - Missing `DB` produces `Cannot read properties of undefined (reading 'prepare')`; `/health` is the quickest binding/table check.
@@ -140,3 +148,4 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 - Remote: `https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader.git`; do not force-push `main`.
 - When committing as the owner, use one-off `git -c user.name=... -c user.email=... commit` flags rather than persistent Git configuration.
+- `.sisyphus/` evidence files were committed at `a2576f2` and are now gitignored, but ignore rules do not untrack them; run `git rm -r --cached .sisyphus` before merging `factory` into `main` or the merge drags ~1000 lines of agent artifacts into main.
