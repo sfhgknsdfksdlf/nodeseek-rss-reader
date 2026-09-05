@@ -1,0 +1,35 @@
+{
+  "task": "rule-imports-cache T3 - atomic subscription replacement",
+  "date": "2026-09-05",
+  "server": "http://127.0.0.1:8787 (wrangler dev, local D1)",
+  "sourceChecks": {
+    "validationBeforeStatements": true,
+    "replacementUsesOneBatch": true,
+    "statementOrder": "authenticated-user delete followed by normalized inserts",
+    "preservedFields": ["pattern", "sendEmail", "sendTelegram"],
+    "flagEncoding": "absent flags normalize true; explicit false binds 0; true binds 1",
+    "ownershipPredicates": "delete and every insert bind authenticated user id"
+  },
+  "scenarios": {
+    "validReplacement": {
+      "status": "source-verified",
+      "expected": "validated rules become one delete-plus-inserts D1 batch and return {ok:true} after success"
+    },
+    "emptyReplacement": {
+      "status": "source-verified",
+      "expected": "rules:[] produces a delete-only batch and returns {ok:true} after success"
+    },
+    "invalidRegex": {
+      "status": "source-verified",
+      "expected": "readValidatedSubscriptionImport() returns its 400 response before the first D1 prepare call"
+    }
+  },
+  "boundedLocalQa": {
+    "health": {
+      "status": 200,
+      "response": { "ok": true, "dbBinding": true, "posts": true, "users": true, "sync_state": true }
+    },
+    "status": "pass",
+    "limitation": "No authenticated subscription fixture was created because the existing local D1 session state was unavailable; no unrelated QA state was modified."
+  }
+}

@@ -25,6 +25,7 @@ interface HighlightRuleVersionRow {
 export interface RulePayload {
   userId: number | null;
   rulesVersion: string;
+  cacheHit?: boolean;
   blockRules?: BlockRule[];
   highlightGroups?: HighlightGroup[];
 }
@@ -73,6 +74,10 @@ export async function getRulesVersion(env: Env, user: User | null): Promise<stri
 export async function getInitialRulePayload(env: Env, user: User | null, clientVersion: string | null, clientCacheCapable = false): Promise<RulePayload> {
   const rulesVersion = await getRulesVersion(env, user);
   const payload: RulePayload = { userId: user?.id || null, rulesVersion };
+  if (user && clientCacheCapable && clientVersion !== null && clientVersion.trim().length > 0 && clientVersion === rulesVersion) {
+    payload.cacheHit = true;
+    return payload;
+  }
   if (user) {
     const [blockRules, highlightGroups] = await Promise.all([getBlockRules(env, user), getHighlightGroups(env, user)]);
     payload.blockRules = blockRules;
