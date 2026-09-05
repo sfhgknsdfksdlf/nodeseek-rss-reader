@@ -4,10 +4,8 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const branchName = process.env.WORKERS_CI_BRANCH || process.env.CF_PAGES_BRANCH || process.env.CF_BRANCH || process.env.GITHUB_REF_NAME || process.env.BRANCH || "";
-const isFactory = branchName === "factory";
-const workerName = process.env.WORKER_NAME || (isFactory ? "nodeseek-rss-reader-factory" : "nodeseek-rss-reader");
-const databaseName = process.env.D1_DATABASE_NAME || (isFactory ? "nodeseek-rss-reader-factory" : "nodeseek-rss-reader");
+const workerName = process.env.WORKER_NAME || "nodeseek-rss-reader";
+const databaseName = process.env.D1_DATABASE_NAME || "nodeseek-rss-reader";
 const generatedConfig = resolve(root, "wrangler.generated.jsonc");
 const rootConfig = resolve(root, "wrangler.jsonc");
 
@@ -115,7 +113,6 @@ function verifyMigratedDatabase() {
 }
 
 async function main() {
-  if (branchName) console.log(`Detected branch: ${branchName}`);
   console.log(`Preparing Cloudflare Worker: ${workerName}`);
   console.log(`Preparing Cloudflare D1 database: ${databaseName}`);
   const databaseId = await ensureDatabase();
