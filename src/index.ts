@@ -5,6 +5,7 @@ import { safeRegex } from "./filters";
 import { markReadAndGetLink, queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { getHighlightGroups, getInitialRulePayload } from "./rules";
+import { readValidatedBlockImport, readValidatedHighlightImport, readValidatedSubscriptionImport } from "./rule-import";
 import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
@@ -206,38 +207,58 @@ async function storeLastHomeTiming(env: Env, snapshot: HomeTimingSnapshot): Prom
 }
 
 async function importHighlights(request: Request, env: Env, user: User): Promise<Response> {
-  const body = await readJson<{ groups?: Array<{ name?: string; color?: string; patterns?: string[] }> }>(request);
-  await env.DB.prepare("DELETE FROM highlight_rules WHERE group_id IN (SELECT id FROM highlight_groups WHERE user_id = ?)").bind(user.id).run();
-  await env.DB.prepare("DELETE FROM highlight_groups WHERE user_id = ?").bind(user.id).run();
-  for (const group of body.groups || []) {
-    const name = String(group.name || "未命名").trim() || "未命名";
-    const color = /^#[0-9a-f]{6}$/i.test(String(group.color || "")) ? String(group.color) : "#ffe066";
-    const result = await env.DB.prepare("INSERT INTO highlight_groups (user_id, name, color, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))").bind(user.id, name, color).run();
-    const groupId = Number(result.meta.last_row_id);
-    for (const pattern of group.patterns || []) {
-      const p = String(pattern).trim();
-      if (p && p.length <= 200 && safeRegex(p)) await env.DB.prepare("INSERT INTO highlight_rules (group_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(groupId, p).run();
+  const outcome = await readValidatedHighlightImport(request);
+  if (!outcome.ok) return outcome.response;
+  const groupIdSeed = Date.now() * 1000 + crypto.getRandomValues(new Uint32Array(1))[0];
+  const statements: D1PreparedStatement[] = [
+    env.DB.prepare("DELETE FROM highlight_rules WHERE group_id IN (SELECT id FROM highlight_groups WHERE user_id = ?)").bind(user.id),
+    env.DB.prepare("DELETE FROM highlight_groups WHERE user_id = ?").bind(user.id)
+  ];
+  for (const [groupIndex, group] of outcome.value.entries()) {
+    const groupId = groupIdSeed + groupIndex;
+    statements.push(env.DB.prepare("INSERT INTO highlight_groups (id, user_id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))").bind(groupId, user.id, group.name, group.color));
+    for (let patternIndex = group.patterns.length - 1; patternIndex >= 0; patternIndex--) {
+      const pattern = group.patterns[patternIndex];
+      statements.push(env.DB.prepare("INSERT INTO highlight_rules (group_id, pattern, created_at) VALUES ((SELECT id FROM highlight_groups WHERE id = ? AND user_id = ?), ?, datetime('now'))").bind(groupId, user.id, pattern));
     }
+  }
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    console.error("Highlight import batch failed", error);
+    return json({ error: "高亮规则导入失败" }, 500);
   }
   return json({ ok: true });
 }
 
 async function importBlocks(request: Request, env: Env, user: User): Promise<Response> {
-  const body = await readJson<{ patterns?: string[] }>(request);
-  await env.DB.prepare("DELETE FROM block_rules WHERE user_id = ?").bind(user.id).run();
-  for (const pattern of body.patterns || []) {
-    const p = String(pattern).trim();
-    if (p && p.length <= 200 && safeRegex(p)) await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(user.id, p).run();
+  const outcome = await readValidatedBlockImport(request);
+  if (!outcome.ok) return outcome.response;
+  const statements: D1PreparedStatement[] = [env.DB.prepare("DELETE FROM block_rules WHERE user_id = ?").bind(user.id)];
+  for (const pattern of outcome.value) {
+    statements.push(env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(user.id, pattern));
+  }
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    console.error("Block import batch failed", error);
+    return json({ error: "屏蔽规则导入失败" }, 500);
   }
   return json({ ok: true });
 }
 
 async function importSubscriptions(request: Request, env: Env, user: User): Promise<Response> {
-  const body = await readJson<{ rules?: Array<{ pattern?: string; sendEmail?: boolean; sendTelegram?: boolean }> }>(request);
-  await env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ?").bind(user.id).run();
-  for (const rule of body.rules || []) {
-    const pattern = String(rule.pattern || "").trim();
-    if (pattern && pattern.length <= 200 && safeRegex(pattern)) await env.DB.prepare("INSERT INTO subscriptions (user_id, pattern, send_email, send_telegram, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))").bind(user.id, pattern, rule.sendEmail === false ? 0 : 1, rule.sendTelegram === false ? 0 : 1).run();
+  const outcome = await readValidatedSubscriptionImport(request);
+  if (!outcome.ok) return outcome.response;
+  const statements: D1PreparedStatement[] = [env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ?").bind(user.id)];
+  for (const rule of outcome.value) {
+    statements.push(env.DB.prepare("INSERT INTO subscriptions (user_id, pattern, send_email, send_telegram, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))").bind(user.id, rule.pattern, rule.sendEmail ? 1 : 0, rule.sendTelegram ? 1 : 0));
+  }
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    console.error("Subscription import batch failed", error);
+    return json({ error: "订阅导入失败" }, 500);
   }
   return json({ ok: true });
 }

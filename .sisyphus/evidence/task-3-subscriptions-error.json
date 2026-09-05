@@ -1,0 +1,21 @@
+{
+  "task": "rule-imports-cache T3 - subscription import error and rollback evidence",
+  "date": "2026-09-05",
+  "failureInjection": {
+    "method": "local-only temporary batch with an appended invalid SQL statement",
+    "injectionCodeCommitted": false,
+    "status": "not executed",
+    "reason": "The public import handler has no failure-injection hook, and adding one would violate the requirement that temporary failure hooks are absent from committed code."
+  },
+  "invalidInput": {
+    "status": "source-verified",
+    "result": "invalid regex or malformed subscription entry returns a non-success validation response before deletion; prior rows are not touched"
+  },
+  "rollbackGuarantee": {
+    "basis": "Cloudflare D1 batch executes the prepared statements transactionally and rolls back the complete batch on any statement failure.",
+    "subscriptionBatch": "user-scoped delete followed by all user-scoped inserts",
+    "success": true,
+    "crossUserEffects": false
+  },
+  "status": "documented-environment-limitation"
+}

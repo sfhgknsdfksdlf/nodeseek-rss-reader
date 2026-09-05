@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-04
-**Commit:** 774004a
-**Branch:** 0903
+**Generated:** 2026-09-05
+**Commit:** a08c5b7
+**Branch:** 0905
 
 ## OVERVIEW
 
@@ -15,6 +15,7 @@ Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as 
 ├── src/                    # Worker routes and application modules
 ├── migrations/             # Sequential D1 schema migrations
 ├── scripts/                # Cloudflare build/deploy config generation
+├── public/                 # PWA icon.svg + manifest.webmanifest (only static assets; app renders via Worker)
 ├── DESIGN_SPEC.md          # SDD requirements and approved designs
 ├── DESIGN_D1_PAGINATION.md # Pagination/rule-cache design constraints
 ├── README.md               # Deployment and administrator setup
@@ -33,7 +34,8 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | SSR shell/client script | `src/render.ts` | HTML rendering and browser interactions |
 | Runtime settings | `src/settings.ts` | D1-backed settings and admin configuration |
 | Auth/session | `src/auth.ts` | Registration, login, cookies, Telegram binding |
-| Rules | `src/rules.ts` | User-isolated rule loading/version/payload |
+| Rules | `src/rules.ts` | User-isolated rule loading, SHA-256 version digest, `cacheHit` cache negotiation |
+| Import validation | `src/rule-import.ts` | Shared limits, strict body parsing, structured errors for `/api/import/*` |
 | Subscriptions | `src/subscriptions.ts` | Regex matching and notification dispatch |
 | Notification senders | `src/notifications.ts` | Brevo/Telegram requests and GUID push logs |
 | D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, sessions |
@@ -48,6 +50,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | Notification dedupe | `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0009*.sql`, `migrations/0010*.sql` | Use `post_guid`, never `post_id` |
 | Admin/debug routes | `src/index.ts`, `src/settings.ts` | Admin secret/session boundaries are security-sensitive |
 | User rule handoff | `src/rules.ts`, `src/render.ts` | Payload/version/cache keys stay user-scoped |
+| Rule import changes | `src/rule-import.ts`, `src/index.ts` | Inclusive limits: 1 MiB body, 20 groups, 5000 rules, 200-char regex; reject before any D1 call |
 | Schema changes | `migrations/` | Add a numbered migration; never rewrite deployed migrations |
 | Deploy config | `scripts/cloudflare-build.mjs`, `wrangler.jsonc` | Never hand-edit generated `wrangler.generated.jsonc` |
 
@@ -66,13 +69,17 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
 - Normal post cards must link to the source URL with a real external `<a target="_blank">`; `/post/:id/open` is not the normal open path.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
+- Rule imports are all-or-nothing: fully validate first, then replace with exactly one `env.DB.batch()` per handler; never delete before validation succeeds.
+- `rulesVersion` is a SHA-256 content digest that includes row ids: any successful replacement changes it; failed imports never do. Cache-hit home payloads (`cacheHit: true`) omit rule arrays; clients reuse localStorage only on exact userId + version match.
 - Keep homepage card CSS in `src/styles.ts`; preserve the rounded black/white UI and OLED pure-black dark mode.
 - Listings use runtime `page_size` (default 99, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
 - Do not skip design approval or change scope beyond it.
-- Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks.
+- Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks. The empty `catch {}` blocks inside the embedded browser script in `src/render.ts` are a pre-existing guarded-localStorage convention; the prohibition applies to new server-side TS.
+- Do not silently skip, truncate, or partially apply imported rules; reject the whole request with field/index error details.
+- Never trust client `rulesVersion` as authoritative; the server always computes the current digest.
 - Do not rewrite deployed migrations. Add sequential files instead.
 - Do not use `push_logs.post_id`; the final schema and dedupe paths use `push_logs.post_guid` exclusively.
 - Do not confuse `read_states.post_id` with notification-log identity.
@@ -95,6 +102,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
 - Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
 - Rule payloads must be scoped to the logged-in user; browser processing blocks before highlighting.
+- Highlight imports preallocate positive group ids (`Date.now()*1000 + crypto random + index`) so one batch can bind child rows; any batch failure rolls back atomically and returns 500.
 
 ## UI AND ADMIN
 
@@ -118,10 +126,13 @@ git diff --check
 
 No test or lint scripts are defined. If TypeScript/Wrangler dependencies or the TS language server are absent, report that limitation instead of installing dependencies or inventing tests.
 
+De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` using a manual `Cookie: session=...` header (the Secure session cookie is not replayed by PS `Invoke-WebRequest -WebSession`) and byte-exact bodies via `--data-binary '@file'`. Prove rejected requests wrote nothing with SHA-256 export fingerprints taken before/after; test client-side logic by executing the exact served script in Node with localStorage/location/DOM stubs.
+
 ## DEPLOY AND CONFIG
 
 - `npm run deploy` runs the generator, applies remote migrations, verifies D1, dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
-- Branch `factory` maps to Worker/D1 `nodeseek-rss-reader-factory`; all other branches use `nodeseek-rss-reader`.
+- Branch `factory` maps to Worker/D1 `nodeseek-rss-reader-factory`; all other branches use `nodeseek-rss-reader`. `WORKER_NAME` / `D1_DATABASE_NAME` env vars override these names.
+- The build generator applies ALL pending migrations (not just `0001` as stale README wording suggests).
 - Generated config stays at repository root; moving it under `.wrangler/` previously broke migrations.
 - Missing `DB` produces `Cannot read properties of undefined (reading 'prepare')`; `/health` is the quickest binding/table check.
 
