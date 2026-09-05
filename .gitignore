@@ -5,3 +5,15 @@ wrangler.generated.jsonc
 dist/
 .DS_Store
 npm-debug.log*
+
+# Local debug/QA artifacts
+*.log
+*.pid
+*.mhtml
+logs-*.json
+.sisyphus/
+.omo/
+session-ses_*.md
+wrangler.local-qa.jsonc
+startopencode.bat
+CF报错.txt

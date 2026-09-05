@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const branchName = process.env.CF_PAGES_BRANCH || process.env.CF_BRANCH || process.env.GITHUB_REF_NAME || process.env.BRANCH || "";
+const branchName = process.env.WORKERS_CI_BRANCH || process.env.CF_PAGES_BRANCH || process.env.CF_BRANCH || process.env.GITHUB_REF_NAME || process.env.BRANCH || "";
 const isFactory = branchName === "factory";
 const workerName = process.env.WORKER_NAME || (isFactory ? "nodeseek-rss-reader-factory" : "nodeseek-rss-reader");
 const databaseName = process.env.D1_DATABASE_NAME || (isFactory ? "nodeseek-rss-reader-factory" : "nodeseek-rss-reader");
