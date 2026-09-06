@@ -34,12 +34,6 @@ export function regexHasBacktrackingHazard(pattern: string): boolean {
     || /\((?:[^()\\]|\.)*\|(?:[^()\\]|\.)*\)(?:[+*]|\{\d+(?:,\d*)?\})/.test(pattern);
 }
 
-export function regexMatches(pattern: string, text: string): boolean {
-  const re = safeRegex(pattern);
-  if (!re) return false;
-  return re.test(text);
-}
-
 export function stripHtml(html: string): string {
   return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }

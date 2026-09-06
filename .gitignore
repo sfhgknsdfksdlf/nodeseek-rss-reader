@@ -14,6 +14,5 @@ logs-*.json
 .sisyphus/
 .omo/
 session-ses_*.md
-wrangler.local-qa.jsonc
 startopencode.bat
 CF报错.txt

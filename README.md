@@ -55,7 +55,7 @@ npm run deploy
 - 不存在时自动创建该 D1 数据库。
 - 生成 `wrangler.generated.jsonc`。
 - 同步更新根目录 `wrangler.jsonc`，确保 Cloudflare 最终部署阶段也带有 `DB` 绑定。
-- 自动执行 `migrations/0001_initial.sql`。
+- 自动执行全部待应用的数据库迁移（`migrations/` 目录）。
 - 验证 `posts`、`users`、`sync_state` 表已经存在。
 - 执行 Worker 打包 dry-run 校验。
 - 使用自动生成的配置部署 Worker。
@@ -66,9 +66,7 @@ npm run deploy
 
 ```json
 {
-  "RSS_URL": "https://rss.nodeseek.com/",
-  "ADMIN_USERNAME": "admin",
-  "MAIL_PROVIDER": "brevo"
+  "RSS_URL": "https://rss.nodeseek.com/"
 }
 ```
 
@@ -225,4 +223,4 @@ https://你的域名/health
 - Cloudflare Workers 不能直接使用传统 SMTP socket，本项目使用 Brevo HTTPS API。
 - 首次同步只入库，不推送历史帖子，避免第一次部署产生大量通知。
 - 主部署流程不需要手动创建 D1，不需要手动替换 `database_id`。
-- `workspace/nodeseek.js` 未在当前工作区找到，右下角按钮已实现为圆润上下箭头固定按钮。
+- 右下角快捷按钮为固定的圆润上下箭头悬浮按钮。

@@ -19,7 +19,7 @@ interface FetchStrategy {
   headers: HeadersInit;
 }
 
-export interface RssFetchTestResult {
+interface RssFetchTestResult {
   method: string;
   status?: number;
   statusText?: string;
@@ -45,7 +45,7 @@ interface RssAttemptLogRow {
   preview: string | null;
 }
 
-export interface RssFailureSummary {
+interface RssFailureSummary {
   windowHours: number;
   since: string;
   totalAttempts: number;
@@ -99,12 +99,12 @@ function randomIntInclusive(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-export interface RssAttemptStats {
+interface RssAttemptStats {
   cron: { success: number; failure: number };
   rssTest: { success: number; failure: number };
 }
 
-export interface RssAttemptDiagnostics {
+interface RssAttemptDiagnostics {
   attemptStats: RssAttemptStats;
   failureSummary: RssFailureSummary;
 }
@@ -189,17 +189,17 @@ async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: 
   }
 }
 
-async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number; writeStateMs: number } }> {
+async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number } }> {
   const rssStrategy = rssFetchStrategies[0];
   const browserStrategy = rssFetchStrategies[1];
   const firstDelaySeconds = randomIntInclusive(21, 24);
   const retryDelaySeconds = randomIntInclusive(21, 24);
   await sleep(firstDelaySeconds * 1000);
   const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
-  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy, timings: { fetchRssMs: rssResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: 0, writeStateMs: 0 } };
+  if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy, timings: { fetchRssMs: rssResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: 0 } };
   await sleep(retryDelaySeconds * 1000);
   const browserResult = await tryStrategy(env, "sync", "browser", rssUrl, browserStrategy);
-  if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy, timings: { fetchRssMs: rssResult.fetchMs + browserResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: browserResult.fetchMs, writeStateMs: 0 } };
+  if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy, timings: { fetchRssMs: rssResult.fetchMs + browserResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: browserResult.fetchMs } };
   const errors = [rssResult.message, browserResult.message];
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
@@ -212,7 +212,7 @@ async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Pr
   await setSyncState(env, "last_cron_timing", JSON.stringify(snapshot));
 }
 
-export interface RssSyncTiming {
+interface RssSyncTiming {
   fetchRssMs: number;
   fetchFirstStrategyMs: number;
   fetchRetryStrategyMs: number;
@@ -220,18 +220,15 @@ export interface RssSyncTiming {
   parseItemCount: number;
   prepareInsertMs: number;
   insertBindRunMs: number;
-  insertLookupMs: number;
   insertNewCount: number;
   insertExistingCount: number;
   insertLoopMs: number;
-  insertedPostLoadMs: number;
   insertPostsMs: number;
   writeSyncStateMs: number;
-  writeStateMs: number;
   totalMs: number;
 }
 
-export interface RssSyncResult {
+interface RssSyncResult {
   inserted: number;
   firstSync: boolean;
   insertedPosts: RssNewPost[];
@@ -243,7 +240,7 @@ export interface RssSyncResult {
   };
 }
 
-export interface SafeRssSyncResult {
+interface SafeRssSyncResult {
   inserted: number;
   firstSync: boolean;
   insertedPosts: RssNewPost[];
@@ -281,7 +278,6 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const insertRows = items.filter((item) => item.guid && !existingGuids.has(item.guid)).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
   const prepareInsertMs = Date.now() - prepareInsertStartedAt;
   let insertBindRunMs = 0;
-  let insertLookupMs = 0;
   let insertNewCount = 0;
   let insertExistingCount = existingGuids.size;
   const batchStartedAt = Date.now();
@@ -312,14 +308,12 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
     }
   }
   const insertLoopMs = Date.now() - insertStartedAt;
-  const insertedPostLoadMs = insertLookupMs;
   const writeStateStartedAt = Date.now();
   await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('first_sync_done', '1', ?), ('last_sync_at', ?, ?), ('last_sync_error', '', ?), ('last_sync_strategy', ?, ?)").bind(nowIso(), nowIso(), nowIso(), nowIso(), strategy, nowIso()).run();
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
-  const writeStateMs = fetchTimings.writeStateMs + writeSyncStateMs;
-  const insertPostsMs = insertLoopMs + insertedPostLoadMs;
+  const insertPostsMs = insertLoopMs;
   insertBindRunMs = Date.now() - batchStartedAt;
-  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertBindRunMs, insertLookupMs, insertNewCount, insertExistingCount, insertLoopMs, insertedPostLoadMs, insertPostsMs, writeSyncStateMs, writeStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
+  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertBindRunMs, insertNewCount, insertExistingCount, insertLoopMs, insertPostsMs, writeSyncStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
 }
 
 export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
@@ -331,7 +325,7 @@ export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
     console.error("RSS sync failed", message);
     await setSyncState(env, "last_sync_error", message);
     await setSyncState(env, "last_sync_at", nowIso());
-    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertLookupMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
+    return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
   }
 }
 
@@ -358,14 +352,6 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
     }
   }
   return results;
-}
-
-export async function getRssFailureSummary(env: Env): Promise<RssFailureSummary> {
-  return (await getRssAttemptDiagnostics(env)).failureSummary;
-}
-
-export async function getRssAttemptStats(env: Env): Promise<RssAttemptStats> {
-  return (await getRssAttemptDiagnostics(env)).attemptStats;
 }
 
 export async function getRssAttemptDiagnostics(env: Env): Promise<RssAttemptDiagnostics> {

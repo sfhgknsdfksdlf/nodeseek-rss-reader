@@ -86,9 +86,7 @@ async function writeGeneratedConfig(databaseId) {
     }
   ],
   "vars": {
-    "RSS_URL": "https://rss.nodeseek.com/",
-    "ADMIN_USERNAME": "admin",
-    "MAIL_PROVIDER": "brevo"
+    "RSS_URL": "https://rss.nodeseek.com/"
   }
 }
 `;

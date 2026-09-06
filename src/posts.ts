@@ -124,18 +124,10 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
   setTiming("scannedChunks", scannedChunks);
   setTiming("matchedPosts", matched);
-  setTiming("limitedScan", 1);
   setTiming("hasNextPage", stoppedAtPageLimit ? 1 : 0);
   const dbPageStart = Date.now();
   const posts = await postsByIds(env, user, pagePostIds);
   setTiming("dbPageMs", Date.now() - dbPageStart);
   setTiming("totalMs", Date.now() - totalStart);
   return { posts, page, pageSize, board, query, syncError };
-}
-
-export async function markReadAndGetLink(env: Env, user: User | null, postId: number): Promise<string | null> {
-  const post = await one<Post>(env.DB.prepare("SELECT * FROM posts WHERE id = ?").bind(postId));
-  if (!post) return null;
-  if (user) await env.DB.prepare("INSERT OR REPLACE INTO read_states (user_id, post_id, opened_at) VALUES (?, ?, datetime('now'))").bind(user.id, postId).run();
-  return post.link;
 }

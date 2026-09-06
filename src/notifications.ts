@@ -1,4 +1,5 @@
 import { nowIso } from "./db";
+import { escapeAttr, escapeHtml, safeHttpUrl } from "./filters";
 import { runtimeSettings } from "./settings";
 import type { RuntimeSettings } from "./settings";
 import type { Env, RssNewPost, Subscription, User } from "./types";
@@ -20,7 +21,9 @@ export async function sendBrevo(env: Env, user: User, sub: Subscription, post: R
         sender: { email: settings.mailFrom, name: settings.mailFromName },
         to: [{ email: user.email, name: user.username }],
         subject: `NodeSeek 订阅命中：${post.title}`,
-        htmlContent: `<p>${post.title}</p><p>${post.content_text.slice(0, 300)}</p><p><a href="${post.link}">打开原帖</a></p>`
+        // RSS content is third-party input: escape text nodes, validate the
+        // URL scheme, and attribute-escape the href before interpolation.
+        htmlContent: `<p>${escapeHtml(post.title)}</p><p>${escapeHtml(post.content_text.slice(0, 300))}</p><p><a href="${escapeAttr(safeHttpUrl(post.link))}">打开原帖</a></p>`
       })
     });
     await logPush(env, user.id, sub.id, post.guid, "email", res.ok ? "sent" : "failed", res.ok ? "" : await res.text());

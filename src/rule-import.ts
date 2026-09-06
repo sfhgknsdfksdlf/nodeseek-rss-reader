@@ -2,38 +2,38 @@ import { json } from "./db";
 import { safeRegex } from "./filters";
 
 // Import limits are inclusive: exactly at the limit passes, one over rejects.
-export const IMPORT_BODY_LIMIT_BYTES = 1048576; // 1 MiB
-export const IMPORT_MAX_GROUPS = 20;
-export const IMPORT_MAX_TOTAL_RULES = 5000;
-export const IMPORT_MAX_PATTERN_LENGTH = 200;
-export const IMPORT_DEFAULT_GROUP_NAME = "未命名";
-export const IMPORT_DEFAULT_GROUP_COLOR = "#ffe066";
+const IMPORT_BODY_LIMIT_BYTES = 1048576; // 1 MiB
+const IMPORT_MAX_GROUPS = 20;
+const IMPORT_MAX_TOTAL_RULES = 5000;
+const IMPORT_MAX_PATTERN_LENGTH = 200;
+const IMPORT_DEFAULT_GROUP_NAME = "未命名";
+const IMPORT_DEFAULT_GROUP_COLOR = "#ffe066";
 
-export interface ImportValidationErrorDetail {
+interface ImportValidationErrorDetail {
   field: string;
   index: number;
   reason: string;
 }
 
-export interface ImportHttpError {
+interface ImportHttpError {
   status: number;
   error: string;
   details: ImportValidationErrorDetail[];
 }
 
-export interface ValidatedHighlightGroup {
+interface ValidatedHighlightGroup {
   name: string;
   color: string;
   patterns: string[];
 }
 
-export interface ValidatedSubscriptionRule {
+interface ValidatedSubscriptionRule {
   pattern: string;
   sendEmail: boolean;
   sendTelegram: boolean;
 }
 
-export type ImportOutcome<T> = { ok: true; value: T } | { ok: false; response: Response };
+type ImportOutcome<T> = { ok: true; value: T } | { ok: false; response: Response };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -51,6 +51,13 @@ export function importErrorResponse(err: ImportHttpError): Response {
 // which swallows parse errors and returns {}). Distinguishes body-too-large (413)
 // from malformed/empty JSON (400); a valid body yields the parsed value.
 export async function parseImportBody(request: Request): Promise<ImportOutcome<unknown>> {
+  // Reject oversized bodies before buffering them. Content-Length is only a
+  // cheap pre-check for the common case; the byteLength check below stays the
+  // authoritative backstop for missing/chunked upload headers.
+  const declaredLength = Number(request.headers.get("content-length") || "0");
+  if (declaredLength > IMPORT_BODY_LIMIT_BYTES) {
+    return { ok: false, response: importErrorResponse({ status: 413, error: "请求体超过 1 MiB 限制", details: [] }) };
+  }
   const raw = await request.arrayBuffer();
   if (raw.byteLength > IMPORT_BODY_LIMIT_BYTES) {
     return { ok: false, response: importErrorResponse({ status: 413, error: "请求体超过 1 MiB 限制", details: [] }) };
@@ -65,15 +72,21 @@ export async function parseImportBody(request: Request): Promise<ImportOutcome<u
   return { ok: true, value: parsed };
 }
 
-// Validates one pattern string: type, trim, length, and bounded regex compilation.
-// Empty/whitespace-only patterns are validation errors (an empty regex would match everything).
-function validatePattern(rawPattern: unknown, field: string, index: number): { ok: true; pattern: string } | { ok: false; detail: ImportValidationErrorDetail } {
-  if (typeof rawPattern !== "string") return { ok: false, detail: { field, index, reason: "必须是字符串" } };
+// Single shared pattern gate for imports and every single-item rule write:
+// type, trim, length, and bounded regex compilation. Empty/whitespace-only
+// patterns are validation errors (an empty regex would match everything).
+export function validatePatternInput(rawPattern: unknown): { ok: true; pattern: string } | { ok: false; reason: string } {
+  if (typeof rawPattern !== "string") return { ok: false, reason: "必须是字符串" };
   const pattern = rawPattern.trim();
-  if (!pattern) return { ok: false, detail: { field, index, reason: "不能为空" } };
-  if (pattern.length > IMPORT_MAX_PATTERN_LENGTH) return { ok: false, detail: { field, index, reason: "长度超过 200 字符" } };
-  if (!safeRegex(pattern)) return { ok: false, detail: { field, index, reason: "不是有效的正则表达式" } };
+  if (!pattern) return { ok: false, reason: "不能为空" };
+  if (pattern.length > IMPORT_MAX_PATTERN_LENGTH) return { ok: false, reason: `长度超过 ${IMPORT_MAX_PATTERN_LENGTH} 字符` };
+  if (!safeRegex(pattern)) return { ok: false, reason: "不是有效的正则表达式" };
   return { ok: true, pattern };
+}
+
+function validatePattern(rawPattern: unknown, field: string, index: number): { ok: true; pattern: string } | { ok: false; detail: ImportValidationErrorDetail } {
+  const result = validatePatternInput(rawPattern);
+  return result.ok ? result : { ok: false, detail: { field, index, reason: result.reason } };
 }
 
 // Group name/color keep current normalize-and-default semantics: missing/invalid
@@ -91,9 +104,13 @@ function normalizeGroupColor(value: unknown): string {
 // the caller must not issue any D1 statement.
 export function validateHighlightImport(body: unknown): { ok: true; value: ValidatedHighlightGroup[] } | { ok: false; error: ImportHttpError } {
   if (!isRecord(body)) return { ok: false, error: semanticError([{ field: "body", index: -1, reason: "请求体必须是 JSON 对象" }]) };
+  // A missing collection is a client bug, not an intentional clear-all: reject it
+  // so malformed input can never wipe existing rules. Only an explicit empty
+  // array means "replace with empty".
   const rawGroups = body.groups;
-  if (rawGroups !== undefined && !Array.isArray(rawGroups)) return { ok: false, error: semanticError([{ field: "groups", index: -1, reason: "必须是数组" }]) };
-  const groups: unknown[] = Array.isArray(rawGroups) ? rawGroups : [];
+  if (rawGroups === undefined) return { ok: false, error: semanticError([{ field: "groups", index: -1, reason: "缺少 groups 数组" }]) };
+  if (!Array.isArray(rawGroups)) return { ok: false, error: semanticError([{ field: "groups", index: -1, reason: "必须是数组" }]) };
+  const groups: unknown[] = rawGroups;
   if (groups.length > IMPORT_MAX_GROUPS) {
     return { ok: false, error: semanticError([{ field: "groups", index: IMPORT_MAX_GROUPS, reason: "分组数量超过上限（最多 20 组）" }]) };
   }
@@ -133,8 +150,9 @@ export function validateHighlightImport(body: unknown): { ok: true; value: Valid
 export function validateBlockImport(body: unknown): { ok: true; value: string[] } | { ok: false; error: ImportHttpError } {
   if (!isRecord(body)) return { ok: false, error: semanticError([{ field: "body", index: -1, reason: "请求体必须是 JSON 对象" }]) };
   const rawPatterns = body.patterns;
-  if (rawPatterns !== undefined && !Array.isArray(rawPatterns)) return { ok: false, error: semanticError([{ field: "patterns", index: -1, reason: "必须是数组" }]) };
-  const patterns: unknown[] = Array.isArray(rawPatterns) ? rawPatterns : [];
+  if (rawPatterns === undefined) return { ok: false, error: semanticError([{ field: "patterns", index: -1, reason: "缺少 patterns 数组" }]) };
+  if (!Array.isArray(rawPatterns)) return { ok: false, error: semanticError([{ field: "patterns", index: -1, reason: "必须是数组" }]) };
+  const patterns: unknown[] = rawPatterns;
   const details: ImportValidationErrorDetail[] = [];
   const validPatterns: string[] = [];
   for (const [patternIndex, rawPattern] of patterns.entries()) {
@@ -152,8 +170,9 @@ export function validateBlockImport(body: unknown): { ok: true; value: string[] 
 export function validateSubscriptionImport(body: unknown): { ok: true; value: ValidatedSubscriptionRule[] } | { ok: false; error: ImportHttpError } {
   if (!isRecord(body)) return { ok: false, error: semanticError([{ field: "body", index: -1, reason: "请求体必须是 JSON 对象" }]) };
   const rawRules = body.rules;
-  if (rawRules !== undefined && !Array.isArray(rawRules)) return { ok: false, error: semanticError([{ field: "rules", index: -1, reason: "必须是数组" }]) };
-  const rules: unknown[] = Array.isArray(rawRules) ? rawRules : [];
+  if (rawRules === undefined) return { ok: false, error: semanticError([{ field: "rules", index: -1, reason: "缺少 rules 数组" }]) };
+  if (!Array.isArray(rawRules)) return { ok: false, error: semanticError([{ field: "rules", index: -1, reason: "必须是数组" }]) };
+  const rules: unknown[] = rawRules;
   const details: ImportValidationErrorDetail[] = [];
   const validated: ValidatedSubscriptionRule[] = [];
   for (const [ruleIndex, rawRule] of rules.entries()) {

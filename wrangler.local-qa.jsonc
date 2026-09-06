@@ -1,0 +1,15 @@
+{
+  "name": "nodeseek-rss-reader",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-24",
+  "vars": {
+    "RSS_URL": "https://rss.nodeseek.com/"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nodeseek-rss-reader",
+      "database_id": "local-qa-only"
+    }
+  ]
+}

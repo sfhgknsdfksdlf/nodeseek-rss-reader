@@ -1,11 +1,10 @@
 import { accountInfo, currentUser, login, logout, newTelegramBindCode, register, updateEmail, updateTelegram } from "./auth";
 import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
-import { safeRegex } from "./filters";
-import { markReadAndGetLink, queryPosts } from "./posts";
+import { queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { getHighlightGroups, getInitialRulePayload } from "./rules";
-import { readValidatedBlockImport, readValidatedHighlightImport, readValidatedSubscriptionImport } from "./rule-import";
+import { readValidatedBlockImport, readValidatedHighlightImport, readValidatedSubscriptionImport, validatePatternInput } from "./rule-import";
 import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch } from "./rss";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, processSubscriptions } from "./subscriptions";
@@ -79,11 +78,23 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     }
     if (request.method === "PUT") {
       const body = await readJson<{ name?: string; color?: string; patterns?: string[] }>(request);
-      await env.DB.prepare("UPDATE highlight_groups SET name = ?, color = ?, updated_at = datetime('now') WHERE id = ?").bind((body.name || "").trim() || "未命名", body.color || "#ffe066", groupId).run();
+      const rawPatterns = Array.isArray(body.patterns) ? body.patterns : [];
+      const details: { field: string; index: number; reason: string }[] = [];
+      const patterns: string[] = [];
+      for (const [patternIndex, rawPattern] of rawPatterns.entries()) {
+        const result = validatePatternInput(rawPattern);
+        if (result.ok) patterns.push(result.pattern);
+        else details.push({ field: `patterns[${patternIndex}]`, index: patternIndex, reason: result.reason });
+      }
+      const name = (body.name || "").trim() || "未命名";
+      const color = /^#[0-9a-f]{6}$/i.test(body.color || "") ? body.color! : "#ffe066";
+      // Validate the whole replacement payload before any mutation: a PUT with
+      // one invalid pattern must not delete the group's existing rules.
+      if (details.length > 0) return json({ error: "规则数据无效", details }, 400);
+      await env.DB.prepare("UPDATE highlight_groups SET name = ?, color = ?, updated_at = datetime('now') WHERE id = ?").bind(name, color, groupId).run();
       await env.DB.prepare("DELETE FROM highlight_rules WHERE group_id = ?").bind(groupId).run();
-      for (const pattern of body.patterns || []) {
-        const p = String(pattern).trim();
-        if (p && p.length <= 200 && safeRegex(p)) await env.DB.prepare("INSERT INTO highlight_rules (group_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(groupId, p).run();
+      for (const pattern of patterns) {
+        await env.DB.prepare("INSERT INTO highlight_rules (group_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(groupId, pattern).run();
       }
       return json({ ok: true });
     }
@@ -91,10 +102,10 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
   if (path === "/api/block-rules" && request.method === "GET") return json(await all(env.DB.prepare("SELECT id, pattern FROM block_rules WHERE user_id = ? ORDER BY id ASC").bind(me.id)));
   if (path === "/api/block-rules" && request.method === "POST") {
     const body = await readJson<{ pattern?: string }>(request);
-    const pattern = (body.pattern || "").trim();
-    if (!safeRegex(pattern)) return json({ error: "正则无效" }, 400);
-    const result = await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(me.id, pattern).run();
-    return json({ ok: true, id: Number(result.meta.last_row_id), pattern });
+    const result = validatePatternInput(body.pattern ?? "");
+    if (!result.ok) return json({ error: result.reason }, 400);
+    const insert = await env.DB.prepare("INSERT INTO block_rules (user_id, pattern, created_at) VALUES (?, ?, datetime('now'))").bind(me.id, result.pattern).run();
+    return json({ ok: true, id: Number(insert.meta.last_row_id), pattern: result.pattern });
   }
   if (path === "/api/block-rules/clear" && request.method === "POST") {
     await env.DB.prepare("DELETE FROM block_rules WHERE user_id = ?").bind(me.id).run();
@@ -126,7 +137,7 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
 }
 
 async function debugStatus(request: Request, env: Env): Promise<Response> {
-  if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确" }, 401);
+  if (!(await isAdmin(request, env))) return json({ error: "管理员 token 不正确" }, 401);
   const url = new URL(request.url);
   const live = url.searchParams.get("live") === "1";
   const startedAt = Date.now();
@@ -312,11 +323,6 @@ async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): P
   if (homeTimings) homeTimings.authMs = Date.now() - authStart;
   if (url.pathname.startsWith("/api/")) return handleApi(request, env, user, url);
   if (url.pathname === "/telegram/webhook" && request.method === "POST") return handleTelegram(request, env);
-  const openMatch = /^\/post\/(\d+)\/open$/.exec(url.pathname);
-  if (openMatch) {
-    const link = await markReadAndGetLink(env, user, Number(openMatch[1]));
-    return link ? Response.redirect(link, 302) : new Response("Not found", { status: 404 });
-  }
   if (isHomeRoute && homeTimings) {
     const pageData = await queryPosts(env, user, url, homeTimings.queryPosts);
     const initialRules = await getInitialRulePayload(env, user, url.searchParams.get("rulesVersion"), url.searchParams.get("rulesCache") === "1");
@@ -360,7 +366,7 @@ export default {
     inserted: result.inserted,
     ranProcessSubscriptions: shouldProcessSubscriptions,
     timings: {
-      rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertLookupMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertedPostLoadMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, writeStateMs: 0, totalMs: 0 },
+      rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
       processSubscriptionsMs: subscriptionTimings.totalMs,
       cleanupOldDataMs,
       totalMs: Date.now() - startedAt

@@ -1,5 +1,0 @@
-{
-  "task": "T4",
-  "checks": [{"scenario":"anonymous negotiation","request":"/?rulesVersion=stale&rulesCache=1","result":"pass","responseShape":{"rulesVersion":"anonymous","cacheHit":false,"arrays":"not advertised for anonymous users"},"method":"bounded curl.exe request to http://127.0.0.1:8787 (5s timeout)"}],
-  "sourceVerification": {"currentVersionComputed":true,"versionDigestSemanticsPreserved":true,"authenticatedFullPayloadQueriesRemainUserScoped":true}
-}

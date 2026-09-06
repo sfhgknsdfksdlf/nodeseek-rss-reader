@@ -1,8 +1,6 @@
 export interface Env {
   DB: D1Database;
   RSS_URL?: string;
-  SESSION_SECRET?: string;
-  ADMIN_USERNAME?: string;
   TELEGRAM_BOT_TOKEN?: string;
   BREVO_API_KEY?: string;
   MAIL_FROM?: string;
@@ -77,12 +75,10 @@ export interface HomeTimings {
     totalMs?: number;
     searchRegexCompileMs?: number;
     searchMatchMs?: number;
-    countMs?: number;
     dbPageMs?: number;
     scanMs?: number;
     scannedChunks?: number;
     matchedPosts?: number;
-    limitedScan?: number;
     hasNextPage?: number;
   };
   render?: {
@@ -109,25 +105,22 @@ export interface CronTimingSnapshot {
   firstSync: boolean;
   inserted: number;
   ranProcessSubscriptions: boolean;
-  timings: {
-    rssSync: {
-      fetchRssMs: number;
-      fetchFirstStrategyMs: number;
-      fetchRetryStrategyMs: number;
-      parseItemsMs: number;
-      parseItemCount: number;
-      prepareInsertMs: number;
-      insertBindRunMs: number;
-      insertLookupMs: number;
-      insertNewCount: number;
-      insertExistingCount: number;
-      insertLoopMs: number;
-      insertedPostLoadMs: number;
-      insertPostsMs: number;
-      writeSyncStateMs: number;
-      writeStateMs: number;
-      totalMs: number;
-    };
+    timings: {
+      rssSync: {
+        fetchRssMs: number;
+        fetchFirstStrategyMs: number;
+        fetchRetryStrategyMs: number;
+        parseItemsMs: number;
+        parseItemCount: number;
+        prepareInsertMs: number;
+        insertBindRunMs: number;
+        insertNewCount: number;
+        insertExistingCount: number;
+        insertLoopMs: number;
+        insertPostsMs: number;
+        writeSyncStateMs: number;
+        totalMs: number;
+      };
     processSubscriptionsMs: number;
     cleanupOldDataMs: number;
     totalMs: number;
