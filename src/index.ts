@@ -12,6 +12,21 @@ import type { CronTimingSnapshot, Env, HomeTimingSnapshot, HomeTimings, User } f
 
 const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NodeSeek RSS Reader"><rect width="128" height="128" rx="30" fill="#fff"/><rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#111" stroke-width="8"/><path d="M34 35h16l31 43V35h15v58H80L49 50v43H34z" fill="#111"/><circle cx="38" cy="91" r="8" fill="#111"/><path d="M34 67c15 0 27 12 27 27" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/><path d="M34 49c25 0 45 20 45 45" fill="none" stroke="#111" stroke-width="8" stroke-linecap="round"/></svg>`;
 const manifest = { name: "NodeSeek RSS Reader", short_name: "NodeSeek RSS", start_url: "/", display: "standalone", background_color: "#000000", theme_color: "#000000", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
+// Static interstitial shell for post links (/go?v=1#p=<post id>&u=<encoded source URL>).
+// Card hrefs are root-relative, so every custom domain resolves to its own /go. Post
+// params travel in the URL FRAGMENT on purpose: fragments never reach the server and do
+// not participate in the HTTP cache key, so every post shares the single /go?v=1 cache
+// entry (about 1KB per domain, one Worker request per domain per shell version). The
+// ?v= query stays in the cache key as the version lever: bump it to invalidate every
+// cached shell at once. The shell runs client-side only: validate u against nodeseek.com
+// hosts (anti open-redirect), broadcast the post id so already-open list tabs turn red,
+// send the read receipt via keepalive fetch (server-side INSERT OR REPLACE is idempotent),
+// then location.replace(u) so the back button returns to the list. The server never redirects.
+const goInterstitialHtml = String.raw`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>正在打开原帖…</title></head><body><p style="font-family:system-ui;padding:2rem;line-height:1.6">正在打开原帖…</p><script>(function(){var q=new URLSearchParams(location.hash.slice(1));var target=q.get('u')||'';var ok=false;try{ok=/^(?:[a-z0-9-]+\.)*nodeseek\.com$/i.test(new URL(target).hostname)}catch(e){}if(!ok){document.body.innerHTML='<p style="font-family:system-ui;padding:2rem;line-height:1.6">链接无效或已过期，<a href="/">返回首页</a>。</p>';return}var id=Number(q.get('p')||0);if(Number.isInteger(id)&&id>0){try{var ch=new BroadcastChannel('nd-read');ch.postMessage({postId:id});ch.close()}catch(e){}fetch('/api/read-state',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({postId:id}),keepalive:true}).catch(function(){})}location.replace(target)})();</script></body></html>`;
+
+function goInterstitial(): Response {
+  return new Response(goInterstitialHtml, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" } });
+}
 
 function requireUser(user: User | null): Response | null {
   return user ? null : json({ error: "需要登录" }, 401);
@@ -315,6 +330,7 @@ async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): P
   const homeStart = isHomeRoute ? Date.now() : 0;
   if (url.pathname === "/icon.svg") return new Response(iconSvg, { headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "public, max-age=86400" } });
   if (url.pathname === "/manifest.webmanifest") return json(manifest, 200, { "cache-control": "public, max-age=86400" });
+  if (url.pathname === "/go") return goInterstitial();
   if (url.pathname === "/health") return health(env);
   if (!env.DB) return missingDbResponse(request);
   if (url.pathname === "/admin") return handleAdmin(request, env);

@@ -21,8 +21,8 @@ function pager(data: PageData, rulesVersion: string | null): string {
 }
 
 function renderPost(post: Post): string {
-  const link = escapeAttr(safeHttpUrl(post.link));
-  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-rule-text="${escapeAttr(postTextForBlock(post))}"><a class="card-overlay" href="${link}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${link}" target="_blank" rel="noreferrer">${escapeHtml(post.title)}</a></div><div class="body">${sanitizePostHtml(post.content_html)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
+  const goHref = escapeAttr(`/go?v=1#p=${post.id}&u=${encodeURIComponent(safeHttpUrl(post.link))}`);
+  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-rule-text="${escapeAttr(postTextForBlock(post))}"><a class="card-overlay" href="${goHref}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${goHref}" target="_blank" rel="noreferrer">${escapeHtml(post.title)}</a></div><div class="body">${sanitizePostHtml(post.content_html)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
 }
 
 function safeJson(value: unknown): string {
@@ -107,6 +107,7 @@ const boardSelect=$('.toolbar select[name="board"]');boardSelect?.addEventListen
  $$('.pager a').forEach(a=>a.addEventListener('click',e=>{if(!initialRules.userId)return;try{const url=new URL(a.href,location.href);const cached=JSON.parse(localStorage.getItem(rulesKey(initialRules.userId))||'null');if(cached&&cached.userId===initialRules.userId&&cached.rulesVersion===initialRules.rulesVersion&&Array.isArray(cached.blockRules)&&Array.isArray(cached.highlightGroups)){url.searchParams.set('rulesVersion',cached.rulesVersion);url.searchParams.set('rulesCache','1');a.href=url.toString()}}catch{}}));
  function markRead(c){const id=c.dataset.postId;c.classList.add('read');if(id){try{localStorage.setItem(readStateKey()+id,'1')}catch{}fetch('/api/read-state',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({postId:Number(id)})}).catch(()=>{})}}
  $$('.card').forEach(c=>{const id=c.dataset.postId;try{if(id&&localStorage.getItem(readStateKey()+id))c.classList.add('read')}catch{}c.querySelectorAll('.card-overlay,.title-link').forEach(a=>a.addEventListener('click',()=>markRead(c))) });
+try{const goChannel=new BroadcastChannel('nd-read');goChannel.onmessage=e=>{const id=e.data&&e.data.postId;if(typeof id!=='number'||!Number.isInteger(id)||id<=0)return;const card=document.querySelector('.card[data-post-id="'+id+'"]');if(!card||card.classList.contains('read'))return;card.classList.add('read');try{localStorage.setItem(readStateKey()+id,'1')}catch{}}}catch{}
 $('#toTop').onclick=()=>scrollTo({top:0,behavior:'smooth'});$('#toBottom').onclick=()=>scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
 fetch('https://api.github.com/repos/sfhgknsdfksdlf/nodeseek-rss-reader').then(r=>r.ok?r.json():null).then(d=>{if(d&&Number.isFinite(d.stargazers_count))$('#githubStars').textContent='★ '+d.stargazers_count}).catch(()=>{});
 $$('[data-tab]').forEach(b=>b.onclick=()=>loadTab(b.dataset.tab));
