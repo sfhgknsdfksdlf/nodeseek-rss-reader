@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-09-06
-**Commit:** 41e76f8
+**Commit:** 2484d64
 **Branch:** factory
 
 ## OVERVIEW
@@ -15,7 +15,7 @@ Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as 
 ├── src/                    # Worker routes and application modules
 ├── migrations/             # Sequential D1 schema migrations
 ├── scripts/                # Cloudflare build/deploy config generation
-├── public/                 # PWA icon.svg + manifest.webmanifest (only static assets; app renders via Worker)
+├── public/                 # PWA icon.svg + manifest.webmanifest — repo assets only; the Worker serves embedded copies from src/index.ts, never these files
 ├── README.md               # Deployment and administrator setup
 ├── AGENTS.md               # Knowledge base + merged approved design (this file)
 ├── package.json            # Scripts (dev/migrate/deploy/typecheck); no test or lint scripts
@@ -30,7 +30,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 | Symbol/module | Location | Role |
 |---|---|---|
-| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration, debug status |
+| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration, debug status, static `/go` interstitial shell |
 | RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, diagnostics |
 | Home query | `src/posts.ts` | Page/board query, title/body search, pagination, read state |
 | SSR shell/client script | `src/render.ts` | HTML rendering and browser interactions |
@@ -75,7 +75,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - TypeScript is strict/no-emit; target Workers and Web APIs, not Node-only APIs.
 - D1 owns all persistent state. Do not add KV, Durable Objects, R2, or another store without an explicit request.
 - RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
-- Normal post cards must link to the source URL with a real external `<a target="_blank">`; read receipts go through `POST /api/read-state`. There is no redirect/open route.
+- Post cards open the source URL through the root-relative `/go?v=1#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
 - Rule imports are all-or-nothing: fully validate first, then replace with exactly one `env.DB.batch()` per handler; never delete before validation succeeds. A missing top-level collection key (`groups`/`patterns`/`rules`) is a client bug and is rejected, not treated as an empty import; an explicit empty array means "replace with empty". Per-group `patterns` inside a highlight import stays optional and defaults to `[]` (normalize-and-default semantics for display-only fields).
 - All rule-writing endpoints (imports, highlight PUT, block POST, subscription POST) share the same `validatePatternInput` gate: non-empty, ≤200 chars, `safeRegex` (ReDoS-hazard guarded). Reject invalid regex at write time; never persist patterns the cron matcher would silently drop.
@@ -95,6 +95,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Do not rewrite deployed migrations. Add sequential files instead.
 - Do not use `push_logs.post_id`; the final schema and dedupe paths use `push_logs.post_guid` exclusively.
 - Do not confuse `read_states.post_id` with notification-log identity.
+- Registration error mapping (`src/auth.ts`): only a real username uniqueness collision returns "用户名已存在"/409 — other DB failures must surface as their own error, never as a false taken-username report.
 - Do not commit local artifacts: agent states (`.sisyphus/`, `.omo/`, `session-ses_*.md`), logs, or reference dumps. Gitignore covers them; never `git add -f` them.
 
 ## DATA AND MIGRATIONS
@@ -160,6 +161,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 - Remote: `https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader.git`; do not force-push `main`.
 - When committing as the owner, use one-off `git -c user.name=... -c user.email=... commit` flags rather than persistent Git configuration.
+- Commit message style (owner-mandated, reference commit `8108b49`): a single Chinese subject line, verb-first (修复/新增/统一/移除/完善…), stating concretely what changed; when the knowledge base ships with the change append `并同步 AGENTS.md` / `并刷新 AGENTS.md`. No body, no trailers — never append Co-authored-by, AI attribution, or "Ultraworked" footers. This repo rule overrides any tooling default suggesting attribution trailers.
 - `.sisyphus/` agent artifacts were committed at `a2576f2` and untracked on 2026-09-06 via `git rm -r --cached .sisyphus`. The directory remains gitignored; never re-add agent artifacts (`.sisyphus/`, `.omo/`, `session-ses_*.md`) to git.
 
 ## APPROVED DESIGN
@@ -219,7 +221,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 ### API（当前完整清单）
 
-- `GET /`、`GET /page/:page`：SSR 帖子列表；`GET /health`；`GET /icon.svg`；`GET /manifest.webmanifest`。
+- `GET /`、`GET /page/:page`：SSR 帖子列表；`GET /health`；`GET /icon.svg`；`GET /manifest.webmanifest`；`GET /go`：后台打开中转外壳（静态、immutable 长缓存，不查库、不重定向）。
 - `GET /admin?token=ADMIN_SECRET`：独立管理员页；`POST /telegram/webhook`。
 - `GET /api/posts`：JSON 帖子列表。
 - `POST /api/auth/register|login|logout`；`GET /api/me`；`PUT /api/me/email`；`PUT /api/me/telegram`；`GET /api/account`；`GET /api/notification-settings`；`POST /api/read-state`。
@@ -230,7 +232,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 导入：`POST /api/import/highlights|blocks|subscriptions`。
 - 诊断：`GET /api/rss-test`、`GET /api/debug/status?token=ADMIN_SECRET`（非 `live=1` 不做实抓）。
 - 管理：`GET|PUT /api/admin/settings`、`GET /api/admin/users`、`DELETE /api/admin/users/:id`。
-- 普通卡片直接外链 `<a target="_blank">` 打开原帖，已读回执走 `POST /api/read-state`；不存在中转打开路由。
+- 卡片经根相对 `/go?v=1#p=<id>&u=<原帖链接>` 中转外壳在新标签打开原帖，已读回执走 `POST /api/read-state`（2026-09-06 owner 批准；外壳纯客户端，服务端不做重定向，见「后台打开标红 /go 中转」）。
 
 ### RSS 抓取与失败诊断
 
@@ -258,8 +260,21 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 搜索与分页在小屏保持一行。
 - 卡片只显示标题、正文、三列用户名/板块/时间行。
 - 点击用户名复制到剪贴板，不打开帖子。
-- 点击卡片在新标签打开原帖并标记已读；已读帖渲染红色。
+- 点击卡片在新标签打开原帖并标记已读；已读帖渲染红色。中键/长按“后台打开”经 `/go` 中转外壳同样标记已读（见「后台打开标红 /go 中转」）。
 - 正文图片 markdown 与 image 标签渲染为响应式图片。
+
+### 后台打开标红 /go 中转（2026-09-06 owner 批准）
+
+**需求**：中键点击、手机长按菜单“后台打开”帖子时，列表页也要标红。此前只有左键 `click` 触发回执：中键触发 `auxclick`、上下文菜单路径不产生任何页面事件，均无法标记；浏览器对“上下文菜单选了后台打开”没有任何可用信号，精确覆盖只能让打开动作本身经过本站。
+
+**设计**：
+- 卡片 `.card-overlay` 与 `.title-link` 的 href 改为根相对 `/go?v=1#p=<post id>&u=<encodeURIComponent(safeHttpUrl(post.link))>`，保留 `target="_blank" rel="noreferrer"`。`?v=` 是外壳缓存版本号（查询串参与 HTTP 缓存键，运行时不读），改外壳逻辑时递增以整体失效旧缓存；帖子参数放 fragment——fragment 不发给服务器、不参与缓存键，所以所有帖子共用同一份外壳缓存条目，每帖打开不再各存一份、也不多打 Worker 请求。
+- 多域名：根相对链接由浏览器解析到当前域名（A/B/C/D/E…各自生成各自的 `/go` 链接），无需任何检测逻辑；会话 Cookie 按域名隔离，回执跟随当前域名登录态（匿名仍 localStorage）。
+- `GET /go` 返回静态外壳 HTML（约 1KB，`Cache-Control: public, max-age=31536000, immutable`），对所有帖子/域名同一份内容；浏览器 HTTP 缓存每域名每版本只存一份（~1KB），每个版本只发生一次外壳 Worker 请求。服务端不查库、不做重定向；路由放在 DB 缺失检查之前，无 DB 也可用。
+- 外壳脚本（纯客户端，顺序固定）：1) `new URL(u).hostname` 必须匹配 `nodeseek.com` 及其子域（防开放重定向/钓鱼，失败显示“链接无效”并不跳转）；2) `BroadcastChannel('nd-read').postMessage({postId})` 通知同源已打开的列表页，列表页监听后本地标红并按自身作用域写 localStorage（外壳不知道登录态，不写作用域键）；3) `keepalive fetch POST /api/read-state {postId}` 发已读回执（登录入库，匿名 401 静默）；4) `location.replace(u)` 跳原帖（`replace` 让外壳不留在该标签的历史记录里，后退行为与原直链一致），外壳带 `<meta name="referrer" content="no-referrer">` 保持原 noreferrer 隐私行为。
+- 左键 `click` 的既有 `markRead`（即时标红 + localStorage + POST 回执）保留；与外壳回执幂等（`INSERT OR REPLACE`），双路径重复上报无害。
+- 取舍：打开帖子多一跳（首次约几十 ms，之后外壳走磁盘缓存近零）；复制的链接是 `/go` 形态（仍正常跳转）；不支持 BroadcastChannel 的老浏览器退化为“下次加载时按 localStorage/服务端状态标红”。
+- 不新增 API、不改 schema、不引入新存储。
 
 ### 部署
 
@@ -314,7 +329,7 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 **9. 浏览器处理与防闪现**：顺序固定：先 block（移除/隐藏匹配项），再对仍可见内容 highlight。首屏不能长时间以未处理状态显示；在现有 SSR/client 结构中设最小预处理状态，规则准备与 block 先完成再进入高亮。正则必须继续通过现有安全检查与编译路径；不得使用未校验动态正则，不得因客户端缓存跳过服务端安全约束。
 
-**10. XSS 与安全约束**：帖子标题/正文/用户名/板块/链接与规则相关文本继续走现有 HTML 转义或安全 HTML 路径；`href`、`data-*` 属性值必须属性转义，外部帖子链接继续真实 `<a target="_blank">`，不得改成新的中转路由；规则文本不是 HTML，不得直接拼接进标记，嵌入的规则载荷必须安全结构化编码传输、客户端解析后作数据使用；服务端会话与用户身份决定可读规则范围，localStorage 只能作为对应用户范围的缓存，不能成为跨用户授权机制；page size、page number 等查询参数必须服务端校验。
+**10. XSS 与安全约束**：帖子标题/正文/用户名/板块/链接与规则相关文本继续走现有 HTML 转义或安全 HTML 路径；`href`、`data-*` 属性值必须属性转义，外部帖子链接保持 `<a target="_blank">` 新标签打开行为（2026-09-06 owner 批准改为经根相对 `/go` 中转外壳，见「后台打开标红 /go 中转」；中转仅承载跳转与已读回执，不承载授权，服务端不做重定向）；规则文本不是 HTML，不得直接拼接进标记，嵌入的规则载荷必须安全结构化编码传输、客户端解析后作数据使用；服务端会话与用户身份决定可读规则范围，localStorage 只能作为对应用户范围的缓存，不能成为跨用户授权机制；page size、page number 等查询参数必须服务端校验。
 
 **11. 回滚设计**：实现保持可逆——分页查询、页面数据、SSR pager、客户端分页请求、规则载荷处理、page size 读取保持模块边界清晰；无总数分页出问题可临时恢复旧分页渲染与计数逻辑（不得描述为目标设计）；规则版本或防闪现出问题优先关闭客户端增量规则缓存路径，回退同页发送完整规则并保持“先屏蔽、后高亮”；Admin page_size 异常回退安全默认 99；回滚不得引入 KV 或其他存储，也不得改写已部署历史迁移。
 
