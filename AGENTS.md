@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-09-06
-**Commit:** 37c374c
+**Commit:** 41e76f8
 **Branch:** factory
 
 ## OVERVIEW
@@ -80,7 +80,8 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Rule imports are all-or-nothing: fully validate first, then replace with exactly one `env.DB.batch()` per handler; never delete before validation succeeds. A missing top-level collection key (`groups`/`patterns`/`rules`) is a client bug and is rejected, not treated as an empty import; an explicit empty array means "replace with empty". Per-group `patterns` inside a highlight import stays optional and defaults to `[]` (normalize-and-default semantics for display-only fields).
 - All rule-writing endpoints (imports, highlight PUT, block POST, subscription POST) share the same `validatePatternInput` gate: non-empty, ≤200 chars, `safeRegex` (ReDoS-hazard guarded). Reject invalid regex at write time; never persist patterns the cron matcher would silently drop.
 - `rulesVersion` is a SHA-256 digest of the complete canonical rule payload (block rules + highlight groups with patterns, including row ids): any persisted change to any rule field changes it; failed writes never do. Cache-hit home payloads (`cacheHit: true`) omit rule arrays; clients reuse localStorage only on exact userId + version match.
-- Rule ordering is canonical D1 insertion order (`id ASC`) for every user-facing rule list: SQL reads, API payloads, settings display (`keywordRows` renders payload order directly, no reversal), export, and import. The settings page PUTs pattern arrays back verbatim on every add/delete/color edit, so any other sort permutes saved rules. Exception: the cron-only subscription loader (`src/subscriptions.ts`) stays `ORDER BY s.id DESC` — matching is order-insensitive and it never round-trips through the settings page.
+- Rule ordering is canonical D1 insertion order (`id ASC`) for every user-facing rule list: SQL reads, API payloads, export, import, and PUT bodies. The settings page PUTs pattern arrays back verbatim on every add/delete/color edit, so any other sort permutes saved rules. Exception: the cron-only subscription loader (`src/subscriptions.ts`) stays `ORDER BY s.id DESC` — matching is order-insensitive and it never round-trips through the settings page.
+- Settings chip display is intentionally reversed at the rendering layer: `keywordRows` renders the payload in reverse DOM order because the `.keywords` CSS (`row-reverse` + `wrap-reverse`, group left-aligned) mirrors it into the owner-approved layout — tail (newest) chip at bottom-right, rows reading left→right, full rows wrapping upward, upper rows left-aligned. PUT bodies always come from the in-memory payload arrays, never from DOM order.
 - Keep homepage card CSS in `src/styles.ts`; preserve the rounded black/white UI and OLED pure-black dark mode.
 - Listings use runtime `page_size` (default 99, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
 
@@ -90,7 +91,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks. The empty `catch {}` blocks inside the embedded browser script in `src/render.ts` are a pre-existing guarded-localStorage convention; the prohibition applies to new server-side TS.
 - Do not silently skip, truncate, or partially apply imported rules; reject the whole request with field/index error details.
 - Never trust client `rulesVersion` as authoritative; the server always computes the current digest.
-- Do not read user-facing rule lists with `ORDER BY id DESC` or reverse/sort rule arrays for display; the settings page round-trips arrays verbatim, so any re-ordering permutes saved rules.
+- Do not read user-facing rule lists with `ORDER BY id DESC` or re-sort/reverse the payload in the data layer; the settings page round-trips arrays verbatim, so any re-ordering permutes saved rules. (`keywordRows`' display-side reversal is the single sanctioned exception — DOM order must never leak into PUT bodies.)
 - Do not rewrite deployed migrations. Add sequential files instead.
 - Do not use `push_logs.post_id`; the final schema and dedupe paths use `push_logs.post_guid` exclusively.
 - Do not confuse `read_states.post_id` with notification-log identity.
