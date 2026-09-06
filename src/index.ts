@@ -88,7 +88,7 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
       return json({ ok: true });
     }
   }
-  if (path === "/api/block-rules" && request.method === "GET") return json(await all(env.DB.prepare("SELECT id, pattern FROM block_rules WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
+  if (path === "/api/block-rules" && request.method === "GET") return json(await all(env.DB.prepare("SELECT id, pattern FROM block_rules WHERE user_id = ? ORDER BY id ASC").bind(me.id)));
   if (path === "/api/block-rules" && request.method === "POST") {
     const body = await readJson<{ pattern?: string }>(request);
     const pattern = (body.pattern || "").trim();
@@ -105,7 +105,7 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     await env.DB.prepare("DELETE FROM block_rules WHERE id = ? AND user_id = ?").bind(Number(blockMatch[1]), me.id).run();
     return json({ ok: true });
   }
-  if (path === "/api/subscriptions" && request.method === "GET") return json(await all(env.DB.prepare("SELECT id, pattern, send_email, send_telegram FROM subscriptions WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
+  if (path === "/api/subscriptions" && request.method === "GET") return json(await all(env.DB.prepare("SELECT id, pattern, send_email, send_telegram FROM subscriptions WHERE user_id = ? ORDER BY id ASC").bind(me.id)));
   if (path === "/api/subscriptions" && request.method === "POST") return createSubscription(request, env, me);
   if (path === "/api/subscriptions/clear" && request.method === "POST") {
     await env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ?").bind(me.id).run();
@@ -117,8 +117,8 @@ async function handleApi(request: Request, env: Env, user: User | null, url: URL
     return json({ ok: true });
   }
   if (path === "/api/export/highlights") return listHighlights(env, me);
-  if (path === "/api/export/blocks") return json(await all(env.DB.prepare("SELECT pattern FROM block_rules WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
-  if (path === "/api/export/subscriptions") return json(await all(env.DB.prepare("SELECT pattern, send_email, send_telegram FROM subscriptions WHERE user_id = ? ORDER BY id DESC").bind(me.id)));
+  if (path === "/api/export/blocks") return json(await all(env.DB.prepare("SELECT pattern FROM block_rules WHERE user_id = ? ORDER BY id ASC").bind(me.id)));
+  if (path === "/api/export/subscriptions") return json(await all(env.DB.prepare("SELECT pattern, send_email, send_telegram FROM subscriptions WHERE user_id = ? ORDER BY id ASC").bind(me.id)));
   if (path === "/api/import/highlights" && request.method === "POST") return importHighlights(request, env, me);
   if (path === "/api/import/blocks" && request.method === "POST") return importBlocks(request, env, me);
   if (path === "/api/import/subscriptions" && request.method === "POST") return importSubscriptions(request, env, me);
@@ -217,8 +217,8 @@ async function importHighlights(request: Request, env: Env, user: User): Promise
   for (const [groupIndex, group] of outcome.value.entries()) {
     const groupId = groupIdSeed + groupIndex;
     statements.push(env.DB.prepare("INSERT INTO highlight_groups (id, user_id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))").bind(groupId, user.id, group.name, group.color));
-    for (let patternIndex = group.patterns.length - 1; patternIndex >= 0; patternIndex--) {
-      const pattern = group.patterns[patternIndex];
+    // Insert patterns in input order so import/export and the settings page preserve sequence.
+    for (const pattern of group.patterns) {
       statements.push(env.DB.prepare("INSERT INTO highlight_rules (group_id, pattern, created_at) VALUES ((SELECT id FROM highlight_groups WHERE id = ? AND user_id = ?), ?, datetime('now'))").bind(groupId, user.id, pattern));
     }
   }
