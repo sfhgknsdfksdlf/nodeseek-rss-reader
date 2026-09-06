@@ -1,27 +1,6 @@
 import { all } from "./db";
 import type { BlockRule, Env, HighlightGroup, User } from "./types";
 
-interface BlockRuleVersionRow {
-  id: number;
-  pattern: string;
-  created_at: string;
-}
-
-interface HighlightGroupVersionRow {
-  id: number;
-  name: string;
-  color: string;
-  created_at: string;
-  updated_at: string;
-}
-
-interface HighlightRuleVersionRow {
-  id: number;
-  group_id: number;
-  pattern: string;
-  created_at: string;
-}
-
 export interface RulePayload {
   userId: number | null;
   rulesVersion: string;
@@ -63,27 +42,17 @@ async function digestVersion(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function getRulesVersion(env: Env, user: User | null): Promise<string> {
-  if (!user) return "anonymous";
-  const [blocks, groups, highlightRules] = await Promise.all([
-    all<BlockRuleVersionRow>(env.DB.prepare("SELECT id, pattern, created_at FROM block_rules WHERE user_id = ? ORDER BY id").bind(user.id)),
-    all<HighlightGroupVersionRow>(env.DB.prepare("SELECT id, name, color, created_at, updated_at FROM highlight_groups WHERE user_id = ? ORDER BY id").bind(user.id)),
-    all<HighlightRuleVersionRow>(env.DB.prepare("SELECT hr.id, hr.group_id, hr.pattern, hr.created_at FROM highlight_rules hr JOIN highlight_groups hg ON hg.id = hr.group_id WHERE hg.user_id = ? ORDER BY hr.id").bind(user.id)),
-  ]);
-  return digestVersion(JSON.stringify({ userId: user.id, blocks, groups, highlightRules }));
-}
-
+// The version digest is computed from the complete canonical rule payload
+// (block rules and highlight groups including patterns, with row ids), so any
+// persisted change to any rule field changes the version. Cache negotiation
+// therefore cannot serve stale rules after an in-place update, and the payload
+// reads double as the digest input instead of duplicating them.
 export async function getInitialRulePayload(env: Env, user: User | null, clientVersion: string | null, clientCacheCapable = false): Promise<RulePayload> {
-  const rulesVersion = await getRulesVersion(env, user);
-  const payload: RulePayload = { userId: user?.id || null, rulesVersion };
-  if (user && clientCacheCapable && clientVersion !== null && clientVersion.trim().length > 0 && clientVersion === rulesVersion) {
-    payload.cacheHit = true;
-    return payload;
+  if (!user) return { userId: null, rulesVersion: "anonymous" };
+  const [blockRules, highlightGroups] = await Promise.all([getBlockRules(env, user), getHighlightGroups(env, user)]);
+  const rulesVersion = await digestVersion(JSON.stringify({ userId: user.id, blockRules, highlightGroups }));
+  if (clientCacheCapable && clientVersion !== null && clientVersion.trim().length > 0 && clientVersion === rulesVersion) {
+    return { userId: user.id, rulesVersion, cacheHit: true };
   }
-  if (user) {
-    const [blockRules, highlightGroups] = await Promise.all([getBlockRules(env, user), getHighlightGroups(env, user)]);
-    payload.blockRules = blockRules;
-    payload.highlightGroups = highlightGroups;
-  }
-  return payload;
+  return { userId: user.id, rulesVersion, blockRules, highlightGroups };
 }

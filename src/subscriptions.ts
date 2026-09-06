@@ -1,5 +1,6 @@
 import { all, readJson } from "./db";
 import { safeRegex } from "./filters";
+import { validatePatternInput } from "./rule-import";
 import { sendBrevo, sendTelegram } from "./notifications";
 import { runtimeSettings } from "./settings";
 import type { Env, RssNewPost, Subscription, User } from "./types";
@@ -12,7 +13,7 @@ interface SubscriptionWithUser extends Subscription {
   telegram_bind_code_expires_at: string | null;
 }
 
-export interface SubscriptionProcessTimings {
+interface SubscriptionProcessTimings {
   loadSubsMs: number;
   loadSentMs: number;
   compileRegexMs: number;
@@ -85,10 +86,12 @@ export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promi
 
 export async function createSubscription(request: Request, env: Env, user: User): Promise<Response> {
   const body = await readJson<{ pattern?: string; sendEmail?: boolean; sendTelegram?: boolean }>(request);
-  const pattern = (body.pattern || "").trim();
-  if (!pattern || pattern.length > 200) return Response.json({ error: "订阅正则不能为空且不能超过 200 字符" }, { status: 400 });
+  // Same gate as imports and block rules: reject invalid/hazardous regex at
+  // creation time instead of letting the cron matcher silently drop it later.
+  const result = validatePatternInput(body.pattern ?? "");
+  if (!result.ok) return Response.json({ error: `订阅正则无效：${result.reason}` }, { status: 400 });
   await env.DB.prepare("INSERT INTO subscriptions (user_id, pattern, send_email, send_telegram, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))")
-    .bind(user.id, pattern, body.sendEmail === false ? 0 : 1, body.sendTelegram === false ? 0 : 1)
+    .bind(user.id, result.pattern, body.sendEmail === false ? 0 : 1, body.sendTelegram === false ? 0 : 1)
     .run();
   return Response.json({ ok: true });
 }

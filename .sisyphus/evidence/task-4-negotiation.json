@@ -1,6 +1,0 @@
-{
-  "task": "T4",
-  "contract": {"validPair":"non-empty client rulesVersion plus rulesCache=1","hit":"authenticated exact current version returns userId, rulesVersion, cacheHit=true with arrays omitted","miss":"stale, partial, malformed, unsupported, or anonymous negotiation returns the complete safe payload and never cacheHit=true"},
-  "implementedCases":["current-version hit","stale-version miss","version-without-capability miss","capability-without-version miss","empty or whitespace-only version miss","anonymous miss"],
-  "verification":"bounded local anonymous HTTP probe plus source-level contract inspection; authenticated cases require a session-backed local D1 fixture"
-}

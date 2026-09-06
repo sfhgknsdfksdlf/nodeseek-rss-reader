@@ -63,13 +63,19 @@ export async function register(request: Request, env: Env): Promise<Response> {
   const passwordHash = await hashPassword(password, salt);
   const bindCode = randomToken(4);
   const bindExpiry = telegramBindExpiry();
+  let result: { meta: { last_row_id: number } };
   try {
-    const result = await env.DB.prepare("INSERT INTO users (username, password_hash, password_salt, telegram_bind_code, telegram_bind_code_expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(username, passwordHash, salt, bindCode, bindExpiry, nowIso(), nowIso()).run();
-    const session = await createSession(env, Number(result.meta.last_row_id));
-    return Response.json({ ok: true }, { headers: { "set-cookie": setSessionCookie(session.id, session.expires) } });
-  } catch {
-    return Response.json({ error: "用户名已存在" }, { status: 409 });
+    result = await env.DB.prepare("INSERT INTO users (username, password_hash, password_salt, telegram_bind_code, telegram_bind_code_expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(username, passwordHash, salt, bindCode, bindExpiry, nowIso(), nowIso()).run();
+  } catch (error) {
+    // Only a real username collision is a 409; any other failure (D1 hiccup,
+    // constraint elsewhere) must not masquerade as "username already exists".
+    if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
+      return Response.json({ error: "用户名已存在" }, { status: 409 });
+    }
+    return Response.json({ error: "注册失败，请重试" }, { status: 500 });
   }
+  const session = await createSession(env, Number(result.meta.last_row_id));
+  return Response.json({ ok: true }, { headers: { "set-cookie": setSessionCookie(session.id, session.expires) } });
 }
 
 export async function login(request: Request, env: Env): Promise<Response> {

@@ -114,12 +114,30 @@ function tokenFromRequest(request: Request): string {
   return new URL(request.url).searchParams.get("token") || request.headers.get("x-admin-token") || "";
 }
 
-export function isAdmin(request: Request, env: Env): boolean {
-  return !!env.ADMIN_SECRET && tokenFromRequest(request) === env.ADMIN_SECRET;
+// Constant-time secret comparison: hash both values to fixed-size digests and
+// XOR-accumulate, so response timing reveals nothing about where (or whether)
+// the provided token differs from ADMIN_SECRET. URL-query access stays the
+// approved admin auth model (owner decision, 2026-09-06); only the comparison
+// is hardened.
+async function secretTokensEqual(provided: string, secret: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [providedDigest, secretDigest] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
+    crypto.subtle.digest("SHA-256", encoder.encode(secret))
+  ]);
+  const providedBytes = new Uint8Array(providedDigest);
+  const secretBytes = new Uint8Array(secretDigest);
+  let diff = 0;
+  for (let index = 0; index < providedBytes.length; index++) diff |= providedBytes[index] ^ secretBytes[index];
+  return diff === 0;
 }
 
-export function adminStatus(request: Request, env: Env): { adminSecretConfigured: boolean; adminAuthenticated: boolean } {
-  return { adminSecretConfigured: !!env.ADMIN_SECRET, adminAuthenticated: isAdmin(request, env) };
+export async function isAdmin(request: Request, env: Env): Promise<boolean> {
+  return !!env.ADMIN_SECRET && await secretTokensEqual(tokenFromRequest(request), env.ADMIN_SECRET);
+}
+
+export async function adminStatus(request: Request, env: Env): Promise<{ adminSecretConfigured: boolean; adminAuthenticated: boolean }> {
+  return { adminSecretConfigured: !!env.ADMIN_SECRET, adminAuthenticated: await isAdmin(request, env) };
 }
 
 export async function handleAdmin(request: Request, env: Env): Promise<Response> {
@@ -127,12 +145,12 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
   if (!env.ADMIN_SECRET) {
     return new Response(adminSetupHtml(), { status: 503, headers: { "content-type": "text/html; charset=utf-8" } });
   }
-  if (url.searchParams.get("token") !== env.ADMIN_SECRET) return new Response(adminSetupHtml("管理链接中的 token 不正确。"), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
+  if (!(await secretTokensEqual(url.searchParams.get("token") || "", env.ADMIN_SECRET))) return new Response(adminSetupHtml("管理链接中的 token 不正确。"), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
   return new Response(adminPageHtml(url.searchParams.get("token") || ""), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 
 export async function adminSettingsResponse(request: Request, env: Env): Promise<Response> {
-  if (!isAdmin(request, env)) return json({ admin: false, adminSecretConfigured: !!env.ADMIN_SECRET }, 401);
+  if (!(await isAdmin(request, env))) return json({ admin: false, adminSecretConfigured: !!env.ADMIN_SECRET }, 401);
   const settings = await runtimeSettings(env);
   return json({
     admin: true,
@@ -150,7 +168,7 @@ export async function adminSettingsResponse(request: Request, env: Env): Promise
 }
 
 export async function updateAdminSettings(request: Request, env: Env): Promise<Response> {
-  if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确，请打开 /admin?token=你的ADMIN_SECRET" }, 401);
+  if (!(await isAdmin(request, env))) return json({ error: "管理员 token 不正确，请打开 /admin?token=你的ADMIN_SECRET" }, 401);
   const body = (await request.json().catch(() => ({}))) as {
     mailFrom?: unknown;
     mailFromName?: unknown;
@@ -177,7 +195,7 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
 }
 
 export async function adminUsersResponse(request: Request, env: Env): Promise<Response> {
-  if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确" }, 401);
+  if (!(await isAdmin(request, env))) return json({ error: "管理员 token 不正确" }, 401);
   const result = await env.DB.prepare(`
     SELECT
       u.id,
@@ -196,7 +214,7 @@ export async function adminUsersResponse(request: Request, env: Env): Promise<Re
 }
 
 export async function deleteAdminUser(request: Request, env: Env, userId: number): Promise<Response> {
-  if (!isAdmin(request, env)) return json({ error: "管理员 token 不正确" }, 401);
+  if (!(await isAdmin(request, env))) return json({ error: "管理员 token 不正确" }, 401);
   const user = await one<{ id: number; username: string }>(env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(userId));
   if (!user) return json({ error: "用户不存在" }, 404);
   await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run();

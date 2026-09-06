@@ -31,7 +31,14 @@ export function getCookie(request: Request, name: string): string | null {
   const cookie = request.headers.get("cookie") || "";
   for (const part of cookie.split(";")) {
     const [rawKey, ...rawValue] = part.trim().split("=");
-    if (rawKey === name) return decodeURIComponent(rawValue.join("="));
+    if (rawKey !== name) continue;
+    // A malformed percent-encoding must not turn an unauthenticated request
+    // into a server error; treat the value as absent instead.
+    try {
+      return decodeURIComponent(rawValue.join("="));
+    } catch {
+      return null;
+    }
   }
   return null;
 }
