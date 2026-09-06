@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-09-06
-**Commit:** 2ed4c66
+**Commit:** 99777eb
 **Branch:** 0906
 
 ## OVERVIEW
@@ -126,7 +126,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 ## UI AND ADMIN
 
 - Header brand links to `/`; do not add a second homepage button.
-- Keep post cards to title, body, username, board, and time; username click only copies and shows a one-line toast.
+- Keep post cards to title, body, username, board, and time; username and time clicks each copy and show a one-line toast (time button keeps `<time datetime="ISO8601">` inside for machine-readable semantics).
 - Settings tabs stay one row; destructive operations require confirmation.
 - Admin is standalone `/admin?token=ADMIN_SECRET`, not a settings tab.
 - Floating top/bottom controls use `nd-jump-group`/`nd-jump-item` near `bottom: 200px`.
@@ -262,7 +262,8 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - `prefers-color-scheme: dark` 使用 OLED `#000`（页面、卡片、对话框、控件）。
 - 搜索与分页在小屏保持一行。
 - 卡片只显示标题、正文、三列用户名/板块/时间行。
-- 点击用户名复制到剪贴板，不打开帖子。
+- 点击用户名/时间均复制到剪贴板并弹一行 toast，不打开帖子；时间按钮内保留 `<time datetime>`（ISO 8601）机器可读语义（owner 2026-09-06）。
+- 用户名/时间芯片增高采用「垂直 padding 增量 + 等量负上下 margin」补偿，保持按钮中心到卡片边框距离不变（owner 2026-09-06）；调整 padding 必须同步负 margin（基础档 `padding:.35rem .28rem;margin:-.25rem 0`，移动端 `padding:.3rem .22rem;margin:-.24rem 0`）。
 - 点击卡片在新标签打开原帖并标记已读；已读帖渲染红色。中键/长按“后台打开”经 `/go` 中转外壳同样标记已读（见「后台打开标红 /go 中转」）。
 - 正文图片 markdown 与 image 标签渲染为响应式图片。
 - 帖子卡片标题与正文 `word-break:break-all`：填满行内容宽度再换行（owner 2026-09-06 批准；避免示例中 `aaaaaaaaaa-` 未满行即提前换行，接受英文行尾按字符断词，中文逐字换行不受影响）。
