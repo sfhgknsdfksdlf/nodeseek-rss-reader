@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-09-06
-**Commit:** 99777eb
+**Commit:** d9da5cb
 **Branch:** 0906
 
 ## OVERVIEW
@@ -147,6 +147,12 @@ No test or lint scripts are defined. If TypeScript/Wrangler dependencies or the 
 
 De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` using a manual `Cookie: session=...` header (the Secure session cookie is not replayed by PS `Invoke-WebRequest -WebSession`) and byte-exact bodies via `--data-binary '@file'`. Prove rejected requests wrote nothing with SHA-256 export fingerprints taken before/after; test client-side logic by executing the exact served script in Node with localStorage/location/DOM stubs.
 
+本地 QA 铁律（owner 2026-09-06，必须遵守，违者整轮验证会被用户感知为"卡死"）：
+
+- `wrangler dev` 冷启动**禁止固定 sleep 盲等**（曾固定等 12s，连续多轮被投诉卡住）：启动后轮询 `/health` 直到 HTTP 200 再发后续请求。
+- server 就绪后**跨验证轮次复用**，禁止每轮验证杀掉重启。
+- 仅验证 CSS/标记增量时，**优先对已抓取页面做字符串补丁后 file:// 测量**，完全不碰 server；仅当 CSS 规则本身变化且无法安全补丁时才重启。
+
 ## DEPLOY AND CONFIG
 
 - `npm run deploy` runs the generator, applies remote migrations, verifies D1 (five tables: `posts`, `users`, `sync_state`, `app_settings`, `admin_sessions`), dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
@@ -264,6 +270,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 卡片只显示标题、正文、三列用户名/板块/时间行。
 - 点击用户名/时间均复制到剪贴板并弹一行 toast，不打开帖子；时间按钮内保留 `<time datetime>`（ISO 8601）机器可读语义（owner 2026-09-06）。
 - 用户名/时间芯片增高采用「垂直 padding 增量 + 等量负上下 margin」补偿，保持按钮中心到卡片边框距离不变（owner 2026-09-06）；调整 padding 必须同步负 margin（基础档 `padding:.35rem .28rem;margin:-.25rem 0`，移动端 `padding:.3rem .22rem;margin:-.24rem 0`）。
+- 移动端（≤520px）品牌字号压缩为 `clamp(15px,4.2vw,18px)` 且 `white-space:nowrap` 永不折行；登录态用户名 span 手机端可见（`hide-sm` 已移除），`.auth` 与 `.auth>span` 的 `min-width:0` 构成收缩链——头部挤压全部由 span 吸收、自动省略号，全局上限 200px，按钮 `min-width:auto` 永不被压碎（owner 2026-09-06）。
 - 点击卡片在新标签打开原帖并标记已读；已读帖渲染红色。中键/长按“后台打开”经 `/go` 中转外壳同样标记已读（见「后台打开标红 /go 中转」）。
 - 正文图片 markdown 与 image 标签渲染为响应式图片。
 - 帖子卡片标题与正文 `word-break:break-all`：填满行内容宽度再换行（owner 2026-09-06 批准；避免示例中 `aaaaaaaaaa-` 未满行即提前换行，接受英文行尾按字符断词，中文逐字换行不受影响）。
