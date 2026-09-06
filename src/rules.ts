@@ -32,7 +32,9 @@ export interface RulePayload {
 
 export async function getBlockRules(env: Env, user: User | null): Promise<BlockRule[]> {
   if (!user) return [];
-  return all<BlockRule>(env.DB.prepare("SELECT * FROM block_rules WHERE user_id = ? ORDER BY id DESC").bind(user.id));
+  // Insertion order (id ASC) is the canonical rule order everywhere: the settings
+  // page PUTs the payload array back on edit, so any other sort permutes saved rules.
+  return all<BlockRule>(env.DB.prepare("SELECT * FROM block_rules WHERE user_id = ? ORDER BY id ASC").bind(user.id));
 }
 
 export async function getHighlightGroups(env: Env, user: User | null): Promise<HighlightGroup[]> {
@@ -42,7 +44,7 @@ export async function getHighlightGroups(env: Env, user: User | null): Promise<H
     FROM highlight_groups hg
     LEFT JOIN highlight_rules hr ON hr.group_id = hg.id
     WHERE hg.user_id = ?
-    ORDER BY hg.id DESC, hr.id DESC
+    ORDER BY hg.id ASC, hr.id ASC
   `).bind(user.id));
   const byId = new Map<number, HighlightGroup>();
   for (const row of rows) {
