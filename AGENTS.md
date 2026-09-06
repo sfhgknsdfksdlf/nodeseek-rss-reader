@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-09-06
-**Commit:** 2484d64
-**Branch:** factory
+**Commit:** 2ed4c66
+**Branch:** 0906
 
 ## OVERVIEW
 
@@ -20,8 +20,10 @@ Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as 
 ├── AGENTS.md               # Knowledge base + merged approved design (this file)
 ├── package.json            # Scripts (dev/migrate/deploy/typecheck); no test or lint scripts
 ├── tsconfig.json           # strict/no-emit TypeScript config
-├── wrangler.jsonc          # Source Worker/D1/cron configuration (no committed DB binding)
-└── wrangler.local-qa.jsonc # Committed local-dev/QA config with placeholder D1 binding (`npm run dev` and `db:migrate:local` use it)
+├── wrangler.jsonc            # Source Worker/D1/cron configuration (no committed DB binding)
+├── wrangler.local-qa.jsonc # Committed local-dev/QA config with placeholder D1 binding (`npm run dev` and `db:migrate:local` use it); intentionally no cron/observability blocks
+├── package-lock.json       # npm lockfile; all deps are devDependencies (@cloudflare/workers-types, typescript, wrangler)
+└── .gitignore              # ignores .wrangler/, transient wrangler.generated.jsonc, .dev.vars, logs, QA captures, agent state
 ```
 
 This is one package, not a monorepo. `migrations/` and `scripts/` are independent operational domains, but their current size does not warrant child `AGENTS.md` files.
@@ -73,6 +75,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 ## CONVENTIONS
 
 - TypeScript is strict/no-emit; target Workers and Web APIs, not Node-only APIs.
+- Package is ESM (`"type": "module"`); tsconfig `include` is `src/**/*.ts` only. `wrangler.local-qa.jsonc` intentionally omits the production cron trigger and observability blocks (local QA only).
 - D1 owns all persistent state. Do not add KV, Durable Objects, R2, or another store without an explicit request.
 - RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
 - Post cards open the source URL through the root-relative `/go?v=1#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
@@ -146,7 +149,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 ## DEPLOY AND CONFIG
 
-- `npm run deploy` runs the generator, applies remote migrations, verifies D1, dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
+- `npm run deploy` runs the generator, applies remote migrations, verifies D1 (five tables: `posts`, `users`, `sync_state`, `app_settings`, `admin_sessions`), dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
 - All deployments use Worker/D1 `nodeseek-rss-reader`; per-branch environment isolation comes from separate Cloudflare accounts, not branch logic. `WORKER_NAME` / `D1_DATABASE_NAME` env vars override these names.
 - Cloudflare Workers Builds injects only `WORKERS_CI_BRANCH` (never `CF_PAGES_BRANCH`/`CF_BRANCH`/`GITHUB_REF_NAME`/`BRANCH`); the old env-var chain therefore never fired in CF builds — root cause of the factory incidents. The script is intentionally branch-agnostic; do not reintroduce branch detection.
 - A Workers Builds project can only deploy the Worker it is connected to: on config `name` mismatch, CI overrides the name (warning; it may also auto-open a PR editing `wrangler.jsonc`). Both account projects must be named `nodeseek-rss-reader`.
@@ -190,7 +193,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 - `users(id, username, password_hash, password_salt, email, telegram_chat_id, telegram_bind_code, telegram_bind_code_expires_at, created_at, updated_at)`
 - `sessions(id, user_id, expires_at, created_at)`（`0011` 起 `expires_at` 有索引，供每日过期清理）
-- `admin_sessions(id, expires_at, created_at)`
+- `admin_sessions(id, expires_at, created_at)`（遗留表：运行时不再写入，仅 cleanupOldData 每日删除过期行）
 - `app_settings(key, value, encrypted, updated_at)`
 - `posts(id, guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at)`
 - `read_states(user_id, post_id, opened_at)`
@@ -262,6 +265,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 点击用户名复制到剪贴板，不打开帖子。
 - 点击卡片在新标签打开原帖并标记已读；已读帖渲染红色。中键/长按“后台打开”经 `/go` 中转外壳同样标记已读（见「后台打开标红 /go 中转」）。
 - 正文图片 markdown 与 image 标签渲染为响应式图片。
+- 帖子卡片标题与正文 `word-break:break-all`：填满行内容宽度再换行（owner 2026-09-06 批准；避免示例中 `aaaaaaaaaa-` 未满行即提前换行，接受英文行尾按字符断词，中文逐字换行不受影响）。
 
 ### 后台打开标红 /go 中转（2026-09-06 owner 批准）
 
@@ -286,7 +290,7 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 ### 管理设置
 
-管理员用单一 Secret `ADMIN_SECRET` 认证：访问 `/admin?token=ADMIN_SECRET` 建立 7 天 HttpOnly 管理会话；UI 须提示收藏该 URL（会话 7 天过期）。
+管理员用单一 Secret `ADMIN_SECRET` 认证（2026-09-06 修订：无服务端管理会话）：`/admin` 页面与每个 `/api/admin/*` 请求都直接校验 token（URL `?token=` 或 `x-admin-token` 头），`secretTokensEqual` 常量时间比较；管理页 JS 内嵌 token 调 API，UI 须提示收藏完整管理 URL。`admin_sessions` 表为遗留，运行时不再写入，仅每日清理过期行。
 
 `ADMIN_SECRET` 同时派生 AES-GCM 密钥用于加密 D1 设置。Brevo API Key 与 Telegram Bot Token 加密存于 `app_settings`；发件邮箱、发件人名、保留天数明文存储。运行时通知代码先读 D1 设置，再回退环境变量。
 
