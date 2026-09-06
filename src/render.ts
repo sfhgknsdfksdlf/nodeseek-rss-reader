@@ -22,7 +22,8 @@ function pager(data: PageData, rulesVersion: string | null): string {
 
 function renderPost(post: Post): string {
   const goHref = escapeAttr(`/go?v=1#p=${post.id}&u=${encodeURIComponent(safeHttpUrl(post.link))}`);
-  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-rule-text="${escapeAttr(postTextForBlock(post))}"><a class="card-overlay" href="${goHref}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${goHref}" target="_blank" rel="noreferrer">${escapeHtml(post.title)}</a></div><div class="body">${sanitizePostHtml(post.content_html)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><time class="time">${escapeHtml(formatBeijingTime(post.published_at))}</time></div></article>`;
+  const timeText = formatBeijingTime(post.published_at);
+  return `<article class="card ${post.is_read ? "read" : ""}" data-post-id="${post.id}" data-rule-text="${escapeAttr(postTextForBlock(post))}"><a class="card-overlay" href="${goHref}" target="_blank" rel="noreferrer" aria-label="打开帖子"></a><div class="title"><a class="title-link" href="${goHref}" target="_blank" rel="noreferrer">${escapeHtml(post.title)}</a></div><div class="body">${sanitizePostHtml(post.content_html)}</div><div class="meta"><button class="author" data-copy="${escapeAttr(post.author || "")}">${escapeHtml(post.author || "")}</button><div class="board">${escapeHtml(displayBoard(post.board_key))}</div><button class="time" data-copy="${escapeAttr(timeText)}"><time datetime="${escapeAttr(post.published_at)}">${escapeHtml(timeText)}</time></button></div></article>`;
 }
 
 function safeJson(value: unknown): string {
