@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-06
-**Commit:** d9da5cb
+**Generated:** 2026-09-07
+**Commit:** 6239e01
 **Branch:** 0906
 
 ## OVERVIEW
@@ -39,12 +39,12 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | Runtime settings | `src/settings.ts` | D1-backed settings and admin configuration |
 | Auth/session | `src/auth.ts` | Registration, login, cookies, Telegram binding |
 | Rules | `src/rules.ts` | User-isolated rule loading, `cacheHit` negotiation; `rulesVersion` digests the full canonical payload |
-| Import validation | `src/rule-import.ts` | Shared limits, strict body parsing, structured errors for `/api/import/*`, shared `validatePatternInput` gate for all rule writes |
-| Subscriptions | `src/subscriptions.ts` | Regex matching and notification dispatch |
+| Import validation | `src/rule-import.ts` | Shared limits, strict body parsing, structured errors for `/api/import/*`, shared chained-aware `validatePatternInput` gate for all rule writes |
+| Subscriptions | `src/subscriptions.ts` | Chained AND matching and notification dispatch |
 | Notification senders | `src/notifications.ts` | Brevo/Telegram requests and GUID push logs |
 | D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, user+admin sessions |
 | Shared helpers | `src/db.ts` | D1 `one`/`all` helpers, JSON responses, body parsing, cookie/session-cookie builders |
-| HTML/regex safety | `src/filters.ts` | Escaping, `safeHttpUrl`, `safeRegex` + ReDoS-hazard guard, `sanitizePostHtml` whitelist sanitizer, post text builders |
+| HTML/regex + chained-rule core | `src/filters.ts` | Escaping, `safeHttpUrl`, `safeRegex` + ReDoS-hazard guard, chained-rule core (`parseChainedRule`/`compileChainedRule`/`matchChainedRule`/`extractChainedRuleMatches`), `sanitizePostHtml` whitelist sanitizer, post text builders |
 | Board helpers | `src/board.ts` | Board name normalization and option lists for render |
 | Homepage CSS | `src/styles.ts` | Responsive black/white/OLED stylesheet consumed by `src/render.ts` |
 | Time display | `src/time.ts` | `formatBeijingTime` (UTC+8, same-day `今天 HH:MM`) |
@@ -60,7 +60,8 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | Admin/debug routes | `src/index.ts`, `src/settings.ts` | Admin auth is the URL-query token model (`/admin?token=ADMIN_SECRET`, owner-approved); comparison must stay constant-time (`secretTokensEqual`) |
 | User rule handoff | `src/rules.ts`, `src/render.ts` | Payload/version/cache keys stay user-scoped |
 | Rule list ordering | `src/rules.ts`, `src/index.ts`, `src/render.ts` (`keywordRows`) | Canonical order is `id ASC` for user-facing rule lists; see CONVENTIONS |
-| Rule import changes | `src/rule-import.ts`, `src/index.ts` | Inclusive limits: 1 MiB body, 20 groups, 5000 rules, 200-char regex; reject before any D1 call |
+| Rule import changes | `src/rule-import.ts`, `src/index.ts` | Inclusive limits: 1 MiB body, 20 groups, 5000 rules, 200-char whole rule (chained-aware gate); reject before any D1 call |
+| Rule matching semantics | `src/filters.ts`, `src/subscriptions.ts`, `src/render.ts` | Chained `####` AND core (server + browser mirror); `q` stays single-regex; see APPROVED DESIGN |
 | Schema changes | `migrations/` | Add a numbered migration; never rewrite deployed migrations |
 | Deploy config | `scripts/cloudflare-build.mjs`, `wrangler.jsonc` | Never hand-edit generated `wrangler.generated.jsonc` |
 
@@ -81,7 +82,8 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Post cards open the source URL through the root-relative `/go?v=1#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
 - Rule imports are all-or-nothing: fully validate first, then replace with exactly one `env.DB.batch()` per handler; never delete before validation succeeds. A missing top-level collection key (`groups`/`patterns`/`rules`) is a client bug and is rejected, not treated as an empty import; an explicit empty array means "replace with empty". Per-group `patterns` inside a highlight import stays optional and defaults to `[]` (normalize-and-default semantics for display-only fields).
-- All rule-writing endpoints (imports, highlight PUT, block POST, subscription POST) share the same `validatePatternInput` gate: non-empty, ≤200 chars, `safeRegex` (ReDoS-hazard guarded). Reject invalid regex at write time; never persist patterns the cron matcher would silently drop.
+- All rule-writing endpoints (imports, highlight PUT, block POST, subscription POST) share the same chained-aware `validatePatternInput` gate: whole-trim ≤200 chars (separators and internal spaces count) → `parseChainedRule` (literal `####` split, 1..4 segments, empty/whitespace-only segments rejected) → per-segment `safeRegex` compile. Reject before any D1 call; never persist patterns the matcher would silently drop; store the whole trimmed original string — parsing happens again at match time.
+- Rule matching is unified chained AND (see APPROVED DESIGN「规则 #### 链式分段 AND 匹配」): block/highlight/subscription all consume the chained core from `src/filters.ts`, and the embedded browser script mirrors it. Search `q` stays a single whole-string `safeRegex` — do not re-introduce whole-string compilation for the three rule types, and do not apply chained parsing to `q`.
 - `rulesVersion` is a SHA-256 digest of the complete canonical rule payload (block rules + highlight groups with patterns, including row ids): any persisted change to any rule field changes it; failed writes never do. Cache-hit home payloads (`cacheHit: true`) omit rule arrays; clients reuse localStorage only on exact userId + version match.
 - Rule ordering is canonical D1 insertion order (`id ASC`) for every user-facing rule list: SQL reads, API payloads, export, import, and PUT bodies. The settings page PUTs pattern arrays back verbatim on every add/delete/color edit, so any other sort permutes saved rules. Exception: the cron-only subscription loader (`src/subscriptions.ts`) stays `ORDER BY s.id DESC` — matching is order-insensitive and it never round-trips through the settings page.
 - Settings chip display is intentionally reversed at the rendering layer: `keywordRows` renders the payload in reverse DOM order because the `.keywords` CSS (`row-reverse` + `wrap-reverse`, group left-aligned) mirrors it into the owner-approved layout — tail (newest) chip at bottom-right, rows reading left→right, full rows wrapping upward, upper rows left-aligned. PUT bodies always come from the in-memory payload arrays, never from DOM order.
@@ -92,6 +94,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 - Do not skip design approval or change scope beyond it.
 - Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks. The empty `catch {}` blocks inside the embedded browser script in `src/render.ts` are a pre-existing guarded-localStorage convention; the prohibition applies to new server-side TS.
+- Do not compile stored block/highlight/subscription patterns as a single whole-string regex; use the chained core (parse + per-segment compile). Historical rows containing literal `####` are interpreted under chained semantics at match time (owner-approved); the only sanctioned whole-string regex path is search `q`.
 - Do not silently skip, truncate, or partially apply imported rules; reject the whole request with field/index error details.
 - Never trust client `rulesVersion` as authoritative; the server always computes the current digest.
 - Do not read user-facing rule lists with `ORDER BY id DESC` or re-sort/reverse the payload in the data layer; the settings page round-trips arrays verbatim, so any re-ordering permutes saved rules. (`keywordRows`' display-side reversal is the single sanctioned exception — DOM order must never leak into PUT bodies.)
@@ -346,3 +349,24 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 **11. 回滚设计**：实现保持可逆——分页查询、页面数据、SSR pager、客户端分页请求、规则载荷处理、page size 读取保持模块边界清晰；无总数分页出问题可临时恢复旧分页渲染与计数逻辑（不得描述为目标设计）；规则版本或防闪现出问题优先关闭客户端增量规则缓存路径，回退同页发送完整规则并保持“先屏蔽、后高亮”；Admin page_size 异常回退安全默认 99；回滚不得引入 KV 或其他存储，也不得改写已部署历史迁移。
 
 **12. 实现验收边界**：普通首页、匿名用户、登录用户、board 筛选、有效与越界 `page=N`、read state、Admin 10..500 page size 校验、无精确总页数查询、页码点击后才请求、当前至+3 窗口、规则版本变化、用户隔离、登出清理、“先屏蔽、后高亮”顺序。
+
+### 规则 #### 链式分段 AND 匹配（2026-09-07 owner 批准）
+
+**需求**：高亮、屏蔽、订阅三类规则统一支持把一条规则按字面 `####` 分隔为最多 4 段正则；各段在同一段文本（haystack）上全部命中才生效；链式高亮命中后标记所有命中分段。旧单段规则完全兼容；搜索 `q` 保持单段正则不受影响。
+
+**语义**：
+- 解析：整条规则先去首尾空白，再按字面 4 连井号 `####` 切分；额外井号留在相邻段（`a#####b` → 段 `a` + `#b`；`a######b` → `a` + `##b`）；不含 `####` 即单段。
+- 限制：整条 trim 后长度 ≤200（含分隔符与段内空格）；空段/全空白段拒绝；超过 4 段拒绝。
+- 空格：分隔符两侧空格保留在相邻段内容内并参与匹配（`Alpha #### Beta` 的两段是 `Alpha ` 与 ` Beta`）。
+- 存储：存整体 trim 后的原始字符串（含 `####` 与段内空格），不存分段；解析仅发生在校验与匹配时，无 schema 变更。
+- 匹配：每段经 `safeRegex`（flag "i"、每段 ≤200、ReDoS-hazard 防护）编译后，对同一完整 haystack 做 AND（`every` 失败短路、不要求位置顺序）。haystack 维持各自现状：屏蔽 = 标题+正文+作者（`postTextForBlock`），高亮 = 标题+正文，订阅 = 标题+正文+作者+板块。
+- 高亮：规则命中后按逐段匹配信息把每个命中分段都标记出来（零宽匹配该段不产生标记但不影响命中判定）。
+- 字面井号：要匹配连续井号本身用 `#{4}`（量词写法，字符串内无 4 连井号，不触发切分）。
+
+**核心与镜像**：核心导出于 `src/filters.ts`（`parseChainedRule`/`compileChainedRule`/`matchChainedRule`/`extractChainedRuleMatches`），纯函数、零依赖（仅 String/RegExp/Array 原语），保证服务端与浏览器副本可镜像且行为一致。服务端订阅匹配（`src/subscriptions.ts`）每 cron 每订阅预编译一次（不逐帖编译），编译失败的存量 pattern 静默跳过、不中断 cron（与旧 `safeRegex` 过滤语义一致）；浏览器嵌入脚本（`src/render.ts`）镜像同一语义（`clientRegex` 保留同样的 200/防护/try-catch 语义）。
+
+**校验**：三类导入（`/api/import/highlights|blocks|subscriptions`）与三个单项写入端点（highlight PUT、block POST、subscription POST）共用链式感知的 `validatePatternInput` 门，任何错误在 D1 调用之前返回；导入错误保留 field/index 结构化细节；导入保持 all-or-nothing。
+
+**兼容与例外**：不含 `####` 的规则行为与旧版完全一致（单段）；历史存量含 `####` 的规则在匹配时按新语义解释（owner 认可的语义变更，含行为改变的可能：如字符类切分后编译失败则规则惰性）；搜索 `q`（`src/posts.ts` 服务端与浏览器搜索高亮）始终按单个正则处理，不做链式解析。
+
+**排除项**：不改 schema/迁移；不改 API 路径与响应形状；不新增依赖或存储；不改规则顺序匹配语义（订阅加载器仍 `ORDER BY s.id DESC`）；不改 rulesVersion 摘要契约（pattern 仍为整串存储，载荷形状不变）。

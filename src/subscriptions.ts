@@ -1,5 +1,5 @@
 import { all, readJson } from "./db";
-import { safeRegex } from "./filters";
+import { compileChainedRule, matchChainedRule } from "./filters";
 import { validatePatternInput } from "./rule-import";
 import { sendBrevo, sendTelegram } from "./notifications";
 import { runtimeSettings } from "./settings";
@@ -53,7 +53,10 @@ export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promi
   const sent = new Set(logRows.map((row) => pushKey(row.user_id, row.subscription_id, row.post_guid, row.channel)));
   const loadSentMs = Date.now() - loadSentStartedAt;
   const compileStartedAt = Date.now();
-  const compiledSubs = subs.map((sub) => ({ sub, regex: safeRegex(sub.pattern) })).filter((item): item is { sub: SubscriptionWithUser; regex: RegExp } => !!item.regex);
+  const compiledSubs = subs.flatMap((sub) => {
+    const compiled = compileChainedRule(sub.pattern);
+    return compiled.ok ? [{ sub, segments: compiled.segments }] : [];
+  });
   const compileRegexMs = Date.now() - compileStartedAt;
   if (!compiledSubs.length) return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
   const buildPostTextsStartedAt = Date.now();
@@ -62,10 +65,10 @@ export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promi
   const buildPostTextsMs = Date.now() - buildPostTextsStartedAt;
   const matchStartedAt = Date.now();
   let sendMs = 0;
-  for (const { sub, regex } of compiledSubs) {
+  for (const { sub, segments } of compiledSubs) {
     const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code, telegram_bind_code_expires_at: sub.telegram_bind_code_expires_at };
     for (const post of posts) {
-      if (!regex.test(postTexts.get(post.guid) || "")) continue;
+      if (!matchChainedRule(segments, postTexts.get(post.guid) || "")) continue;
       if (sub.send_email && !sent.has(pushKey(user.id, sub.id, post.guid, "email"))) {
         const sendStartedAt = Date.now();
         await sendBrevo(env, user, sub, post, settings);

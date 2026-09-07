@@ -26,6 +26,55 @@ export function safeRegex(pattern: string): RegExp | null {
   }
 }
 
+export type ChainedRuleParseResult =
+  | { readonly ok: true; readonly segments: readonly string[] }
+  | { readonly ok: false; readonly reason: string };
+
+export type ChainedRuleCompileResult =
+  | { readonly ok: true; readonly segments: readonly RegExp[] }
+  | { readonly ok: false; readonly reason: string; readonly segmentIndex?: number };
+
+export interface ChainedRuleMatch {
+  readonly index: number;
+  readonly length: number;
+  readonly text: string;
+}
+
+export function parseChainedRule(rule: string): ChainedRuleParseResult {
+  const trimmedRule = rule.trim();
+  if (!trimmedRule) return { ok: false, reason: "不能为空" };
+  const segments = trimmedRule.split("####");
+  if (segments.length > 4) return { ok: false, reason: "分段数量超过上限（最多 4 段）" };
+  if (segments.some((segment) => !segment.trim())) return { ok: false, reason: "分段不能为空" };
+  return { ok: true, segments };
+}
+
+export function compileChainedRule(rule: string): ChainedRuleCompileResult {
+  const parsed = parseChainedRule(rule);
+  if (!parsed.ok) return parsed;
+  const compiled: RegExp[] = [];
+  for (const [segmentIndex, segment] of parsed.segments.entries()) {
+    const regex = safeRegex(segment);
+    if (!regex) return { ok: false, reason: "不是有效的正则表达式", segmentIndex };
+    compiled.push(regex);
+  }
+  return { ok: true, segments: compiled };
+}
+
+export function matchChainedRule(compiled: readonly RegExp[], haystack: string): boolean {
+  return compiled.every((regex) => regex.test(haystack));
+}
+
+export function extractChainedRuleMatches(compiled: readonly RegExp[], haystack: string): readonly ChainedRuleMatch[] {
+  const matches: ChainedRuleMatch[] = [];
+  for (const regex of compiled) {
+    const match = regex.exec(haystack);
+    if (!match) return [];
+    matches.push({ index: match.index, length: match[0].length, text: match[0] });
+  }
+  return matches;
+}
+
 // Reject the common nested-quantifier shape such as (a+)+. This is not a
 // general regex timeout; valid simple expressions remain supported.
 export function regexHasBacktrackingHazard(pattern: string): boolean {

@@ -1,5 +1,5 @@
 import { json } from "./db";
-import { safeRegex } from "./filters";
+import { compileChainedRule, parseChainedRule } from "./filters";
 
 // Import limits are inclusive: exactly at the limit passes, one over rejects.
 const IMPORT_BODY_LIMIT_BYTES = 1048576; // 1 MiB
@@ -73,14 +73,20 @@ export async function parseImportBody(request: Request): Promise<ImportOutcome<u
 }
 
 // Single shared pattern gate for imports and every single-item rule write:
-// type, trim, length, and bounded regex compilation. Empty/whitespace-only
-// patterns are validation errors (an empty regex would match everything).
+// type, trim, length (the "####" separators and internal spaces count toward
+// the limit), then chained-segment checks — literal "####" splitting with
+// every segment non-empty and compiling as a bounded regex. The stored pattern
+// stays the whole trimmed original string; segments are split again at match
+// time, so parsing here is validation only.
 export function validatePatternInput(rawPattern: unknown): { ok: true; pattern: string } | { ok: false; reason: string } {
   if (typeof rawPattern !== "string") return { ok: false, reason: "必须是字符串" };
   const pattern = rawPattern.trim();
   if (!pattern) return { ok: false, reason: "不能为空" };
   if (pattern.length > IMPORT_MAX_PATTERN_LENGTH) return { ok: false, reason: `长度超过 ${IMPORT_MAX_PATTERN_LENGTH} 字符` };
-  if (!safeRegex(pattern)) return { ok: false, reason: "不是有效的正则表达式" };
+  const parsed = parseChainedRule(pattern);
+  if (!parsed.ok) return parsed;
+  const compiled = compileChainedRule(pattern);
+  if (!compiled.ok) return { ok: false, reason: compiled.reason };
   return { ok: true, pattern };
 }
 
