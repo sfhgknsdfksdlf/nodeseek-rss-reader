@@ -3,7 +3,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-04-24",
   "vars": {
-    "RSS_URL": "https://rss.nodeseek.com/"
+    "RSS_URL": "https://rss.nodeseek.com/",
+    "COMMIT_VERSION": "local"
   },
   "d1_databases": [
     {

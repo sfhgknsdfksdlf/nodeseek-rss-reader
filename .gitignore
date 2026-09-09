@@ -11,6 +11,7 @@ npm-debug.log*
 *.pid
 *.mhtml
 logs-*.json
+.qa-*.html
 .sisyphus/
 .omo/
 session-ses_*.md
