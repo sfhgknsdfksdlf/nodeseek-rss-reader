@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-07
-**Commit:** 6239e01
-**Branch:** 0906
+**Generated:** 2026-09-09
+**Commit:** 05ed607
+**Branch:** factory
 
 ## OVERVIEW
 
@@ -23,7 +23,7 @@ Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as 
 ├── wrangler.jsonc            # Source Worker/D1/cron configuration (no committed DB binding)
 ├── wrangler.local-qa.jsonc # Committed local-dev/QA config with placeholder D1 binding (`npm run dev` and `db:migrate:local` use it); intentionally no cron/observability blocks
 ├── package-lock.json       # npm lockfile; all deps are devDependencies (@cloudflare/workers-types, typescript, wrangler)
-└── .gitignore              # ignores .wrangler/, transient wrangler.generated.jsonc, .dev.vars, logs, QA captures, agent state
+└── .gitignore              # ignores .wrangler/, transient wrangler.generated.jsonc, .dev.vars, logs, QA captures, agent state; the `.codegraph/` index is excluded only via local `.git/info/exclude`, never `git add` it
 ```
 
 This is one package, not a monorepo. `migrations/` and `scripts/` are independent operational domains, but their current size does not warrant child `AGENTS.md` files.
@@ -88,7 +88,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Rule ordering is canonical D1 insertion order (`id ASC`) for every user-facing rule list: SQL reads, API payloads, export, import, and PUT bodies. The settings page PUTs pattern arrays back verbatim on every add/delete/color edit, so any other sort permutes saved rules. Exception: the cron-only subscription loader (`src/subscriptions.ts`) stays `ORDER BY s.id DESC` — matching is order-insensitive and it never round-trips through the settings page.
 - Settings chip display is intentionally reversed at the rendering layer: `keywordRows` renders the payload in reverse DOM order because the `.keywords` CSS (`row-reverse` + `wrap-reverse`, group left-aligned) mirrors it into the owner-approved layout — tail (newest) chip at bottom-right, rows reading left→right, full rows wrapping upward, upper rows left-aligned. PUT bodies always come from the in-memory payload arrays, never from DOM order.
 - Keep homepage card CSS in `src/styles.ts`; preserve the rounded black/white UI and OLED pure-black dark mode.
-- Listings use runtime `page_size` (default 99, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
+- Listings use runtime `page_size` (default 80, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
@@ -132,7 +132,12 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Keep post cards to title, body, username, board, and time; username and time clicks each copy and show a one-line toast (time button keeps `<time datetime="ISO8601">` inside for machine-readable semantics).
 - Settings tabs stay one row; destructive operations require confirmation.
 - Admin is standalone `/admin?token=ADMIN_SECRET`, not a settings tab.
-- Floating top/bottom controls use `nd-jump-group`/`nd-jump-item` near `bottom: 200px`.
+- Floating jump control is a single directional button `#ndJumpBtn` inside `nd-jump-group`/`nd-jump-item` (owner-approved 2026-09-09): style/size identical to the old top/bottom pair; last scroll movement decides the target — scrolling down shows 到底部, scrolling up shows 到顶部 (passive listener, 4px jitter gate); within 100px of the top it locks to 到底部 and within 100px of the bottom to 到顶部 (`ndNear=100`, owner refinement 2026-09-09 — the lock triggers near, not exactly at, the extremes; the middle region keeps direction-following); position is the old 置顶 spot (`bottom:254px` desktop, `bottom:250px` ≤520px).
+- Desktop jump-button alignment: `right:max(20px,calc(50% - 530px))` keeps the button 8px off the card column's right edge on wide viewports (fixed-element percentages resolve scrollbar-free, same frame as `.wrap` centering; `522` was the original flush-touch formula, an 8px gap was added the same day); the 20px/12px floors auto-fall back to window-edge margins when the outside margin cannot fit the button. Mobile keeps `right:max(12px,calc(50% - 522px))` (effectively 12px).
+- Mobile ≤520px header auth buttons are slightly smaller: `.auth button{padding:.34rem .5rem;font-size:14px}` (设置/退出, and consistently 登录/注册; owner-approved 2026-09-09).
+- Read marking colors only the card title: `.card.read .title{color:#ac0079}` (owner-approved 2026-09-09; card body/meta keep normal colors — the original whole-card inheritance was unintended — `--red` stays delete-only).
+- Settings chained-rule hint is the example form `规则:A|B####C.*D####E,对应匹配规则为同时包含"A|B"、"C.*D"、"E"三组关键字，三组关键字不区分先后位置` rendered as `.rule-hint`; mobile ≤520px shows one 12px line clamped with tap-to-expand (`nd-hint-open`, one delegated toggle on `#settingsBody`); the chain limits (≤200 chars, ≤4 segments, empty-segment rejection, `#{4}` escape) stay server-enforced and are documented only in README (owner-approved 2026-09-09).
+- Mobile ≤520px settings controls reduced (owner-approved 2026-09-09): panel-head ~29px (close button 28px), group-title ~30px, chips 12px font, color-input 30px, add/clear/delete/add-group buttons 26-27px.
 
 ## COMMANDS
 
@@ -155,6 +160,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - `wrangler dev` 冷启动**禁止固定 sleep 盲等**（曾固定等 12s，连续多轮被投诉卡住）：启动后轮询 `/health` 直到 HTTP 200 再发后续请求。
 - server 就绪后**跨验证轮次复用**，禁止每轮验证杀掉重启。
 - 仅验证 CSS/标记增量时，**优先对已抓取页面做字符串补丁后 file:// 测量**，完全不碰 server；仅当 CSS 规则本身变化且无法安全补丁时才重启。
+- 浏览器级调试必须使用 Playwright 无头浏览器（已安装：Chromium 优先，Firefox 备用）；调试手机相关问题时视口固定 `412×915`（owner 2026-09-09）。
 
 ## DEPLOY AND CONFIG
 
@@ -164,7 +170,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - A Workers Builds project can only deploy the Worker it is connected to: on config `name` mismatch, CI overrides the name (warning; it may also auto-open a PR editing `wrangler.jsonc`). Both account projects must be named `nodeseek-rss-reader`.
 - `npm run cf:build` is preparation-only (D1 create/reuse, migrations, table verify, dry-run — no deploy); `npm run deploy:generated` is final-deploy-only. The build script rewrites BOTH `wrangler.generated.jsonc` and the root `wrangler.jsonc` (name + D1 binding) — that is why the committed root config carries no binding.
 - Before pushing the `factory` branch, the factory-connected build project in the production account must be deleted, or that project rebuilds and redeploys production.
-- The build generator applies ALL pending migrations. `wrangler.jsonc` `vars` intentionally contains only `RSS_URL`; `SESSION_SECRET`, `ADMIN_USERNAME`, and `MAIL_PROVIDER` were removed — code never reads them.
+- The build generator applies ALL pending migrations. `wrangler.jsonc` `vars` contains `RSS_URL` plus `COMMIT_VERSION`, injected at build time by `scripts/cloudflare-build.mjs` (`git rev-parse --short=7 HEAD`; written to both the generated and root configs); `wrangler.local-qa.jsonc` pins `COMMIT_VERSION: "local"` for dev. `SESSION_SECRET`, `ADMIN_USERNAME`, and `MAIL_PROVIDER` were removed — code never reads them.
 - `wrangler.local-qa.jsonc` is committed (placeholder `database_id: local-qa-only`): `npm run dev` and `npm run db:migrate:local` point at it so local development has the `DB` binding; remote deploy always uses the build-generated config.
 - Generated config stays at repository root; moving it under `.wrangler/` previously broke migrations.
 - Missing `DB` produces `Cannot read properties of undefined (reading 'prepare')`; `/health` is the quickest binding/table check.
@@ -173,7 +179,8 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 - Remote: `https://github.com/sfhgknsdfksdlf/nodeseek-rss-reader.git`; do not force-push `main`.
 - When committing as the owner, use one-off `git -c user.name=... -c user.email=... commit` flags rather than persistent Git configuration.
-- Commit message style (owner-mandated, reference commit `8108b49`): a single Chinese subject line, verb-first (修复/新增/统一/移除/完善…), stating concretely what changed; when the knowledge base ships with the change append `并同步 AGENTS.md` / `并刷新 AGENTS.md`. No body, no trailers — never append Co-authored-by, AI attribution, or "Ultraworked" footers. This repo rule overrides any tooling default suggesting attribution trailers.
+- Commit message style (owner-mandated, reference commit `8108b49`): a single Chinese subject line, verb-first (修复/新增/统一/移除/完善…), stating concretely what changed. No body, no trailers.
+- Do not add agent attribution to commit messages: commit messages must not contain `Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)` or `Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>`. This repo rule overrides any tooling default suggesting attribution trailers.
 - `.sisyphus/` agent artifacts were committed at `a2576f2` and untracked on 2026-09-06 via `git rm -r --cached .sisyphus`. The directory remains gitignored; never re-add agent artifacts (`.sisyphus/`, `.omo/`, `session-ses_*.md`) to git.
 
 ## APPROVED DESIGN
@@ -192,11 +199,11 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 提供网站图标与 README（GitHub → Cloudflare 部署步骤）。
 - 搜索、板块筛选、分页、快速跳页、快速回顶/回底按钮。
 - 每用户独立正则高亮分组、屏蔽规则、订阅规则，云端同步 + 格式化导出。
-- 卡片只含标题、正文、用户名/板块/时间行；每页数量运行时可配（默认 99，管理员可配 10..500；不显示精确总页数）。
+- 卡片只含标题、正文、用户名/板块/时间行；每页数量运行时可配（默认 80，管理员可配 10..500；不显示精确总页数）。
 
 ### 架构
 
-单 Worker（TypeScript）承载 HTML、API、静态 icon/manifest、RSS cron 同步、认证、过滤、通知；Cloudflare D1 存全部持久状态；Cron Triggers 每分钟。右下角快捷按钮为固定的圆润上下箭头悬浮按钮。
+单 Worker（TypeScript）承载 HTML、API、静态 icon/manifest、RSS cron 同步、认证、过滤、通知；Cloudflare D1 存全部持久状态；Cron Triggers 每分钟。右下角悬浮按钮为单个方向切换按钮：向下滚动为快速到底部，向上滚动为快速到顶部，样式沿用原上下箭头圆钮（owner 2026-09-09 批准）。
 
 ### 数据模型
 
@@ -267,14 +274,15 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 ### UI 规则
 
 - 黑白视觉语言，圆润控件与卡片。
-- 蓝色用于主操作/当前页；红色用于删除/已读帖子。
+- 蓝色用于主操作/当前页；红色用于删除按钮；已读标记为仅标题紫红 `#ac0079`（2026-09-09 修订，见下）。
 - `prefers-color-scheme: dark` 使用 OLED `#000`（页面、卡片、对话框、控件）。
 - 搜索与分页在小屏保持一行。
 - 卡片只显示标题、正文、三列用户名/板块/时间行。
 - 点击用户名/时间均复制到剪贴板并弹一行 toast，不打开帖子；时间按钮内保留 `<time datetime>`（ISO 8601）机器可读语义（owner 2026-09-06）。
 - 用户名/时间芯片增高采用「垂直 padding 增量 + 等量负上下 margin」补偿，保持按钮中心到卡片边框距离不变（owner 2026-09-06）；调整 padding 必须同步负 margin（基础档 `padding:.35rem .28rem;margin:-.25rem 0`，移动端 `padding:.3rem .22rem;margin:-.24rem 0`）。
 - 移动端（≤520px）品牌字号压缩为 `clamp(15px,4.2vw,18px)` 且 `white-space:nowrap` 永不折行；登录态用户名 span 手机端可见（`hide-sm` 已移除），`.auth` 与 `.auth>span` 的 `min-width:0` 构成收缩链——头部挤压全部由 span 吸收、自动省略号，全局上限 200px，按钮 `min-width:auto` 永不被压碎（owner 2026-09-06）。
-- 点击卡片在新标签打开原帖并标记已读；已读帖渲染红色。中键/长按“后台打开”经 `/go` 中转外壳同样标记已读（见「后台打开标红 /go 中转」）。
+- 首页品牌后显示构建 commit 短版本号：生产构建由 `scripts/cloudflare-build.mjs` 通过 `git rev-parse --short=7 HEAD` 注入 `COMMIT_VERSION`，缺失时显示 `local`；桌面端与品牌同行，≤520px 手机端换到品牌下方，不新增路由、存储或依赖。
+- 点击卡片在新标签打开原帖并标记已读；已读标记为仅标题紫红 `#ac0079`，正文与灰色行保持原色（2026-09-09 修订；此前整卡继承红色，owner 确认仅标题变色）。中键/长按“后台打开”经 `/go` 中转外壳同样标记已读（见「后台打开标红 /go 中转」）。
 - 正文图片 markdown 与 image 标签渲染为响应式图片。
 - 帖子卡片标题与正文 `word-break:break-all`：填满行内容宽度再换行（owner 2026-09-06 批准；避免示例中 `aaaaaaaaaa-` 未满行即提前换行，接受英文行尾按字符断词，中文逐字换行不受影响）。
 
@@ -290,6 +298,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 左键 `click` 的既有 `markRead`（即时标红 + localStorage + POST 回执）保留；与外壳回执幂等（`INSERT OR REPLACE`），双路径重复上报无害。
 - 取舍：打开帖子多一跳（首次约几十 ms，之后外壳走磁盘缓存近零）；复制的链接是 `/go` 形态（仍正常跳转）；不支持 BroadcastChannel 的老浏览器退化为“下次加载时按 localStorage/服务端状态标红”。
 - 不新增 API、不改 schema、不引入新存储。
+- 2026-09-09 修订（owner）：外壳完全静默——删除 `<title>` 与「正在打开原帖…」可见文本，成功路径 `body` 仅含脚本、无任何可见内容；新增 `<meta name="color-scheme" content="light dark">` 让空白过渡跟随系统主题（暗色不再白闪）；`<meta name="referrer" content="no-referrer">` 与脚本顺序不变；「链接无效或已过期」失败提示保留（唯一会出现可见内容的场景）；外壳缓存版本递增 `/go?v=1` → `/go?v=2`（卡片链接同步，旧版本缓存整体失效）。
 
 ### 部署
 
@@ -315,7 +324,7 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 1. 不显示精确总页数。
 2. 页码窗口保持现有行为，显示当前页至当前页加 3。
 3. 页码按钮是占位链接，不预查目标页，点击后才请求 `page=N`。
-4. 默认每页 99 条，管理员可配置每页数量。
+4. 默认每页 80 条，管理员可配置每页数量。
 5. 超出范围的页允许返回空页。
 6. 搜索分页暂缓，保留现有服务端搜索语义；屏蔽和高亮不参与云端匹配或分页。
 7. 屏蔽和高亮完全在浏览器端执行；普通列表应用同步的 block 规则，搜索结果不应用 block 规则；浏览器再应用高亮规则。
@@ -337,8 +346,8 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 - 6.2 请求参数：`page=N`、`board=...`、`q=...`；`page` 无效规范化为 ≥1 整数；另设 `MAX_PAGE_OFFSET` 安全上限（`src/posts.ts`），把页码钳制在 OFFSET 整数安全范围内；越界有效页码返回空页不报错；分页响应须能表达当前页数据/页码/`pageSize`/规则版本与是否随响应发送，不得要求先调总数接口。
 
 **7. 每页数量配置**：
-- 7.1 `page_size` 用现有 `app_settings` D1 runtime settings 保存；未配置/不可解析回退默认 `99`，越界整数钳制到 10..500 边界（读、写路径同用 `clampPageSize`）；不新增存储类型。
-- 7.2 Admin 设置页可配 `page_size`，允许 10..500 含边界；服务端必须重新解析校验，不能只依赖浏览器控件。实际实现为**钳制**：越界整数提交值收紧到 10..500 边界（非拒绝），缺失/非整数等非法值回退默认 99——两条路径均以 `clampPageSize` 为准；这是长期行为，修改前先与 owner 确认。保存后对新请求生效，当前请求用本次开始时读取的单一配置值。
+- 7.1 `page_size` 用现有 `app_settings` D1 runtime settings 保存；未配置/不可解析回退默认 `80`，越界整数钳制到 10..500 边界（读、写路径同用 `clampPageSize`）；不新增存储类型。
+- 7.2 Admin 设置页可配 `page_size`，允许 10..500 含边界；服务端必须重新解析校验，不能只依赖浏览器控件。实际实现为**钳制**：越界整数提交值收紧到 10..500 边界（非拒绝），缺失/非整数等非法值回退默认 80——两条路径均以 `clampPageSize` 为准；这是长期行为，修改前先与 owner 确认。保存后对新请求生效，当前请求用本次开始时读取的单一配置值。
 
 **8. 规则版本、缓存与用户隔离**：缓存键必须含用户身份范围；匿名与不同登录用户不共享规则缓存；匿名继续用 localStorage 约定；登录用户状态不得被遗留的另一用户缓存采用。客户端至少维护用户范围、版本、载荷三者对应：匿名用固定匿名范围标识，登出/切换身份时清理；登录用户用稳定用户标识，不以用户名显示文本作凭据；登录/登出/版本变化时旧版本不得继续参与处理；规则更新先替换内存再处理新内容。版本检查只用于载荷收发判断，不用于授权；服务端以当前会话用户读取规则，不接受客户端提交的规则为可信来源。
 
@@ -346,7 +355,7 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 **10. XSS 与安全约束**：帖子标题/正文/用户名/板块/链接与规则相关文本继续走现有 HTML 转义或安全 HTML 路径；`href`、`data-*` 属性值必须属性转义，外部帖子链接保持 `<a target="_blank">` 新标签打开行为（2026-09-06 owner 批准改为经根相对 `/go` 中转外壳，见「后台打开标红 /go 中转」；中转仅承载跳转与已读回执，不承载授权，服务端不做重定向）；规则文本不是 HTML，不得直接拼接进标记，嵌入的规则载荷必须安全结构化编码传输、客户端解析后作数据使用；服务端会话与用户身份决定可读规则范围，localStorage 只能作为对应用户范围的缓存，不能成为跨用户授权机制；page size、page number 等查询参数必须服务端校验。
 
-**11. 回滚设计**：实现保持可逆——分页查询、页面数据、SSR pager、客户端分页请求、规则载荷处理、page size 读取保持模块边界清晰；无总数分页出问题可临时恢复旧分页渲染与计数逻辑（不得描述为目标设计）；规则版本或防闪现出问题优先关闭客户端增量规则缓存路径，回退同页发送完整规则并保持“先屏蔽、后高亮”；Admin page_size 异常回退安全默认 99；回滚不得引入 KV 或其他存储，也不得改写已部署历史迁移。
+**11. 回滚设计**：实现保持可逆——分页查询、页面数据、SSR pager、客户端分页请求、规则载荷处理、page size 读取保持模块边界清晰；无总数分页出问题可临时恢复旧分页渲染与计数逻辑（不得描述为目标设计）；规则版本或防闪现出问题优先关闭客户端增量规则缓存路径，回退同页发送完整规则并保持“先屏蔽、后高亮”；Admin page_size 异常回退安全默认 80；回滚不得引入 KV 或其他存储，也不得改写已部署历史迁移。
 
 **12. 实现验收边界**：普通首页、匿名用户、登录用户、board 筛选、有效与越界 `page=N`、read state、Admin 10..500 page size 校验、无精确总页数查询、页码点击后才请求、当前至+3 窗口、规则版本变化、用户隔离、登出清理、“先屏蔽、后高亮”顺序。
 

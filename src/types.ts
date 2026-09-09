@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   RSS_URL?: string;
+  COMMIT_VERSION?: string;
   TELEGRAM_BOT_TOKEN?: string;
   BREVO_API_KEY?: string;
   MAIL_FROM?: string;

@@ -57,9 +57,9 @@ function clampDays(value: unknown, fallback: number): number {
 }
 
 function clampPageSize(value: unknown): number {
-  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) return 99;
+  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) return 80;
   const number = Number(value);
-  if (!Number.isInteger(number)) return 99;
+  if (!Number.isInteger(number)) return 80;
   return Math.min(500, Math.max(10, number));
 }
 
@@ -234,7 +234,7 @@ function adminSetupHtml(error = ""): string {
 
 function adminPageHtml(token: string): string {
   const html = baseAdminPageHtml(token);
-  const pageSizeField = '<label>每页数量 / Page size<input name="pageSize" id="pageSize" type="number" min="10" max="500" step="1" required value="99"><span class="muted">有效范围：10-500，默认 99</span></label>';
+  const pageSizeField = '<label>每页数量 / Page size<input name="pageSize" id="pageSize" type="number" min="10" max="500" step="1" required value="80"><span class="muted">有效范围：10-500，默认 80</span></label>';
   return html
     .replace('<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>', '<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>' + pageSizeField)
     .replace("$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()", "$('#pushLogRetentionDays').value=s.pushLogRetentionDays;$('#pageSize').value=s.pageSize;loadUsers()")

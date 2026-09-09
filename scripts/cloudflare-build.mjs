@@ -9,6 +9,13 @@ const databaseName = process.env.D1_DATABASE_NAME || "nodeseek-rss-reader";
 const generatedConfig = resolve(root, "wrangler.generated.jsonc");
 const rootConfig = resolve(root, "wrangler.jsonc");
 
+function commitVersion() {
+  const result = spawnSync("git", ["rev-parse", "--short=7", "HEAD"], { cwd: root, encoding: "utf8" });
+  const value = result.status === 0 ? result.stdout.trim() : "";
+  if (!/^[0-9a-f]{7}$/i.test(value)) throw new Error("Could not determine the 7-character Git commit version");
+  return value;
+}
+
 function run(args, options = {}) {
   const result = spawnSync(process.platform === "win32" ? "npx.cmd" : "npx", ["wrangler", ...args], {
     cwd: root,
@@ -66,7 +73,7 @@ async function ensureDatabase() {
   return databaseId;
 }
 
-async function writeGeneratedConfig(databaseId) {
+async function writeGeneratedConfig(databaseId, version) {
   const config = `{
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "${workerName}",
@@ -86,7 +93,8 @@ async function writeGeneratedConfig(databaseId) {
     }
   ],
   "vars": {
-    "RSS_URL": "https://rss.nodeseek.com/"
+    "RSS_URL": "https://rss.nodeseek.com/",
+    "COMMIT_VERSION": "${version}"
   }
 }
 `;
@@ -113,8 +121,10 @@ function verifyMigratedDatabase() {
 async function main() {
   console.log(`Preparing Cloudflare Worker: ${workerName}`);
   console.log(`Preparing Cloudflare D1 database: ${databaseName}`);
+  const version = commitVersion();
+  console.log(`Commit version: ${version}`);
   const databaseId = await ensureDatabase();
-  await writeGeneratedConfig(databaseId);
+  await writeGeneratedConfig(databaseId, version);
   console.log(`Generated ${generatedConfig}`);
   console.log(`Updated ${rootConfig} so Cloudflare deploys with DB binding`);
   console.log(`D1 binding: DB -> ${databaseName} (${databaseId})`);
