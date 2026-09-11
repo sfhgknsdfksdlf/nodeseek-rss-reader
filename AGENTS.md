@@ -1,12 +1,12 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-09-09
-**Commit:** 05ed607
+**Generated:** 2026-09-12
+**Commit:** da86244
 **Branch:** factory
 
 ## OVERVIEW
 
-Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as an RSS reader. The Worker owns SSR pages, API routing, cron RSS synchronization, authentication, per-user rules, subscriptions, notifications, and diagnostics.
+Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as an RSS reader. The Worker owns SSR pages, API routing, cron RSS synchronization, FTS5 keyword search, authentication, per-user rules, subscriptions, notifications, and diagnostics.
 
 ## STRUCTURE
 
@@ -32,17 +32,18 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 | Symbol/module | Location | Role |
 |---|---|---|
-| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration, debug status, static `/go` interstitial shell |
+| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration (sync → subscriptions → cleanup → search-index backfill), debug status, static `/go` interstitial shell |
 | RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, diagnostics |
-| Home query | `src/posts.ts` | Page/board query, title/body search, pagination, read state |
-| SSR shell/client script | `src/render.ts` | HTML rendering and browser interactions |
-| Runtime settings | `src/settings.ts` | D1-backed settings and admin configuration |
+| Home query | `src/posts.ts` | Page/board query, literal-keyword FTS5 search (title+body), pagination, read state |
+| SSR shell/client script | `src/render.ts` | HTML rendering, search-term marking + local search pager, browser interactions |
+| FTS5 search index/query | `src/search.ts` | Query parsing (literal terms, trigram/bigram anchor), per-post index writes, resumable backfill, index error/retry state |
+| Runtime settings | `src/settings.ts` | D1-backed settings and admin configuration (`page_size`, `search_result_limit`, retention, notification keys) |
 | Auth/session | `src/auth.ts` | Registration, login, cookies, Telegram binding |
 | Rules | `src/rules.ts` | User-isolated rule loading, `cacheHit` negotiation; `rulesVersion` digests the full canonical payload |
 | Import validation | `src/rule-import.ts` | Shared limits, strict body parsing, structured errors for `/api/import/*`, shared chained-aware `validatePatternInput` gate for all rule writes |
 | Subscriptions | `src/subscriptions.ts` | Chained AND matching and notification dispatch |
 | Notification senders | `src/notifications.ts` | Brevo/Telegram requests and GUID push logs |
-| D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, user+admin sessions |
+| D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, user+admin sessions; deletes expired posts' FTS index rows before deleting the posts |
 | Shared helpers | `src/db.ts` | D1 `one`/`all` helpers, JSON responses, body parsing, cookie/session-cookie builders |
 | HTML/regex + chained-rule core | `src/filters.ts` | Escaping, `safeHttpUrl`, `safeRegex` + ReDoS-hazard guard, chained-rule core (`parseChainedRule`/`compileChainedRule`/`matchChainedRule`/`extractChainedRuleMatches`), `sanitizePostHtml` whitelist sanitizer, post text builders |
 | Board helpers | `src/board.ts` | Board name normalization and option lists for render |
@@ -56,12 +57,13 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 |---|---|---|
 | RSS/cron latency | `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts` | Inspect `/api/debug/status`; preserve structured timings |
 | Homepage latency | `src/posts.ts`, `src/render.ts` | Preserve page size and scan behavior |
+| Search latency/index gaps | `src/search.ts`, `src/posts.ts` | Check `search_index_state.complete` and `sync_state.last_search_index_error`; cron backfill ≤20 posts/min, resumable |
 | Notification dedupe | `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0009*.sql`, `migrations/0010*.sql` | Use `post_guid`, never `post_id` |
 | Admin/debug routes | `src/index.ts`, `src/settings.ts` | Admin auth is the URL-query token model (`/admin?token=ADMIN_SECRET`, owner-approved); comparison must stay constant-time (`secretTokensEqual`) |
 | User rule handoff | `src/rules.ts`, `src/render.ts` | Payload/version/cache keys stay user-scoped |
 | Rule list ordering | `src/rules.ts`, `src/index.ts`, `src/render.ts` (`keywordRows`) | Canonical order is `id ASC` for user-facing rule lists; see CONVENTIONS |
 | Rule import changes | `src/rule-import.ts`, `src/index.ts` | Inclusive limits: 1 MiB body, 20 groups, 5000 rules, 200-char whole rule (chained-aware gate); reject before any D1 call |
-| Rule matching semantics | `src/filters.ts`, `src/subscriptions.ts`, `src/render.ts` | Chained `####` AND core (server + browser mirror); `q` stays single-regex; see APPROVED DESIGN |
+| Rule matching semantics | `src/filters.ts`, `src/subscriptions.ts`, `src/render.ts` | Chained `####` AND core (server + browser mirror); search `q` is literal keyword FTS5 search, not regex; see APPROVED DESIGN |
 | Schema changes | `migrations/` | Add a numbered migration; never rewrite deployed migrations |
 | Deploy config | `scripts/cloudflare-build.mjs`, `wrangler.jsonc` | Never hand-edit generated `wrangler.generated.jsonc` |
 
@@ -79,22 +81,23 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Package is ESM (`"type": "module"`); tsconfig `include` is `src/**/*.ts` only. `wrangler.local-qa.jsonc` intentionally omits the production cron trigger and observability blocks (local QA only).
 - D1 owns all persistent state. Do not add KV, Durable Objects, R2, or another store without an explicit request.
 - RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
-- Post cards open the source URL through the root-relative `/go?v=1#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
+- Post cards open the source URL through the root-relative `/go?v=2#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
 - Rule imports are all-or-nothing: fully validate first, then replace with exactly one `env.DB.batch()` per handler; never delete before validation succeeds. A missing top-level collection key (`groups`/`patterns`/`rules`) is a client bug and is rejected, not treated as an empty import; an explicit empty array means "replace with empty". Per-group `patterns` inside a highlight import stays optional and defaults to `[]` (normalize-and-default semantics for display-only fields).
 - All rule-writing endpoints (imports, highlight PUT, block POST, subscription POST) share the same chained-aware `validatePatternInput` gate: whole-trim ≤200 chars (separators and internal spaces count) → `parseChainedRule` (literal `####` split, 1..4 segments, empty/whitespace-only segments rejected) → per-segment `safeRegex` compile. Reject before any D1 call; never persist patterns the matcher would silently drop; store the whole trimmed original string — parsing happens again at match time.
-- Rule matching is unified chained AND (see APPROVED DESIGN「规则 #### 链式分段 AND 匹配」): block/highlight/subscription all consume the chained core from `src/filters.ts`, and the embedded browser script mirrors it. Search `q` stays a single whole-string `safeRegex` — do not re-introduce whole-string compilation for the three rule types, and do not apply chained parsing to `q`.
+- Rule matching is unified chained AND (see APPROVED DESIGN「规则 #### 链式分段 AND 匹配」): block/highlight/subscription all consume the chained core from `src/filters.ts`, and the embedded browser script mirrors it. Search `q` is literal keyword FTS5 search (see APPROVED DESIGN「索引关键词搜索」) — never regex, and chained parsing does not apply to it either; do not re-introduce whole-string regex compilation for the three rule types.
 - `rulesVersion` is a SHA-256 digest of the complete canonical rule payload (block rules + highlight groups with patterns, including row ids): any persisted change to any rule field changes it; failed writes never do. Cache-hit home payloads (`cacheHit: true`) omit rule arrays; clients reuse localStorage only on exact userId + version match.
 - Rule ordering is canonical D1 insertion order (`id ASC`) for every user-facing rule list: SQL reads, API payloads, export, import, and PUT bodies. The settings page PUTs pattern arrays back verbatim on every add/delete/color edit, so any other sort permutes saved rules. Exception: the cron-only subscription loader (`src/subscriptions.ts`) stays `ORDER BY s.id DESC` — matching is order-insensitive and it never round-trips through the settings page.
 - Settings chip display is intentionally reversed at the rendering layer: `keywordRows` renders the payload in reverse DOM order because the `.keywords` CSS (`row-reverse` + `wrap-reverse`, group left-aligned) mirrors it into the owner-approved layout — tail (newest) chip at bottom-right, rows reading left→right, full rows wrapping upward, upper rows left-aligned. PUT bodies always come from the in-memory payload arrays, never from DOM order.
 - Keep homepage card CSS in `src/styles.ts`; preserve the rounded black/white UI and OLED pure-black dark mode.
 - Listings use runtime `page_size` (default 80, saved range 10..500), `page=N` URLs, and no exact total-page calculation.
+- Search results use runtime `search_result_limit` (default 200, integer clamped to 50..500; missing/non-integer falls back to 200) as a hard cap; the capped set renders once and pages locally in the browser with `page_size` — no server-side search paging, no per-page network requests.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
 - Do not skip design approval or change scope beyond it.
 - Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks. The empty `catch {}` blocks inside the embedded browser script in `src/render.ts` are a pre-existing guarded-localStorage convention; the prohibition applies to new server-side TS.
-- Do not compile stored block/highlight/subscription patterns as a single whole-string regex; use the chained core (parse + per-segment compile). Historical rows containing literal `####` are interpreted under chained semantics at match time (owner-approved); the only sanctioned whole-string regex path is search `q`.
+- Do not compile stored block/highlight/subscription patterns as a single whole-string regex; use the chained core (parse + per-segment compile). Historical rows containing literal `####` are interpreted under chained semantics at match time (owner-approved). Search `q` is the opposite: literal keyword FTS5 search — do not re-introduce regex (or chained) semantics for it.
 - Do not silently skip, truncate, or partially apply imported rules; reject the whole request with field/index error details.
 - Never trust client `rulesVersion` as authoritative; the server always computes the current digest.
 - Do not read user-facing rule lists with `ORDER BY id DESC` or re-sort/reverse the payload in the data layer; the settings page round-trips arrays verbatim, so any re-ordering permutes saved rules. (`keywordRows`' display-side reversal is the single sanctioned exception — DOM order must never leak into PUT bodies.)
@@ -106,9 +109,10 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 ## DATA AND MIGRATIONS
 
-- Current chain is `0001_initial` through `0011_sessions_expiry_index`.
+- Current chain is `0001_initial` through `0012_search_indexes`.
 - `0009` moved push idempotency to `post_guid`; `0010` removed legacy `push_logs.post_id`, its FK, unique constraint, and index.
 - `0011_sessions_expiry_index` adds `sessions(expires_at)` for the daily expired-session purge in `cleanupOldData`.
+- `0012_search_indexes` adds the FTS5 search index: contentless `posts_search_trigram` (`tokenize='trigram'`) and `posts_search_bigrams` (hex-codepoint bigram tokens), both keyed by `rowid = posts.id`, plus singleton `search_index_state(id=1, last_post_id, complete, updated_at)` for the resumable cron backfill.
 - `0010` caveat (documented, do not edit the migration): a legacy `push_logs` row whose `post_guid` is blank AND whose `post_id` no longer resolves to a `posts.guid` would insert NULL into the `NOT NULL` replacement column, aborting the migration atomically. `0010` is already on `main` (deployed branch) and must not be rewritten; if a database hits this, fix the orphan rows manually, then re-apply.
 - `0008_posts_keyset_indexes` supports `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)` scans.
 - Push logs retain GUIDs independently of post retention; do not add an FK from `post_guid` to `posts.guid`.
@@ -120,7 +124,8 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Scheduled sync waits 21..24s before RSS and before browser fallback after failure. `/api/rss-test` is the no-sleep diagnostic path.
 - `src/rss.ts` uses `cf.cacheTtl = 60`; preserve attempt diagnostics because upstream often returns 503.
 - `/api/debug/status?token=ADMIN_SECRET` is non-live unless `live=1`; `safeSyncRss()` records cron failure in `sync_state.last_sync_error`.
-- Worker search matches only `title` and `content_text`; browser rules use the synced payload. Ordinary listings apply block rules in the browser, search results skip block rules, and highlights render in the browser. In `src/posts.ts`, scan only until the requested page fills; defer `content_html` until final IDs are known.
+- Worker search matches only `title` and `content_text` via the FTS5 index (see APPROVED DESIGN「索引关键词搜索」); browser rules use the synced payload. Ordinary listings apply block rules in the browser, search results skip block rules, and highlights + literal search-term marking render in the browser. In `src/posts.ts`, ordinary listings scan only until the requested page fills; defer `content_html` until final IDs are known.
+- Search index lifecycle: new posts index on insert (failure records `last_search_index_error` and flags retry), cron backfills ≤20 posts/min until `search_index_state.complete = 1`; expired-post cleanup deletes FTS rows in 100-id chunks before deleting the posts. Search timings live in `home.timings.queryPosts` (`searchParseMs`/`searchQueryMs`).
 - Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
 - Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
 - Rule payloads must be scoped to the logged-in user; browser processing blocks before highlighting.
@@ -138,6 +143,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Read marking colors only the card title: `.card.read .title{color:#ac0079}` (owner-approved 2026-09-09; card body/meta keep normal colors — the original whole-card inheritance was unintended — `--red` stays delete-only).
 - Settings chained-rule hint is the example form `规则:A|B####C.*D####E,对应匹配规则为同时包含"A|B"、"C.*D"、"E"三组关键字，三组关键字不区分先后位置` rendered as `.rule-hint`; mobile ≤520px shows one 12px line clamped with tap-to-expand (`nd-hint-open`, one delegated toggle on `#settingsBody`); the chain limits (≤200 chars, ≤4 segments, empty-segment rejection, `#{4}` escape) stay server-enforced and are documented only in README (owner-approved 2026-09-09).
 - Mobile ≤520px settings controls reduced (owner-approved 2026-09-09): panel-head ~29px (close button 28px), group-title ~30px, chips 12px font, color-input 30px, add/clear/delete/add-group buttons 26-27px.
+- Search results pager keeps the listing pager's look (owner 2026-09-11): `上一页` + numbered window `[current..current+3]` clamped to the known local page count + `下一页`, rendered as the same `<a class="page">` links as the listing pager — never disabled (`上一页` on page 1 points to page 1, `下一页` points to page+1) — plus the jump form. All controls page locally without network requests (capped rendered results; hrefs are the no-JS fallback, preventDefaulted by the delegated handler); clicking regenerates the navs via `innerHTML`, so the delegated click handler re-focuses the corresponding control (prev/next/current page link) to preserve keyboard page-walking. The former `N / M` indicator span is gone by design.
 
 ## COMMANDS
 
@@ -160,7 +166,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - `wrangler dev` 冷启动**禁止固定 sleep 盲等**（曾固定等 12s，连续多轮被投诉卡住）：启动后轮询 `/health` 直到 HTTP 200 再发后续请求。
 - server 就绪后**跨验证轮次复用**，禁止每轮验证杀掉重启。
 - 仅验证 CSS/标记增量时，**优先对已抓取页面做字符串补丁后 file:// 测量**，完全不碰 server；仅当 CSS 规则本身变化且无法安全补丁时才重启。
-- 浏览器级调试必须使用 Playwright 无头浏览器（已安装：Chromium 优先，Firefox 备用）；调试手机相关问题时视口固定 `412×915`（owner 2026-09-09）。
+- 浏览器级调试必须使用 Playwright 无头浏览器（已安装：Chromium 优先，Firefox 备用）；调试手机相关问题时视口固定 `412×915`（owner 2026-09-09）。Playwright MCP 的 chrome 渠道缺 `chrome.exe` 不可用时的退路：node 直跑 npx 缓存里的 `playwright-core`，`chromium.launch({ executablePath: '%LOCALAPPDATA%\ms-playwright\chromium-1243\chrome-win64\chrome.exe' })`——headless-shell 变体未安装，必须显式指定全量 chromium 的 executablePath。
 
 ## DEPLOY AND CONFIG
 
@@ -221,6 +227,8 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - `sync_state(key, value, updated_at)`
 - `rss_fetch_failures(...)`：遗留表，诊断不再读取。
 - `rss_fetch_attempts(id, source, method, outcome, status, status_text, error, preview, created_at)`
+- `posts_search_trigram(rowid=posts.id, body)`、`posts_search_bigrams(rowid=posts.id, tok)`：FTS5 contentless 搜索索引（`0012`，见「索引关键词搜索」）。
+- `search_index_state(id=1, last_post_id, complete, updated_at)`：搜索索引回填断点与完成标记。
 - `sync_state.last_home_timing` 存最近一次首页服务端计时快照，供 `/api/debug/status`。
 - RSS 同步先将当前 feed 的 `guid` 集合与 `posts.guid` 比对，只插入真正新条目。
 - 订阅匹配消费内存中的新帖列表，不回读 D1 已插入行。
@@ -249,9 +257,9 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 订阅：`GET|POST /api/subscriptions`、`POST /api/subscriptions/clear`、`DELETE /api/subscriptions/:id`。
 - 导出：`GET /api/export/highlights|blocks|subscriptions`。
 - 导入：`POST /api/import/highlights|blocks|subscriptions`。
-- 诊断：`GET /api/rss-test`、`GET /api/debug/status?token=ADMIN_SECRET`（非 `live=1` 不做实抓）。
+- 诊断：`GET /api/rss-test`、`GET /api/debug/status?token=ADMIN_SECRET`（非 `live=1` 不做实抓）；debug 另含 `searchIndex.building`/`searchIndex.lastError`（索引构建状态与最近错误）。
 - 管理：`GET|PUT /api/admin/settings`、`GET /api/admin/users`、`DELETE /api/admin/users/:id`。
-- 卡片经根相对 `/go?v=1#p=<id>&u=<原帖链接>` 中转外壳在新标签打开原帖，已读回执走 `POST /api/read-state`（2026-09-06 owner 批准；外壳纯客户端，服务端不做重定向，见「后台打开标红 /go 中转」）。
+- 卡片经根相对 `/go?v=2#p=<id>&u=<原帖链接>` 中转外壳在新标签打开原帖，已读回执走 `POST /api/read-state`（2026-09-06 owner 批准；外壳纯客户端，服务端不做重定向，见「后台打开标红 /go 中转」）。
 
 ### RSS 抓取与失败诊断
 
@@ -267,7 +275,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 普通 `/`、`/page/:page` 请求记录 auth、post query、admin status、render 服务端计时；cron 记录 rssSync、订阅、清理分解计时。block/highlight 规则完全在浏览器执行，服务端不再记录 block/highlight 计时字段。
 - 计时快照经 `ctx.waitUntil()` 异步写入 `sync_state.last_home_timing`，不延迟页面响应。
 - `page=N` URL 与 pager UI 不变。
-- 搜索扫描填满当前请求页后即停止，不扫全表。
+- 搜索已改为索引关键词匹配：结果按 `search_result_limit` 封顶一次性返回，浏览器按 `page_size` 本地翻页（2026-09-10，见「索引关键词搜索」）。
 - Worker 端扫描内部使用 `published_at DESC, id DESC` keyset 游标；SQL 快路径同序稳定分页。
 - `migrations/0008_posts_keyset_indexes.sql` 提供 `(published_at DESC, id DESC)` 与 `(board_key, published_at DESC, id DESC)` 索引。
 
@@ -312,9 +320,9 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 管理员用单一 Secret `ADMIN_SECRET` 认证（2026-09-06 修订：无服务端管理会话）：`/admin` 页面与每个 `/api/admin/*` 请求都直接校验 token（URL `?token=` 或 `x-admin-token` 头），`secretTokensEqual` 常量时间比较；管理页 JS 内嵌 token 调 API，UI 须提示收藏完整管理 URL。`admin_sessions` 表为遗留，运行时不再写入，仅每日清理过期行。
 
-`ADMIN_SECRET` 同时派生 AES-GCM 密钥用于加密 D1 设置。Brevo API Key 与 Telegram Bot Token 加密存于 `app_settings`；发件邮箱、发件人名、保留天数明文存储。运行时通知代码先读 D1 设置，再回退环境变量。
+`ADMIN_SECRET` 同时派生 AES-GCM 密钥用于加密 D1 设置。Brevo API Key 与 Telegram Bot Token 加密存于 `app_settings`；发件邮箱、发件人名、保留天数、`page_size`、`search_result_limit` 明文存储。运行时通知代码先读 D1 设置，再回退环境变量。
 
-默认保留：已读状态 7 天；RSS 帖子 365 天；推送日志 30 天。计划任务经 `sync_state.last_cleanup_at` 闸门每天至多执行一次清理。
+默认保留：已读状态 7 天；RSS 帖子 365 天；推送日志 30 天。每页数量默认 80（钳制 10..500）；搜索结果上限默认 200（钳制 50..500）。计划任务经 `sync_state.last_cleanup_at` 闸门每天至多执行一次清理。
 
 ### D1 分页与浏览器端规则优化设计（原 DESIGN_D1_PAGINATION.md 全文并入）
 
@@ -326,15 +334,15 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 3. 页码按钮是占位链接，不预查目标页，点击后才请求 `page=N`。
 4. 默认每页 80 条，管理员可配置每页数量。
 5. 超出范围的页允许返回空页。
-6. 搜索分页暂缓，保留现有服务端搜索语义；屏蔽和高亮不参与云端匹配或分页。
+6. 搜索分页暂缓，保留现有服务端搜索语义；屏蔽和高亮不参与云端匹配或分页。（2026-09-10 修订：已被「索引关键词搜索」取代——搜索为字面关键词匹配，结果封顶后浏览器本地翻页；屏蔽不参与搜索、高亮仍在浏览器执行的语义未变。）
 7. 屏蔽和高亮完全在浏览器端执行；普通列表应用同步的 block 规则，搜索结果不应用 block 规则；浏览器再应用高亮规则。
 
-**3. 明确排除项**：不引入新前端框架；不引入 KV/DO/R2（状态用 D1 + 匿名用户 `localStorage`）；不新增搜索分页实现；不为精确总页数保留无条件 `COUNT(*)`；不新增 Keyset 分页实现（保留 `page=N` 与 `OFFSET` 快路径；Worker 端搜索扫描内部的 keyset 游标属既有实现，不在排除范围内）。
+**3. 明确排除项**：不引入新前端框架；不引入 KV/DO/R2（状态用 D1 + 匿名用户 `localStorage`）；不新增搜索分页实现（2026-09-10 修订：搜索改走「索引关键词搜索」的封顶 + 浏览器本地翻页路径）；不为精确总页数保留无条件 `COUNT(*)`；不新增 Keyset 分页实现（保留 `page=N` 与 `OFFSET` 快路径；Worker 端搜索扫描内部的 keyset 游标属既有实现，不在排除范围内）。
 
 **4. 现状约束与核心决策**：
 - 4.1 D1 查询：普通列表删除分页用无条件 `COUNT(*)`，按 `page=N` 计算 `OFFSET` 只读所需页；block 规则不参与云端分页；越界页返回空 `posts` 数组。索引改善排序/过滤/分页读取，但不消除 `COUNT(*)` 成本；成本优化来自移除计数查询。
 - 4.2 页码窗口：`[currentPage, currentPage+1, currentPage+2, currentPage+3]`，不用 `totalPages` 截断；上一页在第一页指向第一页，下一页指向当前页+1；最后一页无需在当前响应中识别。
-- 4.3 搜索：`q` 服务端只匹配 `title` + `content_text`；作者与板块名不参与匹配，板块下拉是独立结构化筛选；搜索分页迁移暂缓；搜索结果页不应用 block 规则，普通列表页应用同一份同步 block 规则。
+- 4.3 搜索：`q` 服务端只匹配 `title` + `content_text`；作者与板块名不参与匹配，板块下拉是独立结构化筛选；搜索分页迁移暂缓；搜索结果页不应用 block 规则，普通列表页应用同一份同步 block 规则。（2026-09-10 修订：`q` 改为字面关键词 FTS5 匹配，新增结果封顶与浏览器本地翻页，见「索引关键词搜索」；匹配范围 title+正文、作者/板块不参与、搜索页不应用 block 规则的语义未变。）
 
 **5. 数据流**：
 - 5.1 SSR 首页：解析用户/`page`/`board`/`q` + 运行时 `page_size` → 按发布时间稳定排序读当前页（无云端规则匹配、无分页 `COUNT(*)`）→ 仅按标题正文服务端搜索，返回规则载荷 → 无帖子仍返回正常页面 → SSR 输出内容、当前至+3 占位页码、同页规则缓存载荷或版本信息 → 浏览器先屏蔽再高亮。
@@ -361,7 +369,7 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 ### 规则 #### 链式分段 AND 匹配（2026-09-07 owner 批准）
 
-**需求**：高亮、屏蔽、订阅三类规则统一支持把一条规则按字面 `####` 分隔为最多 4 段正则；各段在同一段文本（haystack）上全部命中才生效；链式高亮命中后标记所有命中分段。旧单段规则完全兼容；搜索 `q` 保持单段正则不受影响。
+**需求**：高亮、屏蔽、订阅三类规则统一支持把一条规则按字面 `####` 分隔为最多 4 段正则；各段在同一段文本（haystack）上全部命中才生效；链式高亮命中后标记所有命中分段。旧单段规则完全兼容；搜索 `q` 当时保持单段正则不受影响（2026-09-10 修订：已改为字面关键词搜索，见「索引关键词搜索」）。
 
 **语义**：
 - 解析：整条规则先去首尾空白，再按字面 4 连井号 `####` 切分；额外井号留在相邻段（`a#####b` → 段 `a` + `#b`；`a######b` → `a` + `##b`）；不含 `####` 即单段。
@@ -376,6 +384,26 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 **校验**：三类导入（`/api/import/highlights|blocks|subscriptions`）与三个单项写入端点（highlight PUT、block POST、subscription POST）共用链式感知的 `validatePatternInput` 门，任何错误在 D1 调用之前返回；导入错误保留 field/index 结构化细节；导入保持 all-or-nothing。
 
-**兼容与例外**：不含 `####` 的规则行为与旧版完全一致（单段）；历史存量含 `####` 的规则在匹配时按新语义解释（owner 认可的语义变更，含行为改变的可能：如字符类切分后编译失败则规则惰性）；搜索 `q`（`src/posts.ts` 服务端与浏览器搜索高亮）始终按单个正则处理，不做链式解析。
+**兼容与例外**：不含 `####` 的规则行为与旧版完全一致（单段）；历史存量含 `####` 的规则在匹配时按新语义解释（owner 认可的语义变更，含行为改变的可能：如字符类切分后编译失败则规则惰性）；搜索 `q`（`src/posts.ts`）始终不做链式解析（2026-09-10 修订：已由单段正则改为字面关键词搜索，见「索引关键词搜索」）。
 
 **排除项**：不改 schema/迁移；不改 API 路径与响应形状；不新增依赖或存储；不改规则顺序匹配语义（订阅加载器仍 `ORDER BY s.id DESC`）；不改 rulesVersion 摘要契约（pattern 仍为整串存储，载荷形状不变）。
+
+### 索引关键词搜索（2026-09-10 实现并入，commit da86244；结果翻页 UI 2026-09-11 owner 修订见 UI AND ADMIN）
+
+**需求**：搜索从服务端正则扫描升级为字面关键词匹配：D1 FTS5 索引（标题+正文）支撑，历史帖子索引由 cron 渐进回填、无需手动 SQL；结果封顶，浏览器本地翻页。
+
+**语义**：
+- `q` 是字面关键词，不是正则：trim → 按空白拆分最多 10 个词（去重，ASCII A-Z 折叠小写，其余字符精确匹配）；整条 ≤200 字符；至少一个 ≥2 字符（codepoint）的词，否则作为 `PageData.searchError` 返回提示（SSR 渲染 `role="alert"` 的 `.search-status`）。
+- 锚定词：优先最长 ≥3 字符词（同长取输入靠前），无则取第一个 2 字符词；trigram 表用词原文 FTS 短语，bigram 表用该词首 bigram token；每条结果必含锚定词；1 字符词不参与锚定、只能参与命中计数（`instr(lower(...))` 路径）。
+- 排序：命中词数降序 → `published_at DESC` → `id DESC`；板块筛选仍是结构化 `board_key` 谓词。
+- 结果上限：运行时 `search_result_limit`（默认 200，钳制 50..500，缺失/非整数回退 200）；封顶结果一次性渲染，浏览器按 `page_size` 本地翻页，翻页零网络请求；搜索结果不应用 block 规则，高亮规则与搜索词字面 mark 标记仍生效。
+
+**存储与运行时**：
+- `0012` 三对象：`posts_search_trigram`（`tokenize='trigram'`、`content=''`、`contentless_delete=1`、rowid=posts.id）、`posts_search_bigrams`（同 contentless，`tok` 为定长十六进制相邻码点 bigram 空格串）、`search_index_state`（id=1 单行：last_post_id/complete/updated_at）。
+- 核心在 `src/search.ts`（`parseSearchQuery`/`ftsPhrase`/`indexPostForSearch`/`backfillSearchIndexes`）；FTS 短语一律绑定参数，绝不拼接 SQL（`ftsPhrase` 负责双引号转义）。
+- 新帖：`syncRss` 插入成功后立即索引（四语句批：删旧两行 + 插新两行）；失败非致命——记 `sync_state.last_search_index_error`（≤500 字符）并置 `complete=0` 等待重试。
+- 回填：cron 经 `ctx.waitUntil(backfillSearchIndexes)`，每分钟 ≤20 帖（`SEARCH_BACKFILL_BATCH=20`），按 id 断点续跑，断点状态与索引语句同一 D1 batch 原子更新；无剩余时置 `complete=1`。构建未完成时搜索仅覆盖已索引帖子，页面显示「历史搜索索引仍在构建中」。
+- 清理：`cleanup.ts` 删过期帖前按 100 id 一批先删两 FTS 表对应行，再删 posts。
+- 诊断：`/api/debug/status` 增加 `searchIndex.building`（`complete!==1` 即 true）与 `searchIndex.lastError`；搜索计时 `searchParseMs`/`searchQueryMs` 记入 `home.timings.queryPosts`（原 `searchRegexCompileMs`/`searchMatchMs`/`scanMs` 等字段已移除）。
+
+**排除项**：不新增路由/依赖/存储；普通列表 pager（`page=N` 链接）不变；已读、`/go` 中转、规则契约不变。

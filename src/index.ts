@@ -3,6 +3,7 @@ import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
 import { queryPosts } from "./posts";
 import { renderHome } from "./render";
+import { backfillSearchIndexes, recordSearchIndexError } from "./search";
 import { getHighlightGroups, getInitialRulePayload } from "./rules";
 import { readValidatedBlockImport, readValidatedHighlightImport, readValidatedSubscriptionImport, validatePatternInput } from "./rule-import";
 import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch } from "./rss";
@@ -175,6 +176,8 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const rssDiagnostics = await measure("rssDiagnosticsMs", async () => getRssAttemptDiagnostics(env));
   const lastHomeTiming = await measure("homeTimingMs", async () => getLastHomeTiming(env));
   const lastCronTiming = await measure("cronTimingMs", async () => getLastCronTiming(env));
+  // Cheap point-read only: building/lastError summary, never counts or cursors.
+  const searchIndexState = await measure("searchIndexMs", async () => env.DB.prepare("SELECT complete FROM search_index_state WHERE id = 1").first<{ complete: number }>());
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -204,6 +207,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
     },
     home: lastHomeTiming,
     cronTiming: lastCronTiming,
+    searchIndex: { building: searchIndexState?.complete !== 1, lastError: sync.last_search_index_error?.value || "" },
     rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
 }
@@ -365,7 +369,7 @@ export default {
       return new Response(`<!doctype html><meta charset="utf-8"><title>NodeSeek RSS Reader Error</title><body style="font-family:system-ui;margin:2rem;line-height:1.6"><h1>NodeSeek RSS Reader Error</h1><pre style="white-space:pre-wrap">${message.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch))}</pre><p>Check <code>/health</code> and Cloudflare Worker bindings.</p></body>`, { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
     }
   },
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
   const startedAt = Date.now();
   const result = await safeSyncRss(env);
@@ -398,5 +402,6 @@ export default {
     },
     ...(result.error ? { error: result.error } : {})
   });
+  ctx.waitUntil(backfillSearchIndexes(env).catch((error: unknown) => recordSearchIndexError(env, error)));
 }
 };

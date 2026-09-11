@@ -1,6 +1,7 @@
 import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
+import { indexPostForSearch, markSearchIndexRetryPending, recordSearchIndexError } from "./search";
 import type { CronTimingSnapshot, Env, Post, RssNewPost } from "./types";
 
 interface RssItem {
@@ -302,6 +303,12 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
           published_at: item.publishedAt,
           fetched_at: values[8] as string
         });
+        try {
+          await indexPostForSearch(env, { id: result.meta.last_row_id, title: item.title, content_text: item.contentText });
+        } catch (error) {
+          await recordSearchIndexError(env, error);
+          await markSearchIndexRetryPending(env);
+        }
       } else {
         insertExistingCount++;
       }

@@ -13,6 +13,7 @@ export interface RuntimeSettings {
   postRetentionDays: number;
   pushLogRetentionDays: number;
   pageSize: number;
+  searchResultLimit: number;
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -63,6 +64,13 @@ function clampPageSize(value: unknown): number {
   return Math.min(500, Math.max(10, number));
 }
 
+function clampSearchResultLimit(value: unknown): number {
+  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) return 200;
+  const number = Number(value);
+  if (!Number.isInteger(number)) return 200;
+  return Math.min(500, Math.max(50, number));
+}
+
 async function getRawSetting(env: Env, key: string): Promise<{ value: string; encrypted: number } | null> {
   return one<{ value: string; encrypted: number }>(env.DB.prepare("SELECT value, encrypted FROM app_settings WHERE key = ?").bind(key));
 }
@@ -86,7 +94,7 @@ export async function setSetting(env: Env, key: string, value: string): Promise<
 }
 
 export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
-  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, postDays, pushDays, pageSize] = await Promise.all([
+  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, postDays, pushDays, pageSize, searchResultLimit] = await Promise.all([
     getSetting(env, "brevo_api_key"),
     getSetting(env, "telegram_bot_token"),
     getSetting(env, "telegram_bot_username"),
@@ -95,7 +103,8 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
     getSetting(env, "read_state_retention_days"),
     getSetting(env, "post_retention_days"),
     getSetting(env, "push_log_retention_days"),
-    getSetting(env, "page_size")
+    getSetting(env, "page_size"),
+    getSetting(env, "search_result_limit")
   ]);
   return {
     brevoApiKey: brevoApiKey || env.BREVO_API_KEY || "",
@@ -106,7 +115,8 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
     readStateRetentionDays: clampDays(readDays || env.READ_STATE_RETENTION_DAYS, 7),
     postRetentionDays: clampDays(postDays || env.POST_RETENTION_DAYS, 365),
     pushLogRetentionDays: clampDays(pushDays || env.PUSH_LOG_RETENTION_DAYS, 30),
-    pageSize: clampPageSize(pageSize)
+    pageSize: clampPageSize(pageSize),
+    searchResultLimit: clampSearchResultLimit(searchResultLimit)
   };
 }
 
@@ -163,7 +173,8 @@ export async function adminSettingsResponse(request: Request, env: Env): Promise
     readStateRetentionDays: settings.readStateRetentionDays,
     postRetentionDays: settings.postRetentionDays,
     pushLogRetentionDays: settings.pushLogRetentionDays,
-    pageSize: settings.pageSize
+    pageSize: settings.pageSize,
+    searchResultLimit: settings.searchResultLimit
   });
 }
 
@@ -179,6 +190,7 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
     postRetentionDays?: unknown;
     pushLogRetentionDays?: unknown;
     pageSize?: unknown;
+    searchResultLimit?: unknown;
   };
   const updates: Array<[string, string]> = [];
   if (typeof body.mailFrom === "string") updates.push(["mail_from", body.mailFrom.trim()]);
@@ -190,6 +202,7 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
   updates.push(["post_retention_days", String(clampDays(body.postRetentionDays, 365))]);
   updates.push(["push_log_retention_days", String(clampDays(body.pushLogRetentionDays, 30))]);
   updates.push(["page_size", String(clampPageSize(body.pageSize))]);
+  updates.push(["search_result_limit", String(clampSearchResultLimit(body.searchResultLimit))]);
   for (const [key, value] of updates) await setSetting(env, key, value);
   return json({ ok: true });
 }
@@ -235,10 +248,11 @@ function adminSetupHtml(error = ""): string {
 function adminPageHtml(token: string): string {
   const html = baseAdminPageHtml(token);
   const pageSizeField = '<label>每页数量 / Page size<input name="pageSize" id="pageSize" type="number" min="10" max="500" step="1" required value="80"><span class="muted">有效范围：10-500，默认 80</span></label>';
+  const searchResultLimitField = '<label>搜索结果上限<input name="searchResultLimit" id="searchResultLimit" type="number" min="50" max="500" step="1" required value="200"><span class="muted">允许范围 50-500（默认 200）</span></label>';
   return html
-    .replace('<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>', '<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>' + pageSizeField)
-    .replace("$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()", "$('#pushLogRetentionDays').value=s.pushLogRetentionDays;$('#pageSize').value=s.pageSize;loadUsers()")
-    .replace("body.pushLogRetentionDays=Number(body.pushLogRetentionDays);", "body.pushLogRetentionDays=Number(body.pushLogRetentionDays);body.pageSize=Number(body.pageSize);");
+    .replace('<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>', '<label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label>' + pageSizeField + searchResultLimitField)
+    .replace("$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()", "$('#pushLogRetentionDays').value=s.pushLogRetentionDays;$('#pageSize').value=s.pageSize;$('#searchResultLimit').value=s.searchResultLimit;loadUsers()")
+    .replace("body.pushLogRetentionDays=Number(body.pushLogRetentionDays);", "body.pushLogRetentionDays=Number(body.pushLogRetentionDays);body.pageSize=Number(body.pageSize);body.searchResultLimit=Number(body.searchResultLimit);");
 }
 
 function baseAdminPageHtml(token: string): string {

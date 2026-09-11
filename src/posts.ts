@@ -1,22 +1,11 @@
 import { all, one } from "./db";
 import { normalizeBoard } from "./board";
-import { safeRegex } from "./filters";
+import { bigramTokenForTerm, codepointLength, ftsPhrase, parseSearchQuery } from "./search";
 import { runtimeSettings } from "./settings";
 import type { Env, HomeTimings, PageData, Post, User } from "./types";
 
-type PostScanRow = Pick<Post, "id" | "title" | "content_text" | "author" | "board_key" | "published_at">;
-
 // Keep bound offsets well below SQLite/D1 integer limits while allowing ordinary page numbers.
 const MAX_PAGE_OFFSET = 2_000_000_000;
-
-function postTextForSearch(post: Pick<Post, "title" | "content_text">): string {
-  return `${post.title}\n${post.content_text}`;
-}
-
-function allowedBySearch(post: Pick<Post, "title" | "content_text">, queryRegex: RegExp | null): boolean {
-  if (!queryRegex) return true;
-  return queryRegex.test(postTextForSearch(post));
-}
 
 async function postsByIds(env: Env, user: User | null, ids: number[]): Promise<Post[]> {
   if (!ids.length) return [];
@@ -43,7 +32,8 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const totalStart = Date.now();
   const board = normalizeBoard(url.searchParams.get("board"));
   const query = (url.searchParams.get("q") || "").trim();
-  const pageSize = (await runtimeSettings(env)).pageSize;
+  const settings = await runtimeSettings(env);
+  const pageSize = settings.pageSize;
   const urlPage = /\/page\/(\d+)/.exec(url.pathname)?.[1];
   const rawPage = url.searchParams.get("page") || urlPage || "1";
   const parsedPage = Number(rawPage);
@@ -52,9 +42,6 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
   const setTiming = (key: keyof NonNullable<HomeTimings["queryPosts"]>, value: number) => {
     if (timings) timings[key] = value;
   };
-  const searchRegexStart = Date.now();
-  const queryRegex = query ? safeRegex(query) : null;
-  setTiming("searchRegexCompileMs", Date.now() - searchRegexStart);
   if (!query) {
     const page = requestedPage;
     const offset = (page - 1) * pageSize;
@@ -78,56 +65,46 @@ export async function queryPosts(env: Env, user: User | null, url: URL, timings?
     return { posts, page, pageSize, board, query, syncError };
   }
 
-  const chunkSize = 1000;
-  let matched = 0;
-  const pagePostIds: number[] = [];
-  const start = (requestedPage - 1) * pageSize;
-  const end = start + pageSize;
-  let stoppedAtPageLimit = false;
-  let scannedChunks = 0;
-  const scanStart = Date.now();
-  let cursorPublishedAt: string | null = null;
-  let cursorId: number | null = null;
-  scan: for (;;) {
-    scannedChunks++;
-    const where: string[] = [];
-    const args: unknown[] = [];
-    if (board) {
-      where.push("board_key = ?");
-      args.push(board);
-    }
-    if (cursorPublishedAt !== null && cursorId !== null) {
-      where.push("(published_at < ? OR (published_at = ? AND id < ?))");
-      args.push(cursorPublishedAt, cursorPublishedAt, cursorId);
-    }
-    const sql = `SELECT id, title, content_text, author, board_key, published_at FROM posts ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY published_at DESC, id DESC LIMIT ?`;
-    const chunk = await all<PostScanRow>(env.DB.prepare(sql).bind(...args, chunkSize));
-    if (!chunk.length) break;
-    const searchStart = Date.now();
-    const searchAllowed = queryRegex ? chunk.filter((post) => allowedBySearch(post, queryRegex)) : chunk;
-    if (timings) timings.searchMatchMs = (timings.searchMatchMs || 0) + (Date.now() - searchStart);
-    for (const post of searchAllowed) {
-      if (matched >= start && matched < end) pagePostIds.push(post.id);
-      matched++;
-      if (matched >= end) {
-        stoppedAtPageLimit = true;
-        break scan;
-      }
-    }
-    const last = chunk[chunk.length - 1];
-    cursorPublishedAt = last.published_at;
-    cursorId = last.id;
-    if (chunk.length < chunkSize) break;
+  const searchParseStart = Date.now();
+  const parsedResult = parseSearchQuery(query);
+  setTiming("searchParseMs", Date.now() - searchParseStart);
+  if (!parsedResult.ok) {
+    setTiming("totalMs", Date.now() - totalStart);
+    return { posts: [], page: requestedPage, pageSize, board, query, searchError: parsedResult.message };
   }
-  setTiming("scanMs", Date.now() - scanStart);
-  const page = requestedPage;
-  const syncError = matched === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
-  setTiming("scannedChunks", scannedChunks);
-  setTiming("matchedPosts", matched);
-  setTiming("hasNextPage", stoppedAtPageLimit ? 1 : 0);
+  const { terms, anchorIndex, anchorKind } = parsedResult.parsed;
+  const anchor = terms[anchorIndex] ?? "";
+  const otherTerms = terms.filter((_, index) => index !== anchorIndex);
+  const anchorTable = anchorKind === "trigram" ? "posts_search_trigram" : "posts_search_bigrams";
+  const anchorValue = anchorKind === "trigram" ? anchor : bigramTokenForTerm(anchor);
+  const ctes = [`candidates AS (SELECT p.id, p.title, p.content_text, p.published_at FROM ${anchorTable} INNER JOIN posts p ON p.id = ${anchorTable}.rowid WHERE ${anchorTable} MATCH ?${board ? " AND p.board_key = ?" : ""})`];
+  const scoreParts = ["1"];
+  const args: unknown[] = [ftsPhrase(anchorValue)];
+  if (board) args.push(board);
+  for (let index = 0; index < otherTerms.length; index += 1) {
+    const term = otherTerms[index];
+    if (term === undefined) continue;
+    const length = codepointLength(term);
+    if (length >= 2) {
+      const table = length >= 3 ? "posts_search_trigram" : "posts_search_bigrams";
+      const value = length >= 3 ? term : bigramTokenForTerm(term);
+      ctes.push(`term_${index} AS (SELECT rowid FROM ${table} WHERE ${table} MATCH ?)`);
+      scoreParts.push(`CASE WHEN EXISTS (SELECT 1 FROM term_${index} WHERE term_${index}.rowid = candidates.id) THEN 1 ELSE 0 END`);
+      args.push(ftsPhrase(value));
+    } else {
+      scoreParts.push("CASE WHEN instr(lower(candidates.title), ?) > 0 OR instr(lower(candidates.content_text), ?) > 0 THEN 1 ELSE 0 END");
+      args.push(term, term);
+    }
+  }
+  args.push(settings.searchResultLimit);
+  const searchQueryStart = Date.now();
+  const ranked = await all<{ id: number }>(env.DB.prepare(`WITH ${ctes.join(", ")} SELECT candidates.id, (${scoreParts.join(" + ")}) AS score FROM candidates ORDER BY score DESC, candidates.published_at DESC, candidates.id DESC LIMIT ?`).bind(...args));
+  const state = await one<{ complete: number }>(env.DB.prepare("SELECT complete FROM search_index_state WHERE id = 1"));
+  setTiming("searchQueryMs", Date.now() - searchQueryStart);
   const dbPageStart = Date.now();
-  const posts = await postsByIds(env, user, pagePostIds);
+  const posts = await postsByIds(env, user, ranked.map((row) => row.id));
   setTiming("dbPageMs", Date.now() - dbPageStart);
   setTiming("totalMs", Date.now() - totalStart);
-  return { posts, page, pageSize, board, query, syncError };
+  const syncError = posts.length === 0 ? (await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'last_sync_error'")))?.value || "" : "";
+  return { posts, page: requestedPage, pageSize, board, query, search: { terms, anchor, anchorKind, building: state?.complete !== 1 }, syncError };
 }
