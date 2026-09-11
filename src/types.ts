@@ -1,3 +1,5 @@
+import type { SearchAnchorKind } from "./search";
+
 export interface Env {
   DB: D1Database;
   RSS_URL?: string;
@@ -59,12 +61,21 @@ export interface Subscription {
   send_telegram: number;
 }
 
+export interface SearchPageMeta {
+  terms: string[];
+  anchor: string;
+  anchorKind: SearchAnchorKind;
+  building: boolean;
+}
+
 export interface PageData {
   posts: Post[];
   page: number;
   pageSize: number;
   board: string;
   query: string;
+  search?: SearchPageMeta;
+  searchError?: string;
   syncError?: string;
 }
 
@@ -74,13 +85,9 @@ export interface HomeTimings {
   adminStatusMs?: number;
   queryPosts?: {
     totalMs?: number;
-    searchRegexCompileMs?: number;
-    searchMatchMs?: number;
+    searchParseMs?: number;
+    searchQueryMs?: number;
     dbPageMs?: number;
-    scanMs?: number;
-    scannedChunks?: number;
-    matchedPosts?: number;
-    hasNextPage?: number;
   };
   render?: {
     totalMs?: number;
