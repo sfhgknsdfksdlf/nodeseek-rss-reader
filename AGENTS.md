@@ -116,7 +116,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - `0010` caveat (documented, do not edit the migration): a legacy `push_logs` row whose `post_guid` is blank AND whose `post_id` no longer resolves to a `posts.guid` would insert NULL into the `NOT NULL` replacement column, aborting the migration atomically. `0010` is already on `main` (deployed branch) and must not be rewritten; if a database hits this, fix the orphan rows manually, then re-apply.
 - `0008_posts_keyset_indexes` supports `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)` scans.
 - Push logs retain GUIDs independently of post retention; do not add an FK from `post_guid` to `posts.guid`.
-- `cleanupOldData` purges expired `admin_sessions` and user `sessions` daily (gated by `sync_state.last_cleanup_at`).
+- `cleanupOldData` purges expired `admin_sessions`, user `sessions`, and 24h-expired `rss_fetch_attempts` daily (gated by `sync_state.last_cleanup_at`).
 - `ADMIN_SECRET` secures admin settings and encrypted Brevo/Telegram values. PBKDF2 iterations must remain `<= 100000`.
 
 ## RUNTIME AND HOTSPOTS
@@ -124,10 +124,12 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Scheduled sync waits 21..24s before RSS and before browser fallback after failure. `/api/rss-test` is the no-sleep diagnostic path.
 - `src/rss.ts` uses `cf.cacheTtl = 60`; preserve attempt diagnostics because upstream often returns 503.
 - `/api/debug/status?token=ADMIN_SECRET` is non-live unless `live=1`; `safeSyncRss()` records cron failure in `sync_state.last_sync_error`.
+- `sync_state` fixed-key write contract (`first_sync_done`, `last_sync_at`, `last_sync_error`, `last_sync_strategy`, `last_cron_timing`, `last_cleanup_at`): missing keys are initialized with guarded `INSERT ... SELECT ... WHERE NOT EXISTS ... ON CONFLICT(key) DO NOTHING`, then updated with conditional `UPDATE ... WHERE value IS NOT ?`; each success path and each failure path runs as one D1 batch. Strategy/error updates fire only on value change, so a stable cron no longer rewrites state every minute. Conditions are evaluated in-DB: with overlapping syncs the later-committing batch wins (success clears the current error, failure keeps it), and there are deliberately no locks or versioning. `last_home_timing` and all search-state writes are outside this contract and unchanged.
 - Worker search matches only `title` and `content_text` via the FTS5 index (see APPROVED DESIGN「索引关键词搜索」); browser rules use the synced payload. Ordinary listings apply block rules in the browser, search results skip block rules, and highlights + literal search-term marking render in the browser. In `src/posts.ts`, ordinary listings scan only until the requested page fills; defer `content_html` until final IDs are known.
 - Search index lifecycle: new posts index on insert (failure records `last_search_index_error` and flags retry), cron backfills ≤20 posts/min until `search_index_state.complete = 1`; expired-post cleanup deletes FTS rows in 100-id chunks before deleting the posts. Search timings live in `home.timings.queryPosts` (`searchParseMs`/`searchQueryMs`).
 - Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
 - Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
+- Subscriptions match ONLY the posts actually inserted by this sync (`insertedPosts` = the `INSERT OR IGNORE` results with truthy `meta.changes`): feed-internal GUID dedupe keeps the first occurrence per GUID, already-present GUIDs and `changes=0` conflicts never match, and the scheduler gate stays `result.ok && !result.firstSync` — the first success (including first-fail-then-success) only imports, never notifies. Matching consumes the in-memory `insertedPosts` array; it never re-queries D1 for "new" posts. `INSERT OR IGNORE` + the `posts.guid` unique constraint remain the final defense against duplicates.
 - Rule payloads must be scoped to the logged-in user; browser processing blocks before highlighting.
 - Highlight imports preallocate positive group ids (`Date.now()*1000 + crypto random + index`) so one batch can bind child rows; any batch failure rolls back atomically and returns 500.
 
@@ -163,6 +165,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 本地 QA 铁律（owner 2026-09-06，必须遵守，违者整轮验证会被用户感知为"卡死"）：
 
+- **禁止在 shell 工具里以任何分离式方式自行拉起 `wrangler dev`**（典型违规写法：`Start-Process -FilePath "cmd.exe" -ArgumentList "/c npm run dev" -WindowStyle Hidden -PassThru -RedirectStandardOutput/-RedirectStandardError`，即后台隐藏窗口 + 重定向输出那套）：该模式会让工具会话假死，每次都要 owner 手动 abort（owner 2026-09-12 明令禁止再犯）。正确做法：先 `netstat -ano | findstr :8787` 探端口、`curl.exe --max-time 5 http://127.0.0.1:8787/health` 探活；已有存活 server 直接复用，没有则请 owner 在自己的终端手动启动 `npm run dev`，agent 只轮询 `/health` 等就绪。
 - `wrangler dev` 冷启动**禁止固定 sleep 盲等**（曾固定等 12s，连续多轮被投诉卡住）：启动后轮询 `/health` 直到 HTTP 200 再发后续请求。
 - server 就绪后**跨验证轮次复用**，禁止每轮验证杀掉重启。
 - 仅验证 CSS/标记增量时，**优先对已抓取页面做字符串补丁后 file:// 测量**，完全不碰 server；仅当 CSS 规则本身变化且无法安全补丁时才重启。
@@ -265,7 +268,8 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 - 生产同步：随机 `A ∈ [21,24]` 秒等待 → 抓 `rss` 策略；失败再随机 `B ∈ [21,24]` 秒等待 → 抓 `browser` 策略。
 - `/api/rss-test` 同序（`rss` → `browser`）但不等待，便于手动诊断。
-- 抓取尝试（成功与失败）结构化写入 `rss_fetch_attempts`，保留 24 小时；遗留 `rss_fetch_failures` 不再读取。
+- 抓取尝试只记录失败：`rss_fetch_attempts` 仅在尝试失败时结构化写入（`rss`/`browser` 两种策略、cron 与 rss-test 两个来源、HTTP 失败与异常均覆盖，字段语义不变）；成功尝试（cron 与 rss-test，含 RSS 失败后 browser 重试成功）一律不写库。过期记录由每日 `cleanupOldData` 按滚动 24 小时 cutoff 清理；清理使用 `last_cleanup_at` 做尽力而为的每日节流（无锁重叠可能重复清理，物理记录最长可能保留约 48 小时），attempt/debug 路径只读；`live=1` 诊断失败写入仍是唯一诊断写操作；遗留 `rss_fetch_failures` 不再读取。
+- 诊断口径为 failures-only：`getRssAttemptDiagnostics` 载荷顶层带 `collectionMode: "failures-only"`、`statsScope: "latest-200-failures-within-24h"`、`sampleLimit: 200` 元数据（`/api/debug/status` 的 `rss` 对象同步透出）；`totalAttempts`、`bySource`、`byResult`、`byStatus`、`attemptStats` 等既有数字字段只统计返回的失败样本，不得删除任何既有数字字段名；`attemptStats` 中 `success: 0` 表示「当前失败样本中没有成功行」，不代表实际成功为零；`recentSamples` 为最近 20 条失败。
 - `GET /api/debug/status?token=ADMIN_SECRET` 含后端计时与 `rss.attemptStats`（`cron.success/failure`、`rssTest.success/failure`），保留原始 `rss.results` 与 `rss.failureSummary`。
 - `/api/debug/status` 另含结构化 `cronTiming`：最新一次 cron 的 `timings.rssSync`、`timings.processSubscriptionsMs`、`timings.cleanupOldDataMs`、`timings.totalMs` 分解。
 - cron 计时快照自 scheduled 路径异步捕获，不阻塞正常 cron；debug 载荷不改动既有 RSS 诊断字段。

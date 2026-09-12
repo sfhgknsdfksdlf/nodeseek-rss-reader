@@ -47,6 +47,7 @@ interface RssAttemptLogRow {
 }
 
 interface RssFailureSummary {
+  // Counts below cover only the returned failure sample (capped by RssAttemptDiagnostics.sampleLimit), not every attempt in the window.
   windowHours: number;
   since: string;
   totalAttempts: number;
@@ -101,11 +102,15 @@ function randomIntInclusive(min: number, max: number): number {
 }
 
 interface RssAttemptStats {
+  // success is always 0 under failures-only collection; kept for payload-shape compatibility.
   cron: { success: number; failure: number };
   rssTest: { success: number; failure: number };
 }
 
 interface RssAttemptDiagnostics {
+  collectionMode: "failures-only";
+  statsScope: "latest-200-failures-within-24h";
+  sampleLimit: number;
   attemptStats: RssAttemptStats;
   failureSummary: RssFailureSummary;
 }
@@ -158,13 +163,9 @@ async function fetchWithStrategy(rssUrl: string, strategy: FetchStrategy): Promi
   return fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 60 } });
 }
 
-async function cleanupOldRssAttemptLogs(env: Env): Promise<void> {
-  const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  await env.DB.prepare("DELETE FROM rss_fetch_attempts WHERE created_at < ?").bind(cutoff).run();
-}
-
+// Only failure attempts are persisted; success writes nothing (diagnostics query is failures-only).
 async function recordRssAttempt(env: Env, source: string, strategy: string, outcome: "success" | "failure", status?: number, statusText?: string, error?: string, preview?: string): Promise<void> {
-  await cleanupOldRssAttemptLogs(env);
+  if (outcome === "success") return;
   await env.DB.prepare("INSERT INTO rss_fetch_attempts (source, method, outcome, status, status_text, error, preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
     .bind(source, strategy, outcome, status ?? null, statusText ?? null, error ?? null, preview ?? null, nowIso())
     .run();
@@ -205,12 +206,17 @@ async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; str
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
 }
 
-async function setSyncState(env: Env, key: string, value: string): Promise<void> {
-  await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)").bind(key, value, nowIso()).run();
+function initSyncState(env: Env, key: string, value: string, updatedAt: string): D1PreparedStatement {
+  return env.DB.prepare("INSERT INTO sync_state (key, value, updated_at) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM sync_state WHERE key = ?) ON CONFLICT(key) DO NOTHING").bind(key, value, updatedAt, key);
 }
 
 async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Promise<void> {
-  await setSyncState(env, "last_cron_timing", JSON.stringify(snapshot));
+  const updatedAt = nowIso();
+  const value = JSON.stringify(snapshot);
+  await env.DB.batch([
+    initSyncState(env, "last_cron_timing", value, updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_cron_timing'").bind(value, updatedAt)
+  ]);
 }
 
 interface RssSyncTiming {
@@ -268,7 +274,13 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   const insertedPosts: RssNewPost[] = [];
   const insertStartedAt = Date.now();
   const prepareInsertStartedAt = Date.now();
-  const guids = items.map((item) => item.guid).filter((guid) => !!guid);
+  const seenGuids = new Set<string>();
+  const uniqueItems = items.filter((item) => {
+    if (seenGuids.has(item.guid)) return false;
+    seenGuids.add(item.guid);
+    return true;
+  });
+  const guids = uniqueItems.map((item) => item.guid);
   const existingGuids = new Set<string>();
   for (let offset = 0; offset < guids.length; offset += 100) {
     const guidChunk = guids.slice(offset, offset + 100);
@@ -276,7 +288,7 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
     const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...guidChunk));
     for (const row of rows) existingGuids.add(row.guid);
   }
-  const insertRows = items.filter((item) => item.guid && !existingGuids.has(item.guid)).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
+  const insertRows = uniqueItems.filter((item) => !existingGuids.has(item.guid)).map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
   const prepareInsertMs = Date.now() - prepareInsertStartedAt;
   let insertBindRunMs = 0;
   let insertNewCount = 0;
@@ -316,7 +328,16 @@ export async function syncRss(env: Env): Promise<RssSyncResult> {
   }
   const insertLoopMs = Date.now() - insertStartedAt;
   const writeStateStartedAt = Date.now();
-  await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('first_sync_done', '1', ?), ('last_sync_at', ?, ?), ('last_sync_error', '', ?), ('last_sync_strategy', ?, ?)").bind(nowIso(), nowIso(), nowIso(), nowIso(), strategy, nowIso()).run();
+  const updatedAt = nowIso();
+  await env.DB.batch([
+    initSyncState(env, "first_sync_done", "1", updatedAt),
+    initSyncState(env, "last_sync_at", updatedAt, updatedAt),
+    initSyncState(env, "last_sync_error", "", updatedAt),
+    initSyncState(env, "last_sync_strategy", strategy, updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_at'").bind(updatedAt, updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = '', updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ''").bind(updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_strategy' AND value IS NOT ?").bind(strategy, updatedAt, strategy)
+  ]);
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
   const insertPostsMs = insertLoopMs;
   insertBindRunMs = Date.now() - batchStartedAt;
@@ -330,8 +351,13 @@ export async function safeSyncRss(env: Env): Promise<SafeRssSyncResult> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("RSS sync failed", message);
-    await setSyncState(env, "last_sync_error", message);
-    await setSyncState(env, "last_sync_at", nowIso());
+    const updatedAt = nowIso();
+    await env.DB.batch([
+      initSyncState(env, "last_sync_error", message, updatedAt),
+      initSyncState(env, "last_sync_at", updatedAt, updatedAt),
+      env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ?").bind(message, updatedAt, message),
+      env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_at'").bind(updatedAt, updatedAt)
+    ]);
     return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
   }
 }
@@ -361,10 +387,11 @@ export async function testRssFetch(env: Env): Promise<RssFetchTestResult[]> {
   return results;
 }
 
+const attemptSampleLimit = 200;
+
 export async function getRssAttemptDiagnostics(env: Env): Promise<RssAttemptDiagnostics> {
-  await cleanupOldRssAttemptLogs(env);
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const rows = await all<RssAttemptLogRow>(env.DB.prepare("SELECT created_at, source, method, outcome, status, status_text, error, preview FROM rss_fetch_attempts WHERE created_at >= ? ORDER BY created_at DESC LIMIT 200").bind(since));
+  const rows = await all<RssAttemptLogRow>(env.DB.prepare(`SELECT created_at, source, method, outcome, status, status_text, error, preview FROM rss_fetch_attempts WHERE created_at >= ? AND outcome = 'failure' ORDER BY created_at DESC LIMIT ${attemptSampleLimit}`).bind(since));
   const bySource: Record<string, number> = {};
   const byResult: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
@@ -385,6 +412,9 @@ export async function getRssAttemptDiagnostics(env: Env): Promise<RssAttemptDiag
     }
   }
   return {
+    collectionMode: "failures-only",
+    statsScope: "latest-200-failures-within-24h",
+    sampleLimit: attemptSampleLimit,
     attemptStats,
     failureSummary: {
       windowHours: 24,
