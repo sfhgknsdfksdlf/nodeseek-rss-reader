@@ -27,9 +27,13 @@ function pushKey(userId: number, subscriptionId: number, postGuid: string, chann
   return `${userId}:${subscriptionId}:${postGuid}:${channel}`;
 }
 
-export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promise<SubscriptionProcessTimings> {
+/**
+ * Match subscriptions against only the posts inserted by the current sync.
+ * Callers must pass syncRss's `insertedPosts`, never RSS items or database rows.
+ */
+export async function processSubscriptions(env: Env, insertedPosts: RssNewPost[]): Promise<SubscriptionProcessTimings> {
   const startedAt = Date.now();
-  if (!posts.length) return { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
+  if (!insertedPosts.length) return { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
   const loadSubsStartedAt = Date.now();
   const subs = await all<SubscriptionWithUser>(env.DB.prepare(`
     SELECT s.*, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code, u.telegram_bind_code_expires_at
@@ -40,7 +44,7 @@ export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promi
   const loadSubsMs = Date.now() - loadSubsStartedAt;
   if (!subs.length) return { loadSubsMs, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
   const loadSentStartedAt = Date.now();
-  const postGuids = posts.map((post) => post.guid);
+  const postGuids = insertedPosts.map((post) => post.guid);
   const logRows: { user_id: number; subscription_id: number; post_guid: string; channel: string }[] = [];
   for (let offset = 0; offset < postGuids.length; offset += 100) {
     const guidChunk = postGuids.slice(offset, offset + 100);
@@ -61,13 +65,13 @@ export async function processSubscriptions(env: Env, posts: RssNewPost[]): Promi
   if (!compiledSubs.length) return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
   const buildPostTextsStartedAt = Date.now();
   const settings = await runtimeSettings(env);
-  const postTexts = new Map(posts.map((post) => [post.guid, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
+  const postTexts = new Map(insertedPosts.map((post) => [post.guid, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
   const buildPostTextsMs = Date.now() - buildPostTextsStartedAt;
   const matchStartedAt = Date.now();
   let sendMs = 0;
   for (const { sub, segments } of compiledSubs) {
     const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code, telegram_bind_code_expires_at: sub.telegram_bind_code_expires_at };
-    for (const post of posts) {
+    for (const post of insertedPosts) {
       if (!matchChainedRule(segments, postTexts.get(post.guid) || "")) continue;
       if (sub.send_email && !sent.has(pushKey(user.id, sub.id, post.guid, "email"))) {
         const sendStartedAt = Date.now();

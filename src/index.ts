@@ -208,7 +208,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
     home: lastHomeTiming,
     cronTiming: lastCronTiming,
     searchIndex: { building: searchIndexState?.complete !== 1, lastError: sync.last_search_index_error?.value || "" },
-    rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
+    rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, collectionMode: rssDiagnostics.collectionMode, statsScope: rssDiagnostics.statsScope, sampleLimit: rssDiagnostics.sampleLimit, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
 }
 
