@@ -32,7 +32,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 | Symbol/module | Location | Role |
 |---|---|---|
-| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration (sync → subscriptions → cleanup → search-index backfill), debug status, static `/go` interstitial shell |
+| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, cron orchestration (capacity prune → sync → subscriptions → cleanup → search-index backfill), debug status, static `/go` interstitial shell |
 | RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, diagnostics |
 | Home query | `src/posts.ts` | Page/board query, literal-keyword FTS5 search (title+body), pagination, read state |
 | SSR shell/client script | `src/render.ts` | HTML rendering, search-term marking + local search pager, browser interactions |
@@ -44,6 +44,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | Subscriptions | `src/subscriptions.ts` | Chained AND matching and notification dispatch |
 | Notification senders | `src/notifications.ts` | Brevo/Telegram requests and GUID push logs |
 | D1 cleanup | `src/cleanup.ts` | Retention for posts, reads, logs, user+admin sessions; deletes expired posts' FTS index rows before deleting the posts |
+| D1 capacity prune | `src/prune.ts` | Size probe (`SELECT 1` + `meta.size_after`), normal FTS batch, full-DB posts-first fallback, FTS orphan cursors, plan-aware trigger/max, never throws |
 | Shared helpers | `src/db.ts` | D1 `one`/`all` helpers, JSON responses, body parsing, cookie/session-cookie builders |
 | HTML/regex + chained-rule core | `src/filters.ts` | Escaping, `safeHttpUrl`, `safeRegex` + ReDoS-hazard guard, chained-rule core (`parseChainedRule`/`compileChainedRule`/`matchChainedRule`/`extractChainedRuleMatches`), `sanitizePostHtml` whitelist sanitizer, post text builders |
 | Board helpers | `src/board.ts` | Board name normalization and option lists for render |
@@ -56,8 +57,9 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | Task | Location | Notes |
 |---|---|---|
 | RSS/cron latency | `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts` | Inspect `/api/debug/status`; preserve structured timings |
+| D1 容量/满库 | `src/prune.ts`, `src/index.ts`, `src/settings.ts` | Cron prunes before sync; check `storage` and `sync_state.db_prune_*`; normal batch, wall posts-first fallback, FTS orphan cursors; no PRAGMA/REST |
 | Homepage latency | `src/posts.ts`, `src/render.ts` | Preserve page size and scan behavior |
-| Search latency/index gaps | `src/search.ts`, `src/posts.ts` | Check `search_index_state.complete` and `sync_state.last_search_index_error`; cron backfill ≤20 posts/min, resumable |
+| Search latency/index gaps | `src/search.ts`, `src/posts.ts` | Check `search_index_state.complete` and `sync_state.last_search_index_error`; cron backfill ≤25 posts/min, resumable |
 | Notification dedupe | `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0009*.sql`, `migrations/0010*.sql` | Use `post_guid`, never `post_id` |
 | Admin/debug routes | `src/index.ts`, `src/settings.ts` | Admin auth is the URL-query token model (`/admin?token=ADMIN_SECRET`, owner-approved); comparison must stay constant-time (`secretTokensEqual`) |
 | User rule handoff | `src/rules.ts`, `src/render.ts` | Payload/version/cache keys stay user-scoped |
@@ -78,8 +80,11 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 ## CONVENTIONS
 
 - TypeScript is strict/no-emit; target Workers and Web APIs, not Node-only APIs.
+- **CPU hard limit (MUST):** Workers Free allows **10 ms CPU per HTTP request and 10 ms CPU per Cron Trigger**; network waits (RSS 21–24 s sleeps, `fetch`, D1 queries) do not count toward CPU, but Cron wall-clock is capped at 15 min. Every change MUST consider CPU usage: no unbounded loops or full-table scans, no full FTS rebuilds, keep regex/JSON/HTML and per-post work bounded, and check `home.timings`, `sync_state.last_cron_timing`, or Workers Logs before merging. Exceeding CPU terminates the invocation (Error 1102) and can break cron recovery. Source: https://developers.cloudflare.com/workers/platform/limits/
+- **D1 free-tier read/write quotas (MUST):** D1 Free allows **5,000,000 rows read/day and 100,000 rows written/day per account** (resets 00:00 UTC), **50 queries per Worker invocation**, **500 MB per database / 5 GB per account**, and **10 databases**. Rows read counts every row **scanned**, not just returned (`SELECT COUNT(*)` over 340k posts = 340k rows; 34 debug calls = 11.59M rows and exhausted the daily quota). Rows written counts every `INSERT`/`UPDATE`/`DELETE` row; indexes add writes. Every change MUST consider D1 read/write usage: no new full-table scans/counts on hot paths or monitoring endpoints, no full reindex/import loops, batch and paginate writes, keep diagnostics bounded, and check D1 Row Metrics or `meta.rows_read`/`rows_written` before merging. Exceeding the daily quota makes all queries fail until 00:00 UTC. Source: https://developers.cloudflare.com/d1/platform/limits/ · https://developers.cloudflare.com/d1/platform/pricing/
 - Package is ESM (`"type": "module"`); tsconfig `include` is `src/**/*.ts` only. `wrangler.local-qa.jsonc` intentionally omits the production cron trigger and observability blocks (local QA only).
 - D1 owns all persistent state. Do not add KV, Durable Objects, R2, or another store without an explicit request.
+- D1 capacity pruning (see APPROVED DESIGN「D1 容量自动裁剪」) runs before RSS sync and must stay non-blocking: only posts whose `published_at` AND `fetched_at` are both older than 24h are eligible, deleted oldest-first (`published_at ASC, id ASC`); the normal path deletes `read_states`, both FTS tables, and `posts` in one `env.DB.batch()`, while the full-DB fallback deletes single-statement `read_states` then `posts` and leaves FTS orphans for the cursor cleanup; the 20,000/UTC-day cap is an atomic conditional reservation before each 100-post batch; defaults are free 480 MB / paid 9850 MB trigger with 30 MB hysteresis, and new posts are capped at 5 only above plan max capacity - 2 MB. Size comes only from `SELECT 1` + `meta.size_after`: never `PRAGMA page_count`/`dbstat`, the Cloudflare REST API/token, or `VACUUM`. The legacy `post_retention_days` (365) stays as a background backstop, is not exposed in the admin page, and every admin setting is preserve-on-omit: a PUT only writes the fields it provides, so an omitted field keeps its stored value.
 - RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
 - Post cards open the source URL through the root-relative `/go?v=2#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
@@ -117,16 +122,18 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - `0008_posts_keyset_indexes` supports `(published_at DESC, id DESC)` and `(board_key, published_at DESC, id DESC)` scans.
 - Push logs retain GUIDs independently of post retention; do not add an FK from `post_guid` to `posts.guid`.
 - `cleanupOldData` purges expired `admin_sessions`, user `sessions`, and 24h-expired `rss_fetch_attempts` daily (gated by `sync_state.last_cleanup_at`).
+- D1 capacity pruning reuses `app_settings`/`sync_state`. Settings: `db_prune_limit_mb` (free default 480 / paid 9850, clamp 100..9850), `d1_paid_enabled` (default false). State: `db_prune_active`, `db_prune_day`, `db_prune_deleted_today`, `db_prune_last_at`, `db_prune_last_error`, `db_prune_blocked_full`, `db_prune_fts_trigram_cursor`, `db_prune_fts_bigram_cursor`. Legacy `db_prune_limit_mb` value `"450"` is decoded as 480 at read time (no migration); an admin explicitly saving 450 stores `"450.0"` and stays 450. An empty/no-op migration still needs a ledger write, so it cannot unblock a full database: deploy first with no pending migrations, then the cron frees space.
 - `ADMIN_SECRET` secures admin settings and encrypted Brevo/Telegram values. PBKDF2 iterations must remain `<= 100000`.
 
 ## RUNTIME AND HOTSPOTS
 
 - Scheduled sync waits 21..24s before RSS and before browser fallback after failure. `/api/rss-test` is the no-sleep diagnostic path.
+- Cron order is capacity prune → RSS sync → subscriptions → cleanup → FTS orphan maintenance → search-index backfill. Prune trigger defaults free 480 MB / paid 9850 MB, target = trigger - 30 MB; normal path is the 4-statement batch, full-DB path is single-statement `read_states` then `posts` with FTS rows left as orphans. FTS orphan cursors process ≤25 rows per table per invocation only below the trigger and when not blocked. `SEARCH_BACKFILL_BATCH=25`; sync caps new posts at 5 only when size > plan max capacity - 2 MB, never 0. Free plan hard limits are 10 ms CPU per HTTP request and per Cron Trigger, 50 D1 queries and 50 subrequests per invocation, 100,000 requests/day, and D1's 5,000,000 rows read/day plus 100,000 rows written/day (00:00 UTC reset), 500 MB per database / 5 GB per account; keep prune, cleanup, sync, and diagnostics within that budget, and remember wall-clock waits (21–24 s sleeps, fetch/D1) do not count as CPU. Rows read counts scanned rows, so no full-table COUNT in hot paths or monitors. Failures land in `sync_state.db_prune_last_error`/`db_prune_blocked_full` and never block sync.
 - `src/rss.ts` uses `cf.cacheTtl = 60`; preserve attempt diagnostics because upstream often returns 503.
 - `/api/debug/status?token=ADMIN_SECRET` is non-live unless `live=1`; `safeSyncRss()` records cron failure in `sync_state.last_sync_error`.
 - `sync_state` fixed-key write contract (`first_sync_done`, `last_sync_at`, `last_sync_error`, `last_sync_strategy`, `last_cron_timing`, `last_cleanup_at`): missing keys are initialized with guarded `INSERT ... SELECT ... WHERE NOT EXISTS ... ON CONFLICT(key) DO NOTHING`, then updated with conditional `UPDATE ... WHERE value IS NOT ?`; each success path and each failure path runs as one D1 batch. Strategy/error updates fire only on value change, so a stable cron no longer rewrites state every minute. Conditions are evaluated in-DB: with overlapping syncs the later-committing batch wins (success clears the current error, failure keeps it), and there are deliberately no locks or versioning. `last_home_timing` and all search-state writes are outside this contract and unchanged.
 - Worker search matches only `title` and `content_text` via the FTS5 index (see APPROVED DESIGN「索引关键词搜索」); browser rules use the synced payload. Ordinary listings apply block rules in the browser, search results skip block rules, and highlights + literal search-term marking render in the browser. In `src/posts.ts`, ordinary listings scan only until the requested page fills; defer `content_html` until final IDs are known.
-- Search index lifecycle: new posts index on insert (failure records `last_search_index_error` and flags retry), cron backfills ≤20 posts/min until `search_index_state.complete = 1`; expired-post cleanup deletes FTS rows in 100-id chunks before deleting the posts. Search timings live in `home.timings.queryPosts` (`searchParseMs`/`searchQueryMs`).
+- Search index lifecycle: new posts index on insert (failure records `last_search_index_error` and flags retry), cron backfills ≤25 posts/min until `search_index_state.complete = 1`; expired-post cleanup deletes FTS rows in 100-id chunks before deleting the posts. Search timings live in `home.timings.queryPosts` (`searchParseMs`/`searchQueryMs`).
 - Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
 - Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
 - Subscriptions match ONLY the posts actually inserted by this sync (`insertedPosts` = the `INSERT OR IGNORE` results with truthy `meta.changes`): feed-internal GUID dedupe keeps the first occurrence per GUID, already-present GUIDs and `changes=0` conflicts never match, and the scheduler gate stays `result.ok && !result.firstSync` — the first success (including first-fail-then-success) only imports, never notifies. Matching consumes the in-memory `insertedPosts` array; it never re-queries D1 for "new" posts. `INSERT OR IGNORE` + the `posts.guid` unique constraint remain the final defense against duplicates.
@@ -138,7 +145,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - Header brand links to `/`; do not add a second homepage button.
 - Keep post cards to title, body, username, board, and time; username and time clicks each copy and show a one-line toast (time button keeps `<time datetime="ISO8601">` inside for machine-readable semantics).
 - Settings tabs stay one row; destructive operations require confirmation.
-- Admin is standalone `/admin?token=ADMIN_SECRET`, not a settings tab.
+- Admin is standalone `/admin?token=ADMIN_SECRET`, not a settings tab. The admin settings form exposes 「数据库自动清理触发阈值（MB）」(`dbPruneLimitMb`, free default 480 / paid 9850, input range 100..9850, server-clamped) and a 「付费版 D1」 toggle (`d1PaidEnabled`, default off, max 500 MB vs 10 GB). The legacy 365-day `post_retention_days` is a non-exposed background backstop, and all admin settings are preserve-on-omit: a PUT only writes the fields it provides, so an omitted field keeps its stored value.
 - Floating jump control is a single directional button `#ndJumpBtn` inside `nd-jump-group`/`nd-jump-item` (owner-approved 2026-09-09): style/size identical to the old top/bottom pair; last scroll movement decides the target — scrolling down shows 到底部, scrolling up shows 到顶部 (passive listener, 4px jitter gate); within 100px of the top it locks to 到底部 and within 100px of the bottom to 到顶部 (`ndNear=100`, owner refinement 2026-09-09 — the lock triggers near, not exactly at, the extremes; the middle region keeps direction-following); position is the old 置顶 spot (`bottom:254px` desktop, `bottom:250px` ≤520px).
 - Desktop jump-button alignment: `right:max(20px,calc(50% - 530px))` keeps the button 8px off the card column's right edge on wide viewports (fixed-element percentages resolve scrollbar-free, same frame as `.wrap` centering; `522` was the original flush-touch formula, an 8px gap was added the same day); the 20px/12px floors auto-fall back to window-edge margins when the outside margin cannot fit the button. Mobile keeps `right:max(12px,calc(50% - 522px))` (effectively 12px).
 - Mobile ≤520px header auth buttons are slightly smaller: `.auth button{padding:.34rem .5rem;font-size:14px}` (设置/退出, and consistently 登录/注册; owner-approved 2026-09-09).
@@ -260,7 +267,7 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 - 订阅：`GET|POST /api/subscriptions`、`POST /api/subscriptions/clear`、`DELETE /api/subscriptions/:id`。
 - 导出：`GET /api/export/highlights|blocks|subscriptions`。
 - 导入：`POST /api/import/highlights|blocks|subscriptions`。
-- 诊断：`GET /api/rss-test`、`GET /api/debug/status?token=ADMIN_SECRET`（非 `live=1` 不做实抓）；debug 另含 `searchIndex.building`/`searchIndex.lastError`（索引构建状态与最近错误）。
+- 诊断：`GET /api/rss-test`、`GET /api/debug/status?token=ADMIN_SECRET`（非 `live=1` 不做实抓）；debug 另含 `searchIndex.building`/`searchIndex.lastError`（索引构建状态与最近错误）、`storage`（`sizeBytes`/`limitBytes`/`targetBytes`/`active`/`deletedToday`/`lastPruneAt`/`lastPruneError`）与 `timings.storageMs`。
 - 管理：`GET|PUT /api/admin/settings`、`GET /api/admin/users`、`DELETE /api/admin/users/:id`。
 - 卡片经根相对 `/go?v=2#p=<id>&u=<原帖链接>` 中转外壳在新标签打开原帖，已读回执走 `POST /api/read-state`（2026-09-06 owner 批准；外壳纯客户端，服务端不做重定向，见「后台打开标红 /go 中转」）。
 
@@ -324,9 +331,9 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 
 管理员用单一 Secret `ADMIN_SECRET` 认证（2026-09-06 修订：无服务端管理会话）：`/admin` 页面与每个 `/api/admin/*` 请求都直接校验 token（URL `?token=` 或 `x-admin-token` 头），`secretTokensEqual` 常量时间比较；管理页 JS 内嵌 token 调 API，UI 须提示收藏完整管理 URL。`admin_sessions` 表为遗留，运行时不再写入，仅每日清理过期行。
 
-`ADMIN_SECRET` 同时派生 AES-GCM 密钥用于加密 D1 设置。Brevo API Key 与 Telegram Bot Token 加密存于 `app_settings`；发件邮箱、发件人名、保留天数、`page_size`、`search_result_limit` 明文存储。运行时通知代码先读 D1 设置，再回退环境变量。
+`ADMIN_SECRET` 同时派生 AES-GCM 密钥用于加密 D1 设置。Brevo API Key 与 Telegram Bot Token 加密存于 `app_settings`；发件邮箱、发件人名、保留天数、`db_prune_limit_mb`、`page_size`、`search_result_limit` 明文存储。运行时通知代码先读 D1 设置，再回退环境变量。
 
-默认保留：已读状态 7 天；RSS 帖子 365 天；推送日志 30 天。每页数量默认 80（钳制 10..500）；搜索结果上限默认 200（钳制 50..500）。计划任务经 `sync_state.last_cleanup_at` 闸门每天至多执行一次清理。
+默认保留：已读状态 7 天；推送日志 30 天。`post_retention_days` 默认 365 天，保留为后台兜底、不在管理员页暴露；管理员页可配的是「数据库自动清理触发阈值（MB）」（`db_prune_limit_mb`），免费默认 480、付费默认 9850（9.85G），钳制 100..9850，清理目标为阈值以下 30MB。管理员页另有「付费版 D1」开关（默认关闭）：免费最大容量 500MB，付费 10GB；超过套餐最大容量 2MB 时新帖每轮最多写入 5 条。每页数量默认 80（钳制 10..500）；搜索结果上限默认 200（钳制 50..500）。计划任务经 `sync_state.last_cleanup_at` 闸门每天至多执行一次清理。
 
 ### D1 分页与浏览器端规则优化设计（原 DESIGN_D1_PAGINATION.md 全文并入）
 
@@ -406,8 +413,45 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 - `0012` 三对象：`posts_search_trigram`（`tokenize='trigram'`、`content=''`、`contentless_delete=1`、rowid=posts.id）、`posts_search_bigrams`（同 contentless，`tok` 为定长十六进制相邻码点 bigram 空格串）、`search_index_state`（id=1 单行：last_post_id/complete/updated_at）。
 - 核心在 `src/search.ts`（`parseSearchQuery`/`ftsPhrase`/`indexPostForSearch`/`backfillSearchIndexes`）；FTS 短语一律绑定参数，绝不拼接 SQL（`ftsPhrase` 负责双引号转义）。
 - 新帖：`syncRss` 插入成功后立即索引（四语句批：删旧两行 + 插新两行）；失败非致命——记 `sync_state.last_search_index_error`（≤500 字符）并置 `complete=0` 等待重试。
-- 回填：cron 经 `ctx.waitUntil(backfillSearchIndexes)`，每分钟 ≤20 帖（`SEARCH_BACKFILL_BATCH=20`），按 id 断点续跑，断点状态与索引语句同一 D1 batch 原子更新；无剩余时置 `complete=1`。构建未完成时搜索仅覆盖已索引帖子，页面显示「历史搜索索引仍在构建中」。
+- 回填：cron 经 `ctx.waitUntil(backfillSearchIndexes)`，每分钟 ≤25 帖（`SEARCH_BACKFILL_BATCH=25`），按 id 断点续跑，断点状态与索引语句同一 D1 batch 原子更新；无剩余时置 `complete=1`。构建未完成时搜索仅覆盖已索引帖子，页面显示「历史搜索索引仍在构建中」。
 - 清理：`cleanup.ts` 删过期帖前按 100 id 一批先删两 FTS 表对应行，再删 posts。
 - 诊断：`/api/debug/status` 增加 `searchIndex.building`（`complete!==1` 即 true）与 `searchIndex.lastError`；搜索计时 `searchParseMs`/`searchQueryMs` 记入 `home.timings.queryPosts`（原 `searchRegexCompileMs`/`searchMatchMs`/`scanMs` 等字段已移除）。
 
 **排除项**：不新增路由/依赖/存储；普通列表 pager（`page=N` 链接）不变；已读、`/go` 中转、规则契约不变。
+
+### D1 容量自动裁剪（2026-11-20 owner 批准；2026-11-21 修订）
+
+**需求**：免费版 D1 单库上限 500MB。管理员可设置「付费版 D1」开关（默认关闭）；免费最大容量 500MB，付费 10GB。数据库达到「数据库自动清理触发阈值」后自动删除最旧帖子，清理到阈值以下 30MB；每天最多删除 20,000 条；免费默认触发 480MB，付费默认 9850MB（9.85G）。
+
+- 触发阈值可在管理员页调整，clamp 100..9850；未显式保存时按当前套餐默认（免费 480 / 付费 9850）。
+- 历史显式 `"450"` 在读取时按 480 生效（无需迁移）；管理员重新保存 450 会写入 `"450.0"`，仍按 450 生效；缺省 key 直接使用套餐默认。空迁移也要写入迁移台账，因此无法用于解除满库阻塞：先在不带待应用迁移的情况下部署，再由 cron 自动腾出空间。
+- 5 帖限流：`size > 套餐最大容量 - 2MB`（免费 498MB，付费 9998MB）时，每次同步最多写入 5 条新帖；否则按原 feed 窗口（当前 20 条）。绝不设 0，也不设 420-450 档。
+
+**大小探测**：cron 每次执行 `SELECT 1` 并读取 `D1Result.meta.size_after`（字节）；不使用 `PRAGMA page_count`/`dbstat`（D1 白名单外），也不调用 Cloudflare REST API/Token；缺失或非有限数时跳过本轮。
+
+**正常路径**：四语句 `env.DB.batch()`（`read_states` → `posts_search_trigram` → `posts_search_bigrams` → `posts`），按 `published_at ASC, id ASC`，24h 双护栏，每轮最多 5 批/500 帖，每天最多 20,000 帖；计数只按 `posts` 的实际 `meta.changes` 结算。
+
+**满库路径**：batch 因 `Exceeded maximum DB size` 回滚时，不再重跑含 FTS 的 batch；对同一批 ID 用单语句先 `read_states`、再 `posts` 释放正文空间，FTS 行暂留孤儿。`read_states` 删除失败只记录错误、不阻止后续 `posts` 删除。只有 `Exceeded maximum DB size` 的 100 行单语句 `posts` 删除失败才进入 1 行降级；非容量错误全额退款并向上抛出，不降级。降级时对同批前 10 个 ID 逐条重试（每个 ID 最多 `read_states` + `posts` 两条语句，共 ≤20 条删除），`changes === 1` 计入确认删除、`changes === 0` 计入可退款，缺失或非数字 `changes` 视为未确认并停止后续尝试，`posts` 抛错即记录首个错误并停止，该 ID 与所有未尝试 ID 保持预留；只对确认未删退款，退款失败只记日志且不覆盖原始满库错误；无论成功几条都设置 `db_prune_blocked_full=1` 并立即结束本轮。100 行删除返回数字（含 37/100 或 0 的部分删除）时不降级，按已知数量退款。无法确认的删除保留保守计数并设置 `db_prune_blocked_full=1`。下一 UTC 日重置；状态键初始化因容量错误失败时，先做一次最多 100 个候选的两步删除再重试初始化；同日重试时引导删除不超过当天剩余额度，余额为零则只重试初始化、不再删除。引导删除一律计入 `deletedThisRun`；若配额结算或状态持久化失败，按实际删除数 best-effort 落库并设置 `db_prune_blocked_full=1`。`blocked_full=1` 不再暂停容量裁剪：`size >= 触发阈值` 时下一分钟照常重试初始化、候选查询与删除（保留原 `last_error` 作为基础诊断），该标记只作为诊断与 FTS 孤儿清理的闸门；仅当 `size < 触发阈值` 时清除。
+
+**FTS 孤儿清理**：不 DROP 表、不建 JSON 队列。游标键 `db_prune_fts_trigram_cursor`、`db_prune_fts_bigram_cursor`；每张表每轮 `rowid > cursor LIMIT 25`，只删除 `rowid NOT IN (SELECT id FROM posts WHERE id IN (...))` 的行；游标到末尾归零。仅当 `sizeBytes < 触发阈值` 且未 `blocked_full` 时运行，放在 cron `waitUntil`，在同步/清理之后、搜索回填之前；搜索内连接 `posts`，孤儿不显示。
+
+**计数**：`db_prune_deleted_today` 只按实际 `posts` changes 结算；`"1100.0"` 规范为 `"1100"` 并视为已用；不按 postCount 差值退款；正常失败不扣费，只有独立预留允许保守多记。
+
+**回填**：`SEARCH_BACKFILL_BATCH=25`，只用于历史回填（读 posts → 生成索引 → 写回 FTS + `search_index_state`），不接 `syncRss` 新帖。
+
+**执行顺序**：`scheduled` 先裁剪；裁剪后若 `size > 套餐最大容量 - 2MB` 则 `maxNewPosts=5` 传给 `safeSyncRss`；订阅/清理后，只有在 `!active` 或 `deletedThisRun=0` 时清理 FTS 孤儿，`!active` 时回填；首页 timing 写入有独立 catch。
+
+**预算**：免费 50 queries/invocation；正常裁剪约 25；满库单语句 100 行；1 行降级最多 10 ID/轮；不做全量 FTS 重建。
+
+**状态键**：`db_prune_active`、`db_prune_day`、`db_prune_deleted_today`、`db_prune_last_at`、`db_prune_last_error`、`db_prune_blocked_full`、`db_prune_fts_trigram_cursor`、`db_prune_fts_bigram_cursor`；设置键 `db_prune_limit_mb`、`d1_paid_enabled`。
+
+**诊断**：`/api/debug/status` 的 `storage` 增加 `paidPlan`、`maxCapacityBytes`、`fivePostThresholdBytes`、`blockedFull`；保留 `sizeBytes`、`limitBytes`、`targetBytes`、`active`、`deletedToday`、`lastPruneAt`、`lastPruneError`。
+
+**配置/迁移**：`app_settings.db_prune_limit_mb`（free 默认 480 / paid 默认 9850，clamp 100..9850）、`app_settings.d1_paid_enabled`（默认 false）；历史显式 `"450"` 读取时按 480 生效，管理员显式保存 450 存为 `"450.0"` 并保持 450；不改 schema。
+
+**排除项**：不 DROP/重建 FTS、不新增 JSON 孤儿队列/存储/依赖/路由、不使用 PRAGMA/REST/VACUUM、不改 365 天年龄清理逻辑；年龄清理仍按 `post_retention_days`（默认 365）每日执行，与容量裁剪互不替代。
+
+**参考实现**：
+- `cloudflare_temp_email`：`SELECT 1` 读 `meta.size_after` 与按时间/批量清理：https://github.com/dreamhunter2333/cloudflare_temp_email/blob/main/worker/src/admin_api/db_api.ts#L270-L276
+- `codegraph` telemetry-worker：按保留期有界批量清理，README 记录满库后删除/读取仍可用：https://github.com/colbymchenry/codegraph/blob/main/telemetry-worker/src/rollup.ts#L390-L404
+- Cloudflare D1 limits/batch/return metadata 与 SQLite FTS5 `contentless_delete` 文档（见上文实现说明）。

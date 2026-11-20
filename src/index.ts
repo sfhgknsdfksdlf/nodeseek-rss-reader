@@ -1,6 +1,7 @@
 import { accountInfo, currentUser, login, logout, newTelegramBindCode, register, updateEmail, updateTelegram } from "./auth";
 import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
+import { D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, cleanupFtsOrphans, decideMaxNewPosts, pruneOldPostsBySize, pruneThresholds, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readPruneState } from "./prune";
 import { queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { backfillSearchIndexes, recordSearchIndexError } from "./search";
@@ -170,7 +171,6 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const tableNames = new Set(tableRows.map((row) => row.name));
   const syncRows = await measure("syncStateMs", async () => all<{ key: string; value: string; updated_at: string }>(env.DB.prepare("SELECT key, value, updated_at FROM sync_state ORDER BY updated_at DESC")));
   const sync = Object.fromEntries(syncRows.map((row) => [row.key, { value: row.value, updatedAt: row.updated_at }]));
-  const postCount = await measure("postCountMs", async () => (await env.DB.prepare("SELECT COUNT(*) AS count FROM posts").first<{ count: number }>())?.count || 0);
   const latestPost = await measure("latestPostMs", async () => env.DB.prepare("SELECT guid, title, link, published_at, fetched_at FROM posts ORDER BY published_at DESC LIMIT 1").first<{ guid: string; title: string; link: string; published_at: string; fetched_at: string }>());
   const rssResults = live ? await measure("rssTestMs", async () => testRssFetch(env)) : [];
   const rssDiagnostics = await measure("rssDiagnosticsMs", async () => getRssAttemptDiagnostics(env));
@@ -178,6 +178,16 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   const lastCronTiming = await measure("cronTimingMs", async () => getLastCronTiming(env));
   // Cheap point-read only: building/lastError summary, never counts or cursors.
   const searchIndexState = await measure("searchIndexMs", async () => env.DB.prepare("SELECT complete FROM search_index_state WHERE id = 1").first<{ complete: number }>());
+  const storage = await measure("storageMs", async () => {
+    const paidPlan = await readD1PaidEnabled(env);
+    const sizeBytes = await readDatabaseSizeBytes(env);
+    const limitMb = await readDbPruneLimitMb(env, paidPlan);
+    const { limitBytes, targetBytes } = pruneThresholds(limitMb);
+    const maxCapacityBytes = (paidPlan ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB) * 1_000_000;
+    const fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
+    const pruneState = await readPruneState(env);
+    return { sizeBytes, limitBytes, targetBytes, active: pruneState.active, deletedToday: pruneState.deletedToday, lastPruneAt: pruneState.lastAt || null, lastPruneError: pruneState.lastError || null, paidPlan, maxCapacityBytes, fivePostThresholdBytes, blockedFull: pruneState.blockedFull };
+  });
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
   if (latestRss?.latestGuid && latestPost?.guid) {
@@ -194,7 +204,6 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
     worker: { dbBinding: !!env.DB, rssUrl: env.RSS_URL || "https://rss.nodeseek.com/", adminSecretConfigured: !!env.ADMIN_SECRET },
     database: {
       tables: { posts: tableNames.has("posts"), users: tableNames.has("users"), sync_state: tableNames.has("sync_state"), app_settings: tableNames.has("app_settings") },
-      postCount,
       latestPost
     },
     sync: {
@@ -208,6 +217,7 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
     home: lastHomeTiming,
     cronTiming: lastCronTiming,
     searchIndex: { building: searchIndexState?.complete !== 1, lastError: sync.last_search_index_error?.value || "" },
+    storage,
     rss: { live, ok: live ? !!latestRss : null, latestItem: latestRss ? { guid: latestRss.latestGuid, title: latestRss.latestTitle, link: latestRss.latestLink, publishedAt: latestRss.latestPublishedAt } : null, itemCount: latestRss?.itemCount || 0, missingFromDb, results: rssResults, collectionMode: rssDiagnostics.collectionMode, statsScope: rssDiagnostics.statsScope, sampleLimit: rssDiagnostics.sampleLimit, attemptStats: rssDiagnostics.attemptStats, failureSummary: rssDiagnostics.failureSummary }
   });
 }
@@ -353,7 +363,7 @@ async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): P
     homeTimings.adminStatusMs = Date.now() - adminStatusStart;
     const response = await renderHome(env, user, pageData, admin, homeTimings, initialRules);
     homeTimings.totalMs = Date.now() - homeStart;
-    ctx.waitUntil(storeLastHomeTiming(env, { path: url.pathname, query: url.searchParams.get("q") || "", board: url.searchParams.get("board") || "", page: pageData.page, user: !!user, postCount: pageData.posts.length, recordedAt: new Date().toISOString(), timings: homeTimings }));
+    ctx.waitUntil(storeLastHomeTiming(env, { path: url.pathname, query: url.searchParams.get("q") || "", board: url.searchParams.get("board") || "", page: pageData.page, user: !!user, postCount: pageData.posts.length, recordedAt: new Date().toISOString(), timings: homeTimings }).catch((error: unknown) => console.error("storeLastHomeTiming failed", error instanceof Error ? error.message : String(error))));
     return response;
   }
   return new Response("Not found", { status: 404 });
@@ -371,8 +381,12 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
+  // Capacity pruning runs before sync so a full database frees space first.
+  // pruneOldPostsBySize never throws; it records failures in sync_state.
   const startedAt = Date.now();
-  const result = await safeSyncRss(env);
+  const prune = await pruneOldPostsBySize(env);
+  const maxNewPosts = decideMaxNewPosts(prune);
+  const result = await safeSyncRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts });
   let subscriptionTimings = { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
   const shouldProcessSubscriptions = result.ok && !result.firstSync;
   if (shouldProcessSubscriptions) {
@@ -402,6 +416,11 @@ export default {
     },
     ...(result.error ? { error: result.error } : {})
   });
-  ctx.waitUntil(backfillSearchIndexes(env).catch((error: unknown) => recordSearchIndexError(env, error)));
+  if (!prune.active || prune.deletedThisRun === 0) {
+    ctx.waitUntil(cleanupFtsOrphans(env).catch((error: unknown) => console.error("cleanupFtsOrphans failed", error instanceof Error ? error.message : String(error))));
+  }
+  if (!prune.active) {
+    ctx.waitUntil(backfillSearchIndexes(env).catch((error: unknown) => recordSearchIndexError(env, error)));
+  }
 }
 };

@@ -3,7 +3,7 @@ import type { Env, Post } from "./types";
 
 export const SEARCH_QUERY_MAX_UNITS = 200;
 export const SEARCH_MAX_TERMS = 10;
-export const SEARCH_BACKFILL_BATCH = 30;
+export const SEARCH_BACKFILL_BATCH = 25;
 export const SEARCH_SHORT_INPUT_MESSAGE = "请至少输入一个两字及以上的关键词";
 
 export type SearchAnchorKind = "trigram" | "bigram";
