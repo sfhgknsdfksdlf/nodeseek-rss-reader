@@ -1,11 +1,49 @@
-import { all, readJson } from "./db";
+import { all, nowIso, one, readJson } from "./db";
 import { compileChainedRule, matchChainedRule } from "./filters";
+import { recordPushLog, sendBrevo, sendTelegram } from "./notifications";
+import { budgetRemaining, consumeQuery } from "./query-budget";
+import type { QueryBudget } from "./query-budget";
 import { validatePatternInput } from "./rule-import";
-import { sendBrevo, sendTelegram } from "./notifications";
 import { runtimeSettings } from "./settings";
+import type { RuntimeSettings } from "./settings";
 import type { Env, RssNewPost, Subscription, User } from "./types";
 
-interface SubscriptionWithUser extends Subscription {
+export const NOTIFICATION_ATTEMPT_LIMIT = 20;
+export const NOTIFICATION_MATCH_UNIT_LIMIT = 500;
+export const NOTIFICATION_POST_PAGE = 20;
+export const NOTIFICATION_SUB_PAGE = 50;
+
+const NOTIFICATION_CURSOR_POST_ID = "notification_cursor_post_id";
+const NOTIFICATION_CURSOR_SUBSCRIPTION_ID = "notification_cursor_subscription_id";
+const NOTIFICATION_CURSOR_CHANNEL = "notification_cursor_channel";
+
+type NotificationChannel = "email" | "telegram";
+const NOTIFICATION_CHANNELS: readonly NotificationChannel[] = ["email", "telegram"];
+
+interface NotificationCursor {
+  postId: number;
+  subscriptionId: number;
+  channel: NotificationChannel | "";
+}
+
+interface NotificationPostRow {
+  id: number;
+  guid: string;
+  title: string;
+  link: string;
+  content_text: string;
+  author: string | null;
+  board_key: string | null;
+}
+
+interface NotificationSubRow {
+  id: number;
+  user_id: number;
+  pattern: string;
+  send_email: number;
+  send_telegram: number;
+  created_at: string;
+  updated_at: string;
   username: string;
   email: string | null;
   telegram_chat_id: string | null;
@@ -13,82 +51,340 @@ interface SubscriptionWithUser extends Subscription {
   telegram_bind_code_expires_at: string | null;
 }
 
-interface SubscriptionProcessTimings {
-  loadSubsMs: number;
-  loadSentMs: number;
-  compileRegexMs: number;
-  buildPostTextsMs: number;
-  matchMs: number;
-  sendMs: number;
-  totalMs: number;
+const COMPILED_RULE_CACHE_LIMIT = 256;
+const compiledRuleCache = new Map<number, { key: string; segments: readonly RegExp[] | null }>();
+
+function compiledSegmentsFor(sub: NotificationSubRow, timings: { compileMs: number }): readonly RegExp[] | null {
+  const key = `${sub.id}:${sub.updated_at}:${sub.pattern}`;
+  const cached = compiledRuleCache.get(sub.id);
+  if (cached && cached.key === key) return cached.segments;
+  const compileStartedAt = Date.now();
+  const compiled = compileChainedRule(sub.pattern);
+  timings.compileMs += Date.now() - compileStartedAt;
+  const segments = compiled.ok ? compiled.segments : null;
+  if (cached) compiledRuleCache.delete(sub.id);
+  compiledRuleCache.set(sub.id, { key, segments });
+  while (compiledRuleCache.size > COMPILED_RULE_CACHE_LIMIT) {
+    const oldest = compiledRuleCache.keys().next();
+    if (oldest.done) break;
+    compiledRuleCache.delete(oldest.value);
+  }
+  return segments;
+}
+
+function parseCursorInteger(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function loadNotificationCursor(env: Env): Promise<NotificationCursor | null> {
+  const row = await one<{ postId: string | null; subscriptionId: string | null; channel: string | null }>(
+    env.DB.prepare(`SELECT
+      (SELECT value FROM sync_state WHERE key = ?) AS postId,
+      (SELECT value FROM sync_state WHERE key = ?) AS subscriptionId,
+      (SELECT value FROM sync_state WHERE key = ?) AS channel`).bind(
+      NOTIFICATION_CURSOR_POST_ID,
+      NOTIFICATION_CURSOR_SUBSCRIPTION_ID,
+      NOTIFICATION_CURSOR_CHANNEL
+    )
+  );
+  if (!row || row.postId === null || row.subscriptionId === null || row.channel === null) return null;
+  const postId = parseCursorInteger(row.postId);
+  const subscriptionId = parseCursorInteger(row.subscriptionId);
+  if (postId === null || subscriptionId === null) return null;
+  if (row.channel !== "" && row.channel !== "email" && row.channel !== "telegram") return null;
+  return { postId, subscriptionId, channel: row.channel };
+}
+
+function cursorUpserts(env: Env, cursor: NotificationCursor): D1PreparedStatement[] {
+  const updatedAt = nowIso();
+  return [
+    [NOTIFICATION_CURSOR_POST_ID, String(cursor.postId)],
+    [NOTIFICATION_CURSOR_SUBSCRIPTION_ID, String(cursor.subscriptionId)],
+    [NOTIFICATION_CURSOR_CHANNEL, cursor.channel]
+  ].map(([key, value]) =>
+    env.DB.prepare("INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(key, value, updatedAt)
+  );
+}
+
+async function persistNotificationCursor(env: Env, cursor: NotificationCursor, budget: QueryBudget): Promise<void> {
+  consumeQuery(budget);
+  await env.DB.batch(cursorUpserts(env, cursor));
+}
+
+export async function initializeNotificationCursor(env: Env): Promise<void> {
+  const row = await one<{ maxPostId: number | null }>(env.DB.prepare("SELECT MAX(id) AS maxPostId FROM posts"));
+  await env.DB.batch(cursorUpserts(env, { postId: row?.maxPostId ?? 0, subscriptionId: 0, channel: "" }));
+}
+
+function notificationPost(row: NotificationPostRow): RssNewPost {
+  return {
+    guid: row.guid,
+    title: row.title,
+    link: row.link,
+    content_html: "",
+    content_text: row.content_text,
+    author: row.author,
+    board_key: row.board_key,
+    published_at: "",
+    fetched_at: ""
+  };
+}
+
+function notificationSubscription(row: NotificationSubRow): Subscription {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    pattern: row.pattern,
+    send_email: row.send_email,
+    send_telegram: row.send_telegram
+  };
+}
+
+function notificationUser(row: NotificationSubRow): User {
+  return {
+    id: row.user_id,
+    username: row.username,
+    email: row.email,
+    telegram_chat_id: row.telegram_chat_id,
+    telegram_bind_code: row.telegram_bind_code,
+    telegram_bind_code_expires_at: row.telegram_bind_code_expires_at
+  };
 }
 
 function pushKey(userId: number, subscriptionId: number, postGuid: string, channel: string): string {
   return `${userId}:${subscriptionId}:${postGuid}:${channel}`;
 }
 
+async function loadPushStatuses(env: Env, posts: NotificationPostRow[]): Promise<Map<string, string>> {
+  const guids = posts.map((post) => post.guid);
+  const placeholders = guids.map(() => "?").join(",");
+  const rows = await all<{ user_id: number; subscription_id: number; post_guid: string; channel: string; status: string }>(
+    env.DB.prepare(`SELECT user_id, subscription_id, post_guid, channel, status FROM push_logs WHERE post_guid IN (${placeholders})`).bind(...guids)
+  );
+  return new Map(rows.map((row) => [pushKey(row.user_id, row.subscription_id, row.post_guid, row.channel), row.status]));
+}
+
 /**
- * Match subscriptions against only the posts inserted by the current sync.
- * Callers must pass syncRss's `insertedPosts`, never RSS items or database rows.
+ * Advance the notification frontier with bounded work: at most
+ * NOTIFICATION_ATTEMPT_LIMIT channel attempts and NOTIFICATION_MATCH_UNIT_LIMIT
+ * regex evaluations per invocation. The persisted cursor is always the exact
+ * next post/subscription/channel triple, so a failure retries that triple on
+ * the next invocation instead of dropping the notification.
  */
-export async function processSubscriptions(env: Env, insertedPosts: RssNewPost[]): Promise<SubscriptionProcessTimings> {
-  const startedAt = Date.now();
-  if (!insertedPosts.length) return { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
-  const loadSubsStartedAt = Date.now();
-  const subs = await all<SubscriptionWithUser>(env.DB.prepare(`
-    SELECT s.*, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code, u.telegram_bind_code_expires_at
-    FROM subscriptions s
-    JOIN users u ON u.id = s.user_id
-    ORDER BY s.id DESC
-  `));
-  const loadSubsMs = Date.now() - loadSubsStartedAt;
-  if (!subs.length) return { loadSubsMs, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
-  const loadSentStartedAt = Date.now();
-  const postGuids = insertedPosts.map((post) => post.guid);
-  const logRows: { user_id: number; subscription_id: number; post_guid: string; channel: string }[] = [];
-  for (let offset = 0; offset < postGuids.length; offset += 100) {
-    const guidChunk = postGuids.slice(offset, offset + 100);
-    const placeholders = guidChunk.map(() => "?").join(",");
-    const rows = await all<{ user_id: number; subscription_id: number; post_guid: string; channel: string }>(
-      env.DB.prepare(`SELECT user_id, subscription_id, post_guid, channel FROM push_logs WHERE post_guid IN (${placeholders})`).bind(...guidChunk)
-    );
-    logRows.push(...rows);
+export async function processNotifications(
+  env: Env,
+  budget: QueryBudget
+): Promise<{
+  attempts: number;
+  matches: number;
+  skipped: number;
+  cursorPostId: number;
+  compileMs: number;
+  matchMs: number;
+  cursor: NotificationCursor;
+}> {
+  const compileTimings = { compileMs: 0 };
+  let matchMs = 0;
+  consumeQuery(budget);
+  const storedCursor = await loadNotificationCursor(env);
+
+  consumeQuery(budget);
+  const summary = await one<{ firstSubId: number | null; maxPostId: number | null }>(
+    env.DB.prepare("SELECT (SELECT id FROM subscriptions LIMIT 1) AS firstSubId, (SELECT MAX(id) FROM posts) AS maxPostId")
+  );
+  const hasSubscriptions = summary !== null && summary.firstSubId !== null;
+  const maxPostId = summary?.maxPostId ?? 0;
+
+  if (!storedCursor) {
+    const bootstrapCursor: NotificationCursor = { postId: maxPostId, subscriptionId: 0, channel: "" };
+    await persistNotificationCursor(env, bootstrapCursor, budget);
+    return { attempts: 0, matches: 0, skipped: 0, cursorPostId: bootstrapCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: bootstrapCursor };
   }
-  const sent = new Set(logRows.map((row) => pushKey(row.user_id, row.subscription_id, row.post_guid, row.channel)));
-  const loadSentMs = Date.now() - loadSentStartedAt;
-  const compileStartedAt = Date.now();
-  const compiledSubs = subs.flatMap((sub) => {
-    const compiled = compileChainedRule(sub.pattern);
-    return compiled.ok ? [{ sub, segments: compiled.segments }] : [];
-  });
-  const compileRegexMs = Date.now() - compileStartedAt;
-  if (!compiledSubs.length) return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: Date.now() - startedAt };
-  const buildPostTextsStartedAt = Date.now();
-  const settings = await runtimeSettings(env);
-  const postTexts = new Map(insertedPosts.map((post) => [post.guid, `${post.title}\n${post.content_text}\n${post.author || ""}\n${post.board_key || ""}`]));
-  const buildPostTextsMs = Date.now() - buildPostTextsStartedAt;
-  const matchStartedAt = Date.now();
-  let sendMs = 0;
-  for (const { sub, segments } of compiledSubs) {
-    const user: User = { id: sub.user_id, username: sub.username, email: sub.email, telegram_chat_id: sub.telegram_chat_id, telegram_bind_code: sub.telegram_bind_code, telegram_bind_code_expires_at: sub.telegram_bind_code_expires_at };
-    for (const post of insertedPosts) {
-      if (!matchChainedRule(segments, postTexts.get(post.guid) || "")) continue;
-      if (sub.send_email && !sent.has(pushKey(user.id, sub.id, post.guid, "email"))) {
-        const sendStartedAt = Date.now();
-        await sendBrevo(env, user, sub, post, settings);
-        sendMs += Date.now() - sendStartedAt;
-        sent.add(pushKey(user.id, sub.id, post.guid, "email"));
+
+  if (!hasSubscriptions) {
+    if (maxPostId > storedCursor.postId) {
+      const advancedCursor: NotificationCursor = { postId: maxPostId, subscriptionId: 0, channel: "" };
+      await persistNotificationCursor(env, advancedCursor, budget);
+      return { attempts: 0, matches: 0, skipped: 0, cursorPostId: advancedCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: advancedCursor };
+    }
+    return { attempts: 0, matches: 0, skipped: 0, cursorPostId: storedCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: storedCursor };
+  }
+
+  if (storedCursor.postId > maxPostId) {
+    return { attempts: 0, matches: 0, skipped: 0, cursorPostId: storedCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: storedCursor };
+  }
+
+  consumeQuery(budget);
+  const posts = await all<NotificationPostRow>(
+    env.DB.prepare(
+      `SELECT id, guid, title, link, content_text, author, board_key FROM posts WHERE id >= ? AND id <= ? ORDER BY id ASC LIMIT ${NOTIFICATION_POST_PAGE}`
+    ).bind(storedCursor.postId, maxPostId)
+  );
+  if (!posts.length) {
+    return { attempts: 0, matches: 0, skipped: 0, cursorPostId: storedCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: storedCursor };
+  }
+
+  consumeQuery(budget);
+  const pushStatuses = await loadPushStatuses(env, posts);
+
+  const resumePostId = storedCursor.postId;
+  const resumeSubscriptionId = storedCursor.subscriptionId;
+  const resumeChannel = storedCursor.channel;
+
+  let cursor: NotificationCursor = { ...storedCursor };
+  let attempts = 0;
+  let matches = 0;
+  let skipped = 0;
+  let matchUnits = 0;
+  let cursorDirty = false;
+  let cachedSettings: RuntimeSettings | null = null;
+  let subPage: NotificationSubRow[] = [];
+  let subPageStart = -1;
+  let subPageComplete = false;
+
+  const getSettings = async (): Promise<RuntimeSettings> => {
+    if (!cachedSettings) {
+      // Charge the settings read before it happens so the ledger stays an
+      // upper bound; a failed consume happens before any settings/send work.
+      consumeQuery(budget);
+      cachedSettings = await runtimeSettings(env);
+    }
+    return cachedSettings;
+  };
+
+  outer: for (const postRow of posts) {
+    const post = notificationPost(postRow);
+    const haystack = `${postRow.title}\n${postRow.content_text}\n${postRow.author || ""}\n${postRow.board_key || ""}`;
+    const isResumePost = postRow.id === resumePostId;
+    const startSubId = isResumePost ? resumeSubscriptionId : 0;
+    const channelStart = isResumePost ? resumeChannel : "";
+
+    if (subPageStart !== startSubId) {
+      consumeQuery(budget);
+      subPage = await all<NotificationSubRow>(
+        env.DB.prepare(`SELECT s.id, s.user_id, s.pattern, s.send_email, s.send_telegram, s.created_at, s.updated_at, u.username, u.email, u.telegram_chat_id, u.telegram_bind_code, u.telegram_bind_code_expires_at
+          FROM subscriptions s
+          JOIN users u ON u.id = s.user_id
+          WHERE s.id >= ?
+          ORDER BY s.id ASC
+          LIMIT ${NOTIFICATION_SUB_PAGE}`).bind(startSubId)
+      );
+      subPageStart = startSubId;
+      subPageComplete = subPage.length < NOTIFICATION_SUB_PAGE;
+    }
+
+    if (!subPage.length) {
+      cursor = { postId: postRow.id + 1, subscriptionId: 0, channel: "" };
+      cursorDirty = true;
+      subPageStart = -1;
+      continue;
+    }
+
+    for (const subRow of subPage) {
+      const isResumePair = isResumePost && subRow.id === resumeSubscriptionId;
+      const startsAtChannel = isResumePair && channelStart !== "";
+      let channelIndex = isResumePair && channelStart === "telegram" ? 1 : 0;
+
+      if (!startsAtChannel) {
+        if (matchUnits >= NOTIFICATION_MATCH_UNIT_LIMIT) {
+          cursor = { postId: postRow.id, subscriptionId: subRow.id, channel: "" };
+          cursorDirty = true;
+          break outer;
+        }
+        matchUnits += 1;
+        const segments = compiledSegmentsFor(subRow, compileTimings);
+        if (!segments) continue;
+        const matchStartedAt = Date.now();
+        const matched = matchChainedRule(segments, haystack);
+        matchMs += Date.now() - matchStartedAt;
+        if (!matched) continue;
+        matches += 1;
       }
-      if (sub.send_telegram && !sent.has(pushKey(user.id, sub.id, post.guid, "telegram"))) {
-        const sendStartedAt = Date.now();
-        await sendTelegram(env, user, sub, post, settings);
-        sendMs += Date.now() - sendStartedAt;
-        sent.add(pushKey(user.id, sub.id, post.guid, "telegram"));
+
+      const user = notificationUser(subRow);
+      const sub = notificationSubscription(subRow);
+
+      for (; channelIndex < NOTIFICATION_CHANNELS.length; channelIndex += 1) {
+        const channel = NOTIFICATION_CHANNELS[channelIndex];
+        const nextCursor: NotificationCursor =
+          channelIndex + 1 < NOTIFICATION_CHANNELS.length
+            ? { postId: postRow.id, subscriptionId: subRow.id, channel: NOTIFICATION_CHANNELS[channelIndex + 1] }
+            : { postId: postRow.id, subscriptionId: subRow.id + 1, channel: "" };
+        const key = pushKey(subRow.user_id, subRow.id, postRow.guid, channel);
+        const priorStatus = pushStatuses.get(key);
+
+        if (priorStatus === "sent" || priorStatus === "skipped") {
+          skipped += 1;
+          cursor = nextCursor;
+          continue;
+        }
+
+        const channelEnabled = channel === "email" ? subRow.send_email !== 0 : subRow.send_telegram !== 0;
+        if (!channelEnabled) {
+          // Disabled channels are not delivery attempts: no push_logs write and no query,
+          // keeping writes bounded by NOTIFICATION_ATTEMPT_LIMIT (D1 query budget).
+          cursor = nextCursor;
+          continue;
+        }
+
+        if (attempts >= NOTIFICATION_ATTEMPT_LIMIT) {
+          // An unevaluated pair must restart at its first channel so the next
+          // invocation re-runs the regex instead of assuming the rule matched.
+          cursor = { postId: postRow.id, subscriptionId: subRow.id, channel: channelIndex === 0 ? "" : channel };
+          cursorDirty = true;
+          break outer;
+        }
+
+        if (budgetRemaining(budget) < 2) {
+          // Reserve one query for the log write and one for the final cursor
+          // persist. Sending without the log slot would replay this delivery.
+          cursor = { postId: postRow.id, subscriptionId: subRow.id, channel: channelIndex === 0 ? "" : channel };
+          cursorDirty = true;
+          break outer;
+        }
+        attempts += 1;
+        consumeQuery(budget);
+
+        const settings = await getSettings();
+        const result = channel === "email"
+          ? await sendBrevo(env, user, sub, post, settings)
+          : await sendTelegram(env, user, sub, post, settings);
+
+        await recordPushLog(env, subRow.user_id, subRow.id, postRow.guid, channel, result.status, result.error);
+        pushStatuses.set(key, result.status);
+
+        if (result.status === "failed") {
+          cursor = { postId: postRow.id, subscriptionId: subRow.id, channel };
+          cursorDirty = true;
+          break outer;
+        }
+        if (result.status === "skipped") skipped += 1;
+        cursor = nextCursor;
       }
     }
+
+    if (!subPageComplete) {
+      cursor = { postId: postRow.id, subscriptionId: subPage[subPage.length - 1].id + 1, channel: "" };
+      cursorDirty = true;
+      break;
+    }
+
+    cursor = { postId: postRow.id + 1, subscriptionId: 0, channel: "" };
+    cursorDirty = true;
+    if (subPageStart > 0) subPageStart = -1;
   }
-  const matchMs = Date.now() - matchStartedAt;
-  return { loadSubsMs, loadSentMs, compileRegexMs, buildPostTextsMs, matchMs, sendMs, totalMs: Date.now() - startedAt };
+
+  if (cursorDirty) {
+    if (budgetRemaining(budget) < 1) {
+      console.warn("notification_cursor_persist_skipped_no_budget");
+    } else {
+      await persistNotificationCursor(env, cursor, budget);
+    }
+  }
+  return { attempts, matches, skipped, cursorPostId: cursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor };
 }
 
 export async function createSubscription(request: Request, env: Env, user: User): Promise<Response> {

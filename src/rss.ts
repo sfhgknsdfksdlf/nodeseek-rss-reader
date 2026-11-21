@@ -15,6 +15,12 @@ interface RssItem {
   publishedAt: string;
 }
 
+interface RssInsertCandidate {
+  guid: string;
+  item?: RssItem;
+  chunk?: string;
+}
+
 interface FetchStrategy {
   name: string;
   headers: HeadersInit;
@@ -115,49 +121,80 @@ interface RssAttemptDiagnostics {
   failureSummary: RssFailureSummary;
 }
 
-function textBetween(xml: string, tags: string[]): string {
-  for (const tag of tags) {
-    const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
-    const match = re.exec(xml);
-    if (match) return decodeXml(match[1].replace(/^<!\[CDATA\[|\]\]>$/g, "").trim());
+function tagPattern(tag: string): RegExp {
+  return new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
+}
+
+// Compiled once per isolate; the previous parser rebuilt 7-9 RegExp objects per item.
+const guidTagPatterns = [tagPattern("guid"), tagPattern("id")];
+const titleTagPatterns = [tagPattern("title")];
+const contentTagPatterns = [tagPattern("content:encoded"), tagPattern("content"), tagPattern("description"), tagPattern("summary")];
+const authorTagPatterns = [tagPattern("dc:creator"), tagPattern("author"), tagPattern("name")];
+const categoryTagPatterns = [tagPattern("category")];
+const dateTagPatterns = [tagPattern("pubDate"), tagPattern("published"), tagPattern("updated")];
+const linkHrefPattern = /<link\b[^>]*href=["']([^"']+)["'][^>]*>/i;
+const linkTextTagPatterns = [tagPattern("link")];
+const cdataWrapperPattern = /^<!\[CDATA\[|\]\]>$/g;
+const itemChunkPattern = /<item[\s\S]*?<\/item>|<entry[\s\S]*?<\/entry>/gi;
+
+function textBetweenPatterns(xml: string, patterns: RegExp[]): string {
+  for (const pattern of patterns) {
+    const match = pattern.exec(xml);
+    if (match) return decodeXml(match[1].replace(cdataWrapperPattern, "").trim());
   }
   return "";
 }
 
 function attrLink(xml: string): string {
-  const href = /<link\b[^>]*href=["']([^"']+)["'][^>]*>/i.exec(xml)?.[1];
+  const href = linkHrefPattern.exec(xml)?.[1];
   if (href) return decodeXml(href);
-  return textBetween(xml, ["link"]);
+  return textBetweenPatterns(xml, linkTextTagPatterns);
 }
 
 function decodeXml(value: string): string {
   return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-function parseItems(xml: string): RssItem[] {
-  const chunks = [...xml.matchAll(/<item[\s\S]*?<\/item>|<entry[\s\S]*?<\/entry>/gi)].map((m) => m[0]);
-  return chunks.map((chunk) => {
-    const title = textBetween(chunk, ["title"]);
-    const link = attrLink(chunk);
-    const guid = textBetween(chunk, ["guid", "id"]) || link || title;
-    const contentRaw = textBetween(chunk, ["content:encoded", "content", "description", "summary"]);
-    const contentHtml = sanitizePostHtml(contentRaw);
-    const author = textBetween(chunk, ["dc:creator", "author", "name"]);
-    const board = normalizeBoard(textBetween(chunk, ["category"]));
-    const dateRaw = textBetween(chunk, ["pubDate", "published", "updated"]);
-    const date = new Date(dateRaw);
-    return {
-      guid,
-      title,
-      link,
-      contentHtml,
-      contentText: stripHtml(contentHtml || contentRaw),
-      author,
-      board,
-      publishedAt: Number.isNaN(date.getTime()) ? nowIso() : date.toISOString()
-    };
-  }).filter((item) => item.guid && item.title && item.link);
+export function splitItemChunks(xml: string): string[] {
+  return [...xml.matchAll(itemChunkPattern)].map((match) => match[0]);
 }
+
+// Mirrors the legacy parser's GUID precedence: guid/id text, then link, then title.
+export function cheapGuid(chunk: string): string {
+  return textBetweenPatterns(chunk, guidTagPatterns) || attrLink(chunk) || textBetweenPatterns(chunk, titleTagPatterns);
+}
+
+function parseChunkFull(chunk: string): RssItem {
+  const title = textBetweenPatterns(chunk, titleTagPatterns);
+  const link = attrLink(chunk);
+  const guid = textBetweenPatterns(chunk, guidTagPatterns) || link || title;
+  const contentRaw = textBetweenPatterns(chunk, contentTagPatterns);
+  const contentHtml = sanitizePostHtml(contentRaw);
+  const author = textBetweenPatterns(chunk, authorTagPatterns);
+  const board = normalizeBoard(textBetweenPatterns(chunk, categoryTagPatterns));
+  const dateRaw = textBetweenPatterns(chunk, dateTagPatterns);
+  const date = new Date(dateRaw);
+  return {
+    guid,
+    title,
+    link,
+    contentHtml,
+    contentText: stripHtml(contentHtml || contentRaw),
+    author,
+    board,
+    publishedAt: Number.isNaN(date.getTime()) ? nowIso() : date.toISOString()
+  };
+}
+
+function parseChunksFull(chunks: string[]): RssItem[] {
+  return chunks.map(parseChunkFull).filter((item) => item.guid && item.title && item.link);
+}
+
+export function parseItemsFull(xml: string): RssItem[] {
+  return parseChunksFull(splitItemChunks(xml));
+}
+
+const parseItems = parseItemsFull;
 
 async function fetchWithStrategy(rssUrl: string, strategy: FetchStrategy): Promise<Response> {
   return fetch(rssUrl, { headers: strategy.headers, cf: { cacheTtl: 60 } });
@@ -233,6 +270,11 @@ interface RssSyncTiming {
   insertPostsMs: number;
   writeSyncStateMs: number;
   totalMs: number;
+  guidExtractMs?: number;
+  guidExtractCount?: number;
+  fullParseMs?: number;
+  fullParseCount?: number;
+  indexFailureCount?: number;
 }
 
 interface RssSyncResult {
@@ -240,6 +282,7 @@ interface RssSyncResult {
   firstSync: boolean;
   insertedPosts: RssNewPost[];
   strategy: string;
+  indexFailureCount: number;
   timings: RssSyncTiming;
   cpu: {
     parseItemsMs: number;
@@ -266,21 +309,34 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
   const fetchStartedAt = Date.now();
   const { xml, strategy, timings: fetchTimings } = await fetchRssXml(env, rssUrl);
   const fetchRssMs = Date.now() - fetchStartedAt;
-  const parseStartedAt = Date.now();
-  const items = parseItems(xml);
-  const parseItemsMs = Date.now() - parseStartedAt;
-  const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
-  let inserted = 0;
-  const insertedPosts: RssNewPost[] = [];
-  const insertStartedAt = Date.now();
-  const prepareInsertStartedAt = Date.now();
+  const chunks = splitItemChunks(xml);
+  const guidExtractStartedAt = Date.now();
+  const chunkGuids = chunks.map((chunk) => cheapGuid(chunk));
+  const guidExtractMs = Date.now() - guidExtractStartedAt;
+  const useFallback = chunkGuids.some((guid) => !guid.trim());
+  let fullParseMs = 0;
+  let fullParseCount = 0;
   const seenGuids = new Set<string>();
-  const uniqueItems = items.filter((item) => {
-    if (seenGuids.has(item.guid)) return false;
-    seenGuids.add(item.guid);
-    return true;
-  });
-  const guids = uniqueItems.map((item) => item.guid);
+  let candidates: RssInsertCandidate[] = [];
+  if (useFallback) {
+    const fullParseStartedAt = Date.now();
+    const items = parseChunksFull(chunks);
+    fullParseMs += Date.now() - fullParseStartedAt;
+    fullParseCount += items.length;
+    candidates = items.filter((item) => {
+      if (seenGuids.has(item.guid)) return false;
+      seenGuids.add(item.guid);
+      return true;
+    }).map((item) => ({ guid: item.guid, item }));
+  } else {
+    chunks.forEach((chunk, index) => {
+      const guid = chunkGuids[index] ?? "";
+      if (seenGuids.has(guid)) return;
+      seenGuids.add(guid);
+      candidates.push({ guid, chunk });
+    });
+  }
+  const guids = candidates.map((candidate) => candidate.guid);
   const existingGuids = new Set<string>();
   for (let offset = 0; offset < guids.length; offset += 100) {
     const guidChunk = guids.slice(offset, offset + 100);
@@ -288,15 +344,40 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
     const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...guidChunk));
     for (const row of rows) existingGuids.add(row.guid);
   }
-  let insertRows = uniqueItems
-    .filter((item) => !existingGuids.has(item.guid))
-    .map((item) => ({ item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] }));
-  const candidateInsertCount = insertRows.length;
+  let targetCandidates = candidates.filter((candidate) => !existingGuids.has(candidate.guid));
+  const candidateInsertCount = targetCandidates.length;
   const maxNewPosts = options?.maxNewPosts;
-  if (typeof maxNewPosts === "number" && Number.isFinite(maxNewPosts) && maxNewPosts >= 0 && insertRows.length > maxNewPosts) {
-    insertRows = insertRows.slice(0, Math.floor(maxNewPosts));
-    console.warn("RSS insert capped", JSON.stringify({ cap: maxNewPosts, candidates: candidateInsertCount }));
+  let capped = false;
+  if (typeof maxNewPosts === "number" && Number.isFinite(maxNewPosts) && maxNewPosts >= 0 && targetCandidates.length > maxNewPosts) {
+    targetCandidates = targetCandidates.slice(0, Math.floor(maxNewPosts));
+    capped = true;
   }
+  if (!useFallback) {
+    const fullParseStartedAt = Date.now();
+    const parsed: RssInsertCandidate[] = [];
+    for (const candidate of targetCandidates) {
+      const item = parseChunkFull(candidate.chunk ?? "");
+      fullParseCount++;
+      if (item.guid && item.title && item.link) parsed.push({ guid: item.guid, item });
+    }
+    fullParseMs += Date.now() - fullParseStartedAt;
+    targetCandidates = parsed;
+  }
+  if (capped) console.warn("RSS insert capped", JSON.stringify({ cap: maxNewPosts, candidates: candidateInsertCount }));
+  const parseItemsMs = guidExtractMs + fullParseMs;
+  const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
+  let inserted = 0;
+  let indexFailureCount = 0;
+  let firstIndexFailure: unknown = null;
+  const insertedPosts: RssNewPost[] = [];
+  const insertStartedAt = Date.now();
+  const prepareInsertStartedAt = Date.now();
+  let insertRows = targetCandidates
+    .filter((candidate): candidate is RssInsertCandidate & { item: RssItem } => Boolean(candidate.item))
+    .map((candidate) => {
+      const { item } = candidate;
+      return { item, values: [item.guid, item.title, item.link, item.contentHtml, item.contentText, item.author || null, item.board || null, item.publishedAt, nowIso()] };
+    });
   const prepareInsertMs = Date.now() - prepareInsertStartedAt;
   let insertBindRunMs = 0;
   let insertNewCount = 0;
@@ -323,11 +404,16 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
           published_at: item.publishedAt,
           fetched_at: values[8] as string
         });
-        try {
-          await indexPostForSearch(env, { id: result.meta.last_row_id, title: item.title, content_text: item.contentText });
-        } catch (error) {
-          await recordSearchIndexError(env, error);
-          await markSearchIndexRetryPending(env);
+        if (indexFailureCount === 0) {
+          try {
+            await indexPostForSearch(env, { id: result.meta.last_row_id, title: item.title, content_text: item.contentText });
+          } catch (error) {
+            // Stop after the first inline failure: this bounds the diagnostic
+            // queries to one pair per invocation, and complete=0 lets the cron
+            // backfill repair every post left unindexed below.
+            indexFailureCount = 1;
+            firstIndexFailure = error;
+          }
         }
       } else {
         insertExistingCount++;
@@ -335,6 +421,14 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
     }
   }
   const insertLoopMs = Date.now() - insertStartedAt;
+  if (firstIndexFailure !== null) {
+    try {
+      await recordSearchIndexError(env, firstIndexFailure);
+      await markSearchIndexRetryPending(env);
+    } catch (error) {
+      console.error("search index failure persist failed", error instanceof Error ? error.message : String(error));
+    }
+  }
   const writeStateStartedAt = Date.now();
   const updatedAt = nowIso();
   await env.DB.batch([
@@ -349,7 +443,7 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
   const insertPostsMs = insertLoopMs;
   insertBindRunMs = Date.now() - batchStartedAt;
-  return { inserted, firstSync: first, insertedPosts, strategy, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: items.length, prepareInsertMs, insertBindRunMs, insertNewCount, insertExistingCount, insertLoopMs, insertPostsMs, writeSyncStateMs, totalMs: Date.now() - fetchStartedAt }, cpu: { parseItemsMs, parseItemCount: items.length } };
+  return { inserted, firstSync: first, insertedPosts, strategy, indexFailureCount, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: chunks.length, prepareInsertMs, insertBindRunMs, insertNewCount, insertExistingCount, insertLoopMs, insertPostsMs, writeSyncStateMs, totalMs: Date.now() - fetchStartedAt, guidExtractMs, guidExtractCount: chunks.length, fullParseMs, fullParseCount, indexFailureCount }, cpu: { parseItemsMs, parseItemCount: chunks.length } };
 }
 
 export async function safeSyncRss(env: Env, options?: { maxNewPosts?: number }): Promise<SafeRssSyncResult> {

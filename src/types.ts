@@ -108,6 +108,12 @@ export interface HomeTimingSnapshot {
   timings: HomeTimings;
 }
 
+export interface NotificationCursor {
+  postId: number;
+  subscriptionId: number;
+  channel: string;
+}
+
 export interface CronTimingSnapshot {
   recordedAt: string;
   ok: boolean;
@@ -129,10 +135,21 @@ export interface CronTimingSnapshot {
         insertPostsMs: number;
         writeSyncStateMs: number;
         totalMs: number;
+        guidExtractMs?: number;
+        guidExtractCount?: number;
+        fullParseMs?: number;
+        fullParseCount?: number;
+        indexFailureCount?: number;
       };
     processSubscriptionsMs: number;
     cleanupOldDataMs: number;
     totalMs: number;
+    notifications?: {
+      attempts: number;
+      matches: number;
+      skipped: number;
+      cursorPostId: number;
+    };
   };
   cpu: {
     rssParseItemsMs: number;
@@ -142,4 +159,5 @@ export interface CronTimingSnapshot {
     totalMs: number;
   };
   error?: string;
+  notificationCursor?: NotificationCursor;
 }

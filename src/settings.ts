@@ -1,4 +1,4 @@
-import { json, nowIso, one } from "./db";
+import { all, json, nowIso, one } from "./db";
 import { D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, decodeStoredPruneLimitMb, encodePruneLimitMb, readIndexState } from "./prune";
 import type { Env } from "./types";
 
@@ -33,9 +33,24 @@ function fromBase64(value: string): Uint8Array {
   return bytes;
 }
 
-async function cryptoKey(secret: string): Promise<CryptoKey> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
-  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+let cachedKeySecret: string | null = null;
+let cachedKeyPromise: Promise<CryptoKey> | null = null;
+
+function cryptoKey(secret: string): Promise<CryptoKey> {
+  if (cachedKeySecret === secret && cachedKeyPromise) return cachedKeyPromise;
+  const entry: Promise<CryptoKey> = crypto.subtle
+    .digest("SHA-256", new TextEncoder().encode(secret))
+    .then((digest) => crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]))
+    .catch((error: unknown) => {
+      if (cachedKeyPromise === entry) {
+        cachedKeySecret = null;
+        cachedKeyPromise = null;
+      }
+      throw error;
+    });
+  cachedKeySecret = secret;
+  cachedKeyPromise = entry;
+  return entry;
 }
 
 async function encrypt(secret: string, value: string): Promise<string> {
@@ -101,20 +116,42 @@ export async function setSetting(env: Env, key: string, value: string): Promise<
   await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, encrypted, updated_at) VALUES (?, ?, ?, ?)").bind(key, stored, encrypted, nowIso()).run();
 }
 
+const runtimeSettingKeys = [
+  "brevo_api_key",
+  "telegram_bot_token",
+  "telegram_bot_username",
+  "mail_from",
+  "mail_from_name",
+  "read_state_retention_days",
+  "db_prune_limit_mb",
+  "d1_paid_enabled",
+  "push_log_retention_days",
+  "page_size",
+  "search_result_limit"
+] as const;
+
 export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
-  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, dbPruneLimit, d1Paid, pushDays, pageSize, searchResultLimit] = await Promise.all([
-    getSetting(env, "brevo_api_key"),
-    getSetting(env, "telegram_bot_token"),
-    getSetting(env, "telegram_bot_username"),
-    getSetting(env, "mail_from"),
-    getSetting(env, "mail_from_name"),
-    getSetting(env, "read_state_retention_days"),
-    getSetting(env, "db_prune_limit_mb"),
-    getSetting(env, "d1_paid_enabled"),
-    getSetting(env, "push_log_retention_days"),
-    getSetting(env, "page_size"),
-    getSetting(env, "search_result_limit")
-  ]);
+  // One query for the whole settings snapshot. Each cron used to spend 11
+  // separate getSetting reads here, and notifications + cleanup each call this
+  // function, so a cleanup-day invocation could spend 22 queries on settings
+  // alone. Keys are always bound as parameters, never interpolated.
+  const placeholders = runtimeSettingKeys.map(() => "?").join(", ");
+  const rows = await all<{ key: string; value: string; encrypted: number }>(
+    env.DB.prepare(`SELECT key, value, encrypted FROM app_settings WHERE key IN (${placeholders})`).bind(...runtimeSettingKeys)
+  );
+  const byKey = new Map(rows.map((row) => [row.key, row]));
+  const read = async (key: string): Promise<string> => {
+    const row = byKey.get(key);
+    if (!row) return "";
+    if (!row.encrypted) return row.value;
+    if (!env.ADMIN_SECRET) return "";
+    try {
+      return await decrypt(env.ADMIN_SECRET, row.value);
+    } catch {
+      return "";
+    }
+  };
+  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, dbPruneLimit, d1Paid, pushDays, pageSize, searchResultLimit] = await Promise.all(runtimeSettingKeys.map(read));
   const paid = parseD1Paid(d1Paid);
   const maxCapacityMb = paid ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB;
   return {
