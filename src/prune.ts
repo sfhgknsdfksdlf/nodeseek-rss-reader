@@ -14,6 +14,7 @@ export const DB_PRUNE_DAILY_CAP = 10_000;
 export const DB_PRUNE_BATCH_SIZE = 100;
 export const DB_PRUNE_DEGRADED_MAX_IDS = 10;
 export const DB_PRUNE_MAX_CHUNKS = 5;
+export const DB_PRUNE_MAX_SCAN_PAGES = 5;
 export const DB_PRUNE_RUN_MAX_POSTS = 500;
 export const DB_PRUNE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 export const D1_FREE_MAX_CAPACITY_MB = 500;
@@ -40,6 +41,9 @@ export const DB_PRUNE_INDEX_HOLDER_MAX_AGE_MS = DB_PRUNE_LEASE_MAX_AGE_MS;
 // Free Workers limit is 50 D1 queries per invocation; a db.batch() counts as a
 // single query (Cloudflare D1 limits). Every phase reserves headroom for the
 // remaining critical work plus the final state write and lease release.
+// Background budget <= 14: plan+limit reuse already-read settings, orphan cleanup
+// re-probes size + blocked state + two 4-query FTS batches = 10, search backfill
+// uses 3, and failure diagnosis uses at most 1.
 export const D1_QUERY_LIMIT = 50;
 export const DB_PRUNE_FINAL_QUERY_RESERVE = 4;
 export const DB_PRUNE_BATCH_QUERY_RESERVE = 12;
@@ -56,6 +60,22 @@ const STATE_LAST_ERROR_KEY = "db_prune_last_error";
 const STATE_BLOCKED_KEY = "db_prune_blocked_full";
 const STATE_FTS_TRIGRAM_CURSOR = "db_prune_fts_trigram_cursor";
 const STATE_FTS_BIGRAM_CURSOR = "db_prune_fts_bigram_cursor";
+// Candidate scan cursor: JSON array [publishedAt, id, restartAt]. Only the
+// lease-holding state-"2" prune writes it; index build/recovery/FTS never do.
+export const STATE_CANDIDATE_CURSOR = "db_prune_candidate_cursor";
+
+// Bounded keyset candidate pages over the (published_at, id) index. `fetched_at`
+// is deliberately absent from SQL: it is filtered in memory after the bounded
+// page so a large block of old-published/recently-fetched rows cannot turn the
+// query into an unbounded index scan.
+const CANDIDATE_SQL_FIRST = "SELECT published_at, id, fetched_at FROM posts INDEXED BY idx_posts_published_at_id WHERE published_at < ? ORDER BY published_at ASC, id ASC LIMIT ?";
+const CANDIDATE_SQL_AFTER = "SELECT published_at, id, fetched_at FROM posts INDEXED BY idx_posts_published_at_id WHERE (published_at, id) > (?, ?) AND published_at < ? ORDER BY published_at ASC, id ASC LIMIT ?";
+
+export interface PruneCandidateCursor {
+  publishedAt: string;
+  id: number;
+  restartAt: string;
+}
 
 export interface PruneState {
   active: boolean;
@@ -66,6 +86,8 @@ export interface PruneState {
   lastError: string;
   hasCounter: boolean;
   blockedFull: boolean;
+  candidateCursorRaw: string;
+  candidateCursor: PruneCandidateCursor | null;
 }
 
 export interface PruneRunResult {
@@ -84,6 +106,7 @@ export interface PruneRunResult {
   indexVerified: boolean;
   indexDay: boolean;
   dailyCap: number;
+  dailyWriteQuotaExhausted: boolean;
 }
 
 export function clampDbPruneLimitMb(value: unknown, paid = false): number {
@@ -134,11 +157,15 @@ export function decidePruneActivation(input: { sizeBytes: number; limitBytes: nu
 
 /**
  * Feed-cap decision shared with the cron path in index.ts: cap new posts only
- * once the database is above the plan's max capacity minus the 2MB margin.
+ * once the database is strictly above the plan's max capacity minus the 2MB
+ * margin. An unknown plan (null) uses the paid 10GB boundary so it never caps
+ * a database that might still have room.
  */
-export function decideMaxNewPosts(input: { sizeBytes: number | null; fivePostThresholdBytes: number }): number | undefined {
-  if (input.sizeBytes === null) return undefined;
-  return input.sizeBytes > input.fivePostThresholdBytes ? 5 : undefined;
+export function decideMaxNewPosts(input: { sizeBytes: number | null; paid: boolean | null }): number | undefined {
+  const sizeBytes = input.sizeBytes;
+  if (sizeBytes === null || !Number.isFinite(sizeBytes) || sizeBytes < 0) return undefined;
+  const threshold = input.paid === false ? 498_000_000 : 9_998_000_000;
+  return sizeBytes > threshold ? 5 : undefined;
 }
 
 export interface IndexStateSnapshot {
@@ -168,9 +195,15 @@ export interface ClaimIndexBuildResult {
 
 export interface QueryMeter {
   readonly env: Env;
-  used(): number;
-  remaining(): number;
   readonly limit: number;
+  used(): number;
+  ordinaryUsed(): number;
+  finalUsed(): number;
+  remaining(): number;
+  markDailyWriteQuotaExhausted(): void;
+  runFinalStateBatch(statements: readonly D1PreparedStatement[]): Promise<void>;
+  clearFinalBlockedFlag(finishedAt: string): Promise<void>;
+  releaseLeaseOnce(token: string): Promise<void>;
 }
 
 export interface BackgroundPlan {
@@ -191,10 +224,13 @@ export interface PruneGateOptions {
   limitMb?: number;
   now?: () => Date;
   queryRemaining?: () => number;
+  meter?: QueryMeter;
 }
 
+// `remaining()` is already net of DB_PRUNE_FINAL_QUERY_RESERVE; stages compare
+// their own slot counts directly and never subtract the reserve again.
 export function hasQueryHeadroom(remaining: number, needed: number): boolean {
-  return remaining >= needed + DB_PRUNE_FINAL_QUERY_RESERVE;
+  return remaining >= needed;
 }
 
 export async function acquirePruneLease(env: Env, now: Date = new Date()): Promise<string | null> {
@@ -206,6 +242,8 @@ export async function acquirePruneLease(env: Env, now: Date = new Date()): Promi
       .run();
     return Number(result.meta?.changes ?? 0) === 1 ? token : null;
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error("acquirePruneLease failed", truncateMessage(error));
     return null;
   }
@@ -218,6 +256,8 @@ export async function refreshPruneLease(env: Env, token: string, now: Date = new
       .run();
     return Number(result.meta?.changes ?? 0) === 1;
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error("refreshPruneLease failed", truncateMessage(error));
     return false;
   }
@@ -231,28 +271,61 @@ export async function releasePruneLease(env: Env, token: string): Promise<void> 
   }
 }
 
+export class DailyWriteQuotaExhaustedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "DailyWriteQuotaExhaustedError";
+  }
+}
+
+export function toDailyWriteQuotaExhaustedError(error: unknown): DailyWriteQuotaExhaustedError | null {
+  if (error instanceof DailyWriteQuotaExhaustedError) return error;
+  if (!isDailyWriteQuotaError(error)) return null;
+  const message = errorMessageChain(error).filter(Boolean).join(" | ");
+  return new DailyWriteQuotaExhaustedError(truncateMessage(message || error), { cause: error });
+}
+
 export function createQueryMeter(env: Env, limit = D1_QUERY_LIMIT, reserve = DB_PRUNE_FINAL_QUERY_RESERVE): QueryMeter {
-  let used = 0;
+  let ordinaryUsed = 0;
+  let finalUsed = 0;
+  let dailyWriteQuotaExhausted = false;
+  let finalBatchUsed = false;
+  let blockedClearUsed = false;
+  let releaseAttempted = false;
+  const rawDb = env.DB;
   const consume = () => {
-    if (used + 1 > limit - reserve) throw new Error("D1 query budget exhausted; final release reserved");
-    used += 1;
+    if (ordinaryUsed + 1 > limit - reserve) throw new Error("D1 query budget exhausted; final release reserved");
+    ordinaryUsed += 1;
   };
   const originals = new WeakMap<object, D1PreparedStatement>();
+  const originalOf = (statement: D1PreparedStatement): D1PreparedStatement => originals.get(statement) ?? statement;
+  const submitFinalWrite = async (action: () => Promise<unknown>): Promise<void> => {
+    try {
+      await action();
+    } catch (error) {
+      const quota = toDailyWriteQuotaExhaustedError(error);
+      if (quota) {
+        dailyWriteQuotaExhausted = true;
+        throw quota;
+      }
+      throw error;
+    }
+  };
   const wrapPrepared = (statement: D1PreparedStatement): D1PreparedStatement => {
     const wrapped = new Proxy(statement, {
       get(target, prop) {
         const value = Reflect.get(target, prop, target);
         if (typeof value !== "function") return value;
         if (prop === "bind") {
-          return (...args: unknown[]) => wrapPrepared((value as (...bindArgs: unknown[]) => D1PreparedStatement).apply(target, args));
+          return (...args: unknown[]) => wrapPrepared(Reflect.apply(value, target, args) as D1PreparedStatement);
         }
         if (prop === "run" || prop === "first" || prop === "all" || prop === "raw") {
           return (...args: unknown[]) => {
             consume();
-            return (value as (...callArgs: unknown[]) => unknown).apply(target, args);
+            return Reflect.apply(value, target, args);
           };
         }
-        return (value as (...callArgs: unknown[]) => unknown).bind(target);
+        return value.bind(target);
       }
     }) as D1PreparedStatement;
     originals.set(wrapped, statement);
@@ -263,26 +336,61 @@ export function createQueryMeter(env: Env, limit = D1_QUERY_LIMIT, reserve = DB_
       const value = Reflect.get(target, prop, target);
       if (typeof value !== "function") return value;
       if (prop === "prepare") {
-        return (...args: unknown[]) => wrapPrepared((value as (sql: string) => D1PreparedStatement).apply(target, args));
+        return (sql: string): D1PreparedStatement => wrapPrepared(target.prepare(sql));
       }
       if (prop === "batch") {
-        return (...args: unknown[]) => {
+        return <T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> => {
           consume();
-          const statements = args[0];
-          const unwrapped = Array.isArray(statements) ? (statements as D1PreparedStatement[]).map((statement) => originals.get(statement) ?? statement) : statements;
-          return (value as (list: D1PreparedStatement[]) => unknown).apply(target, [unwrapped]);
+          const rawStatements: D1PreparedStatement[] = statements.map((statement) => originalOf(statement));
+          return target.batch<T>(rawStatements);
         };
       }
       if (prop === "exec" || prop === "dump") {
         return (...args: unknown[]) => {
           consume();
-          return (value as (...callArgs: unknown[]) => unknown).apply(target, args);
+          return Reflect.apply(value, target, args);
         };
       }
-      return (value as (...callArgs: unknown[]) => unknown).bind(target);
+      return value.bind(target);
     }
   }) as D1Database;
-  return { env: { ...env, DB: db }, used: () => used, remaining: () => Math.max(0, limit - used), limit };
+  return {
+    env: { ...env, DB: db },
+    limit,
+    used: () => ordinaryUsed + finalUsed,
+    ordinaryUsed: () => ordinaryUsed,
+    finalUsed: () => finalUsed,
+    remaining: () => Math.max(0, limit - reserve - ordinaryUsed),
+    markDailyWriteQuotaExhausted: () => {
+      dailyWriteQuotaExhausted = true;
+    },
+    runFinalStateBatch: async (statements: readonly D1PreparedStatement[]) => {
+      if (dailyWriteQuotaExhausted) throw new DailyWriteQuotaExhaustedError("D1 daily write quota exhausted; final state batch blocked");
+      if (finalBatchUsed) throw new Error("D1 final state batch already submitted");
+      if (finalUsed >= reserve - 1) throw new Error("D1 final query budget exhausted; lease release reserved");
+      finalBatchUsed = true;
+      finalUsed += 1;
+      const rawStatements: D1PreparedStatement[] = statements.map((statement) => originalOf(statement));
+      await submitFinalWrite(() => rawDb.batch(rawStatements));
+    },
+    clearFinalBlockedFlag: async (finishedAt: string) => {
+      if (dailyWriteQuotaExhausted) throw new DailyWriteQuotaExhaustedError("D1 daily write quota exhausted; final blocked-flag clear blocked");
+      if (blockedClearUsed) throw new Error("D1 final blocked-flag clear already submitted");
+      if (finalUsed >= reserve - 1) throw new Error("D1 final query budget exhausted; lease release reserved");
+      blockedClearUsed = true;
+      finalUsed += 1;
+      await submitFinalWrite(() => rawDb.prepare("INSERT INTO sync_state (key, value, updated_at) VALUES (?, '0', ?) ON CONFLICT(key) DO UPDATE SET value = '0', updated_at = excluded.updated_at")
+        .bind(STATE_BLOCKED_KEY, finishedAt)
+        .run());
+    },
+    releaseLeaseOnce: async (token: string) => {
+      if (!token) return;
+      if (releaseAttempted) return;
+      releaseAttempted = true;
+      finalUsed += 1;
+      await rawDb.prepare("DELETE FROM sync_state WHERE key = ? AND value = ?").bind(DB_PRUNE_LEASE_KEY, token).run();
+    }
+  };
 }
 
 export async function runIsolated(label: string, action: () => Promise<void>): Promise<boolean> {
@@ -290,6 +398,8 @@ export async function runIsolated(label: string, action: () => Promise<void>): P
     await action();
     return true;
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error(`${label} failed; continuing`, truncateMessage(error));
     return false;
   }
@@ -410,6 +520,8 @@ export async function recordPruneError(env: Env, message: string): Promise<void>
       .bind(STATE_LAST_ERROR_KEY, value, nowIso())
       .run();
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error("recordPruneError failed", truncateMessage(error));
   }
 }
@@ -522,9 +634,30 @@ function isDbSizeError(error: unknown): boolean {
   return truncateMessage(error).includes("Exceeded maximum DB size");
 }
 
-function isDailyWriteQuotaError(error: unknown): boolean {
-  const message = truncateMessage(error).toLowerCase();
-  return message.includes("exceeded maximum allowed rows written") || message.includes("rows written per day");
+function errorMessageChain(error: unknown): string[] {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let level = 0; current !== undefined && current !== null && level <= 4 && !seen.has(current); level++) {
+    seen.add(current);
+    messages.push(String(current));
+    if (current instanceof Error) messages.push(current.message);
+    if (current instanceof Error || typeof current === "object") {
+      current = (current as { cause?: unknown }).cause;
+    } else {
+      break;
+    }
+  }
+  return messages;
+}
+
+export function isDailyWriteQuotaError(error: unknown): boolean {
+  return errorMessageChain(error).some((raw) => {
+    const message = raw.toLowerCase().replace(/\s+/g, " ").replaceAll("’", "'").trim();
+    if (message.includes("exceeded d1's free tier daily row write limit")) return true;
+    if (message.includes("exceeded maximum allowed rows written")) return true;
+    return message.includes("rows written per day") && message.includes("exceeded");
+  });
 }
 
 function stateUpsert(env: Env, key: string, value: string, updatedAt: string): D1PreparedStatement {
@@ -569,8 +702,9 @@ async function deletePostIds(env: Env, ids: number[]): Promise<DeleteOutcome> {
     env.DB.prepare(`DELETE FROM posts WHERE id IN (${placeholders})`).bind(...ids)
   ]);
   const changes = batch[3]?.meta?.changes;
+  const valid = typeof changes === "number" && Number.isInteger(changes) && changes >= 0 && changes <= ids.length;
   return {
-    deleted: typeof changes === "number" && Number.isFinite(changes) ? changes : null
+    deleted: valid ? changes : null
   };
 }
 
@@ -595,6 +729,8 @@ async function wallDeleteIds(env: Env, ids: number[], windowOpen: () => boolean)
   try {
     await env.DB.prepare(`DELETE FROM read_states WHERE post_id IN (${placeholders})`).bind(...ids).run();
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error("wall read_states delete failed", truncateMessage(error));
   }
   if (!windowOpen()) {
@@ -603,8 +739,9 @@ async function wallDeleteIds(env: Env, ids: number[], windowOpen: () => boolean)
   try {
     const result = await env.DB.prepare(`DELETE FROM posts WHERE id IN (${placeholders})`).bind(...ids).run();
     const changes = result.meta?.changes;
+    const valid = typeof changes === "number" && Number.isInteger(changes) && changes >= 0 && changes <= ids.length;
     return {
-      deleted: typeof changes === "number" && Number.isFinite(changes) ? changes : null,
+      deleted: valid ? changes : null,
       postsSubmitted: true,
       windowClosed: false,
       postError: null
@@ -640,6 +777,8 @@ export async function degradedDeleteIds(env: Env, ids: number[], canContinue: ()
     try {
       await env.DB.prepare("DELETE FROM read_states WHERE post_id = ?").bind(id).run();
     } catch (error) {
+      const quota = toDailyWriteQuotaExhaustedError(error);
+      if (quota) throw quota;
       console.error("degraded read_states delete failed", truncateMessage(error));
     }
     if (!canContinue()) {
@@ -663,6 +802,8 @@ export async function degradedDeleteIds(env: Env, ids: number[], canContinue: ()
         break;
       }
     } catch (error) {
+      const quota = toDailyWriteQuotaExhaustedError(error);
+      if (quota) throw quota;
       firstError = truncateMessage(error);
       uncertainReserved += 1;
       notAttempted += ids.length - index - 1;
@@ -686,7 +827,7 @@ async function cleanupFtsTable(env: Env, table: "posts_search_trigram" | "posts_
     const selected = await env.DB.prepare(`SELECT rowid FROM ${table} WHERE rowid > ? ORDER BY rowid ASC LIMIT 25`)
       .bind(cursor)
       .all<{ rowid: number }>();
-    const ids = (selected.results ?? []).map((item) => Number(item.rowid)).filter((id) => Number.isInteger(id) && id > 0);
+    const ids = (selected.results ?? []).map((item: { rowid: number }) => Number(item.rowid)).filter((id: number) => Number.isInteger(id) && id > 0);
     if (ids.length === 0) {
       if (cursor !== 0) await stateUpsert(env, cursorKey, "0", nowIso()).run();
       return;
@@ -697,19 +838,29 @@ async function cleanupFtsTable(env: Env, table: "posts_search_trigram" | "posts_
         .bind(...ids, ...ids)
         .run();
     } catch (error) {
+      const quota = toDailyWriteQuotaExhaustedError(error);
+      if (quota) throw quota;
       console.error("cleanupFtsTable delete failed", table, truncateMessage(error));
+      return;
     }
     const nextCursor = ids.length < 25 ? 0 : Math.max(...ids);
     await stateUpsert(env, cursorKey, String(nextCursor), nowIso()).run();
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error("cleanupFtsTable failed", table, truncateMessage(error));
   }
 }
 
-export async function cleanupFtsOrphans(env: Env): Promise<void> {
+export interface CleanupFtsOrphansOptions {
+  paidPlan?: boolean;
+  limitMb?: number;
+}
+
+export async function cleanupFtsOrphans(env: Env, options: CleanupFtsOrphansOptions = {}): Promise<void> {
   try {
-    const paid = await readD1PaidEnabled(env);
-    const limitMb = await readDbPruneLimitMb(env, paid);
+    const paid = options.paidPlan ?? await readD1PaidEnabled(env);
+    const limitMb = options.limitMb ?? await readDbPruneLimitMb(env, paid);
     const { limitBytes } = pruneThresholds(limitMb, paid);
     const size = await readDatabaseSizeBytes(env);
     if (size === null || size >= limitBytes) return;
@@ -718,6 +869,8 @@ export async function cleanupFtsOrphans(env: Env): Promise<void> {
     await cleanupFtsTable(env, "posts_search_trigram", STATE_FTS_TRIGRAM_CURSOR);
     await cleanupFtsTable(env, "posts_search_bigrams", STATE_FTS_BIGRAM_CURSOR);
   } catch (error) {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (quota) throw quota;
     console.error("cleanupFtsOrphans failed", truncateMessage(error));
   }
 }
@@ -728,35 +881,52 @@ export async function readDatabaseSizeBytes(env: Env): Promise<number | null> {
   return typeof size === "number" && Number.isFinite(size) && size >= 0 ? size : null;
 }
 
+// A missing settings row is the documented default; a D1 query error is not a
+// default. Callers decide whether to skip the round, so these helpers must
+// reject with the original error instead of silently choosing free-plan limits.
 export async function readD1PaidEnabled(env: Env): Promise<boolean> {
-  try {
-    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind("d1_paid_enabled").first<{ value: string }>();
-    return row?.value === "1" || row?.value === "true";
-  } catch (error) {
-    console.error("readD1PaidEnabled failed", truncateMessage(error));
-    return false;
-  }
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind("d1_paid_enabled").first<{ value: string }>();
+  return row?.value === "1" || row?.value === "true";
 }
 
-export async function readDbPruneLimitMb(env: Env, paid?: boolean): Promise<number> {
+export async function readDbPruneLimitMb(env: Env, paid: boolean): Promise<number> {
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind("db_prune_limit_mb").first<{ value: string }>();
+  return decodeStoredPruneLimitMb(row?.value, paid);
+}
+
+function parseCandidateCursor(raw: string): PruneCandidateCursor | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  let parsed: unknown;
   try {
-    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind("db_prune_limit_mb").first<{ value: string }>();
-    const effectivePaid = paid ?? (await readD1PaidEnabled(env));
-    return decodeStoredPruneLimitMb(row?.value, effectivePaid);
+    parsed = JSON.parse(trimmed);
   } catch (error) {
-    console.error("readDbPruneLimitMb failed", truncateMessage(error));
-    return clampDbPruneLimitMb(undefined, paid ?? false);
+    console.error("invalid db_prune_candidate_cursor; starting from oldest", truncateMessage(error));
+    return null;
   }
+  if (Array.isArray(parsed) && parsed.length === 3) {
+    const publishedAt = parsed[0];
+    const id = parsed[1];
+    const restartAt = parsed[2];
+    if (typeof publishedAt === "string" && publishedAt.length > 0
+      && typeof id === "number" && Number.isSafeInteger(id) && id > 0
+      && typeof restartAt === "string" && Number.isFinite(new Date(restartAt).getTime())) {
+      return { publishedAt, id, restartAt };
+    }
+  }
+  console.error("invalid db_prune_candidate_cursor; starting from oldest", trimmed.slice(0, 200));
+  return null;
 }
 
 export async function readPruneState(env: Env): Promise<PruneState> {
-  const result = await env.DB.prepare("SELECT key, value FROM sync_state WHERE key IN (?, ?, ?, ?, ?, ?)")
-    .bind(STATE_ACTIVE_KEY, STATE_DAY_KEY, STATE_DELETED_KEY, STATE_LAST_AT_KEY, STATE_LAST_ERROR_KEY, STATE_BLOCKED_KEY)
+  const result = await env.DB.prepare("SELECT key, value FROM sync_state WHERE key IN (?, ?, ?, ?, ?, ?, ?)")
+    .bind(STATE_ACTIVE_KEY, STATE_DAY_KEY, STATE_DELETED_KEY, STATE_LAST_AT_KEY, STATE_LAST_ERROR_KEY, STATE_BLOCKED_KEY, STATE_CANDIDATE_CURSOR)
     .all<{ key: string; value: string }>();
   const rows = result.results ?? [];
-  const readValue = (key: string): string => rows.find((row) => row.key === key)?.value ?? "";
+  const readValue = (key: string): string => rows.find((row: { key: string; value: string }) => row.key === key)?.value ?? "";
   const rawDeleted = readValue(STATE_DELETED_KEY);
   const deleted = Number(rawDeleted);
+  const candidateCursorRaw = readValue(STATE_CANDIDATE_CURSOR);
   return {
     active: readValue(STATE_ACTIVE_KEY) === "1",
     day: readValue(STATE_DAY_KEY),
@@ -764,19 +934,22 @@ export async function readPruneState(env: Env): Promise<PruneState> {
     deletedTodayRaw: rawDeleted,
     lastAt: readValue(STATE_LAST_AT_KEY),
     lastError: readValue(STATE_LAST_ERROR_KEY),
-    hasCounter: rows.some((row) => row.key === STATE_DELETED_KEY),
-    blockedFull: readValue(STATE_BLOCKED_KEY) === "1"
+    hasCounter: rows.some((row: { key: string; value: string }) => row.key === STATE_DELETED_KEY),
+    blockedFull: readValue(STATE_BLOCKED_KEY) === "1",
+    candidateCursorRaw,
+    candidateCursor: parseCandidateCursor(candidateCursorRaw)
   };
 }
 
 /**
  * Sizes the D1 database and deletes the oldest eligible posts until the size
- * falls below the hysteresis target or the daily/run limits are reached.
+ * falls below the hysteresis target or the daily/run/page limits are reached.
  * Never throws: failures are recorded in sync_state.db_prune_last_error.
  */
 export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = {}): Promise<PruneRunResult> {
   const clock = options.now ?? (() => new Date());
-  const queryRemaining = options.queryRemaining ?? (() => Number.POSITIVE_INFINITY);
+  const finalMeter = options.meter ?? createQueryMeter(env);
+  const queryRemaining = options.queryRemaining ?? (() => finalMeter.remaining());
   const headroom = (needed: number): boolean => hasQueryHeadroom(queryRemaining(), needed);
   let sizeBytes: number | null = null;
   let paidPlan = false;
@@ -784,7 +957,7 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
   let fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
   let limitMb = DB_PRUNE_FREE_DEFAULT_LIMIT_MB;
   let thresholds = pruneThresholds(limitMb);
-  let state: PruneState = { active: false, day: "", deletedToday: 0, deletedTodayRaw: "", lastAt: "", lastError: "", hasCounter: false, blockedFull: false };
+  let state: PruneState = { active: false, day: "", deletedToday: 0, deletedTodayRaw: "", lastAt: "", lastError: "", hasCounter: false, blockedFull: false, candidateCursorRaw: "", candidateCursor: null };
   let indexState: IndexStateSnapshot | null = null;
   let indexVerified = false;
   let indexDay = false;
@@ -792,25 +965,37 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
   let active = false;
   let deletedThisRun = 0;
   let lastError = "";
+  let dailyWriteQuotaExhausted = false;
+  const quotaTerminated = (stage: string, error: unknown): boolean => {
+    const quota = toDailyWriteQuotaExhaustedError(error);
+    if (!quota) return false;
+    if (!dailyWriteQuotaExhausted) {
+      dailyWriteQuotaExhausted = true;
+      finalMeter.markDailyWriteQuotaExhausted();
+      lastError = `D1 daily write quota exhausted during ${stage}; prune paused until 00:00 UTC: ${truncateMessage(error)}`;
+      console.error("d1_daily_write_quota_exhausted", stage, truncateMessage(error));
+    }
+    return true;
+  };
+  const createdState = (skipped = false) => ({
+    skipped,
+    sizeBytes,
+    limitBytes: thresholds.limitBytes,
+    targetBytes: thresholds.targetBytes,
+    active,
+    deletedToday: state.deletedToday,
+    deletedThisRun,
+    lastError,
+    paidPlan,
+    maxCapacityBytes,
+    fivePostThresholdBytes,
+    indexState: indexState?.value ?? null,
+    indexVerified,
+    indexDay,
+    dailyCap,
+    dailyWriteQuotaExhausted
+  });
   try {
-    const createdState = (skipped = false) => ({
-      skipped,
-      sizeBytes,
-      limitBytes: thresholds.limitBytes,
-      targetBytes: thresholds.targetBytes,
-      active,
-      deletedToday: state.deletedToday,
-      deletedThisRun,
-      lastError,
-      paidPlan,
-      maxCapacityBytes,
-      fivePostThresholdBytes,
-      indexState: indexState?.value ?? null,
-      indexVerified,
-      indexDay,
-      dailyCap
-    });
-
     const currentIndex = options.indexState ?? await readIndexState(env);
     indexState = currentIndex;
     if (currentIndex.invalid) {
@@ -841,6 +1026,7 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
         try {
           await stateUpsert(env, STATE_BLOCKED_KEY, "0", nowIso()).run();
         } catch (error) {
+          if (quotaTerminated("blocked_flag_clear", error)) return createdState();
           console.error("prune blocked flag clear failed", truncateMessage(error));
         }
       }
@@ -874,22 +1060,27 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
       try {
         await stateUpsert(env, STATE_DELETED_KEY, String(state.deletedToday), nowIso()).run();
       } catch (error) {
+        if (quotaTerminated("deleted_counter_normalize", error)) return createdState();
         console.error("prune counter normalize failed", truncateMessage(error));
       }
     }
 
     const today = utcDayString(clock());
-    const cutoff = new Date(clock().getTime() - DB_PRUNE_MIN_AGE_MS).toISOString();
     if (state.day !== today || !state.hasCounter || state.blockedFull) {
       try {
         await initPruneDay(env, today);
       } catch (error) {
         // No delete may run before a persistent quota reservation; an init
         // failure means zero deletes this run, never a bootstrap delete.
+        if (quotaTerminated("day_init", error)) return createdState();
         active = sizeBytes > targetBytes;
         lastError = `prune day init failed: ${truncateMessage(error)}`;
         console.error(lastError);
-        await recordPruneError(env, lastError);
+        try {
+          await recordPruneError(env, lastError);
+        } catch (persistError) {
+          if (quotaTerminated("error_key", persistError)) return createdState();
+        }
         return createdState();
       }
       state.hasCounter = true;
@@ -908,8 +1099,18 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
     const markBlocked = async (): Promise<void> => {
       try {
         await stateUpsert(env, STATE_BLOCKED_KEY, "1", nowIso()).run();
-      } catch (blockedError) {
-        console.error("prune blocked flag persist failed", truncateMessage(blockedError));
+      } catch (error) {
+        const quota = toDailyWriteQuotaExhaustedError(error);
+        if (quota) throw quota;
+        console.error("prune blocked flag persist failed", truncateMessage(error));
+      }
+    };
+    const markBlockedOrStop = async (): Promise<boolean> => {
+      try {
+        await markBlocked();
+        return true;
+      } catch (error) {
+        return !quotaTerminated("blocked_flag_write", error);
       }
     };
     const refundReservedQuota = async (count: number): Promise<boolean> => {
@@ -921,15 +1122,46 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
         }
         console.error("prune quota refund not applied", count);
         return false;
-      } catch (refundError) {
-        console.error("prune quota refund failed", truncateMessage(refundError));
+      } catch (error) {
+        const quota = toDailyWriteQuotaExhaustedError(error);
+        if (quota) throw quota;
+        console.error("prune quota refund failed", truncateMessage(error));
         return false;
+      }
+    };
+    const refundOrStop = async (count: number): Promise<boolean> => {
+      try {
+        await refundReservedQuota(count);
+        return true;
+      } catch (error) {
+        return !quotaTerminated("refund", error);
+      }
+    };
+
+    // One eligibility snapshot per invocation. `restartAt` caps the next scan
+    // at the first skipped row's own 24h boundary instead of rescanning the
+    // same old-published/recently-fetched prefix every minute.
+    const snapshotNow = clock();
+    const cutoffMs = snapshotNow.getTime() - DB_PRUNE_MIN_AGE_MS;
+    const cutoff = new Date(cutoffMs).toISOString();
+    let cursor = state.candidateCursor;
+    let restartAt = cursor ? cursor.restartAt : new Date(snapshotNow.getTime() + DB_PRUNE_MIN_AGE_MS).toISOString();
+    const persistCursor = async (value: string): Promise<"ok" | "stop"> => {
+      try {
+        await stateUpsert(env, STATE_CANDIDATE_CURSOR, value, nowIso()).run();
+        return "ok";
+      } catch (error) {
+        if (quotaTerminated("candidate_cursor", error)) return "stop";
+        lastError = `candidate cursor write failed: ${truncateMessage(error)}`;
+        console.error(lastError);
+        return "stop";
       }
     };
 
     let exhaustedChunks = true;
     let degraded = false;
-    for (let chunk = 0; chunk < DB_PRUNE_MAX_CHUNKS && deletedThisRun < DB_PRUNE_RUN_MAX_POSTS; chunk++) {
+    let scanPages = 0;
+    while (scanPages < DB_PRUNE_MAX_SCAN_PAGES && deletedThisRun < DB_PRUNE_RUN_MAX_POSTS) {
       if (!isPruneWindow(clock()) || !indexVerified) {
         active = sizeBytes > targetBytes;
         exhaustedChunks = false;
@@ -947,174 +1179,278 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
         exhaustedChunks = false;
         break;
       }
-      const wanted = Math.min(DB_PRUNE_BATCH_SIZE, DB_PRUNE_RUN_MAX_POSTS - deletedThisRun, remainingDaily);
-      if (wanted <= 0) {
+      const pageLimit = Math.min(DB_PRUNE_BATCH_SIZE, remainingDaily, DB_PRUNE_RUN_MAX_POSTS - deletedThisRun);
+      if (pageLimit <= 0) {
+        active = sizeBytes > targetBytes;
+        exhaustedChunks = false;
+        break;
+      }
+      if (cursor && new Date(cursor.restartAt).getTime() <= clock().getTime()) {
+        console.error("db_prune_candidate_cursor expired; restarting from oldest");
+        if (!isPruneWindow(clock())) {
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        if ((await persistCursor("")) === "stop") {
+          if (dailyWriteQuotaExhausted) return createdState();
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        cursor = null;
         active = sizeBytes > targetBytes;
         exhaustedChunks = false;
         break;
       }
 
-      const candidates = await env.DB.prepare("SELECT id FROM posts WHERE published_at < ? AND fetched_at < ? ORDER BY published_at ASC, id ASC LIMIT ?")
-        .bind(cutoff, cutoff, wanted)
-        .all<{ id: number }>();
-      const ids = (candidates.results ?? []).map((row) => Number(row.id)).filter((id) => Number.isInteger(id) && id > 0);
-      if (ids.length === 0) {
-        active = false;
-        exhaustedChunks = false;
-        break;
+      const candidates = cursor
+        ? await env.DB.prepare(CANDIDATE_SQL_AFTER).bind(cursor.publishedAt, cursor.id, cutoff, pageLimit).all<{ published_at: string; id: number; fetched_at: string }>()
+        : await env.DB.prepare(CANDIDATE_SQL_FIRST).bind(cutoff, pageLimit).all<{ published_at: string; id: number; fetched_at: string }>();
+      scanPages += 1;
+      const rows = candidates.results ?? [];
+      const pageFull = rows.length === pageLimit;
+      const ids: number[] = [];
+      for (const row of rows) {
+        const rowId = Number(row.id);
+        if (!Number.isInteger(rowId) || rowId <= 0) continue;
+        const fetchedAt = Date.parse(String(row.fetched_at ?? ""));
+        if (Number.isFinite(fetchedAt) && fetchedAt < cutoffMs) {
+          ids.push(rowId);
+        } else if (Number.isFinite(fetchedAt)) {
+          const candidateRestartAt = new Date(fetchedAt + DB_PRUNE_MIN_AGE_MS).toISOString();
+          if (Date.parse(candidateRestartAt) < Date.parse(restartAt)) restartAt = candidateRestartAt;
+        }
       }
+      const lastRow = rows.length > 0 ? rows[rows.length - 1] : null;
 
       let deleted: number | null = 0;
       let reserved = 0;
-      try {
-        if (!(await reserveQuota(env, ids.length, dailyCap))) {
+      let processed = ids.length === 0;
+
+      if (ids.length > 0) {
+        reserved = ids.length;
+        try {
+          if (!(await reserveQuota(env, reserved, dailyCap))) {
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
+        } catch (error) {
+          if (quotaTerminated("reservation", error)) return createdState();
+          lastError = `prune quota reservation failed: ${truncateMessage(error)}`;
+          console.error(lastError);
           active = sizeBytes > targetBytes;
           exhaustedChunks = false;
           break;
         }
-        reserved = ids.length;
         state.deletedToday += reserved;
 
         if (!isPruneWindow(clock())) {
-          await refundReservedQuota(reserved);
+          if (!(await refundOrStop(reserved))) return createdState();
           if (!lastError) lastError = "prune window closed before delete";
           active = sizeBytes > targetBytes;
           exhaustedChunks = false;
           break;
         }
 
-        const outcome = await deletePostIds(env, ids);
-        deleted = outcome.deleted;
-        if (deleted === null) {
-          lastError = "posts delete did not return a changes count; keeping quota reservation";
-          await markBlocked();
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        if (deleted < reserved) {
-          await refundReservedQuota(reserved - deleted);
-        }
-        if (deleted === 0) await markBlocked();
-      } catch (error) {
-        if (isDailyWriteQuotaError(error)) {
-          // No application-level total cap: the platform refused the write.
-          // Keep the quota reservation, end the round, and wait for the next
-          // 00:00 UTC reset plus the following 23:30-00:00 window.
-          lastError = `D1 daily write quota exhausted; prune paused until 00:00 UTC: ${truncateMessage(error)}`;
-          console.error(lastError);
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        if (!isDbSizeError(error)) {
-          // Ambiguous batch outcome (timeout/transport error): the posts may
-          // have been deleted, so the quota reservation stays.
-          lastError = truncateMessage(error);
-          await markBlocked();
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        console.error("prune 4-statement batch failed; wall path", truncateMessage(error));
-        if (reserved <= 0) {
-          lastError = "prune reservation failed at size wall";
-          await markBlocked();
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        if (!isPruneWindow(clock()) || !headroom(4)) {
-          await refundReservedQuota(reserved);
-          if (!lastError) lastError = "prune window or query budget closed before full-db fallback";
-          await markBlocked();
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        const wall = await wallDeleteIds(env, ids, () => isPruneWindow(clock()));
-        if (wall.postError !== null && isDailyWriteQuotaError(wall.postError)) {
-          lastError = `D1 daily write quota exhausted; prune paused until 00:00 UTC: ${truncateMessage(wall.postError)}`;
-          console.error(lastError);
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        if (wall.postError !== null && !isDbSizeError(wall.postError)) {
-          // The posts delete was submitted but the outcome is unknown.
-          lastError = truncateMessage(wall.postError);
-          await markBlocked();
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        if (!wall.postsSubmitted) {
-          // The posts delete was never submitted, so its quota is provably
-          // unused; committed read_states deletes are not undone.
-          await refundReservedQuota(reserved);
-          if (!lastError) lastError = "prune window closed before wall posts delete";
-          await markBlocked();
-          active = sizeBytes > targetBytes;
-          exhaustedChunks = false;
-          break;
-        }
-        if (wall.postError !== null) {
-          // The posts delete failed with a capacity error: posts are known not
-          // deleted, read_states may be committed. 1-row degradation reuses the
-          // same reservation and refunds only provably unused post quota.
-          if (!headroom(DB_PRUNE_DEGRADED_QUERY_RESERVE)) {
-            await refundReservedQuota(reserved);
-            lastError = "query headroom insufficient before degraded deletes";
-            await markBlocked();
+        try {
+          const outcome = await deletePostIds(env, ids);
+          deleted = outcome.deleted;
+          if (deleted === null) {
+            lastError = "posts delete did not return a changes count; keeping quota reservation";
+            if (!(await markBlockedOrStop())) return createdState();
             active = sizeBytes > targetBytes;
             exhaustedChunks = false;
             break;
           }
-          degraded = true;
-          const degradation = await degradedDeleteIds(env, ids, () => isPruneWindow(clock()) && headroom(2));
-          deleted = degradation.confirmedDeleted;
-          const refundable = degradation.definiteNotDeleted + degradation.notAttempted;
-          if (refundable > 0) await refundReservedQuota(refundable);
-          lastError = degradation.firstError || truncateMessage(wall.postError);
-          await markBlocked();
-        } else {
+          if (deleted < reserved) {
+            deletedThisRun += deleted;
+            if (!(await refundOrStop(reserved - deleted))) return createdState();
+            if (deleted === 0 && !(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
+          processed = true;
+        } catch (error) {
+          if (quotaTerminated("posts_delete", error)) return createdState();
+          if (!isDbSizeError(error)) {
+            // Ambiguous batch outcome (timeout/transport error): the posts may
+            // have been deleted, so the quota reservation stays.
+            lastError = truncateMessage(error);
+            if (!(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
+          console.error("prune 4-statement batch failed; wall path", truncateMessage(error));
+          if (!isPruneWindow(clock()) || !headroom(4)) {
+            if (!(await refundOrStop(reserved))) return createdState();
+            if (!lastError) lastError = "prune window or query budget closed before full-db fallback";
+            if (!(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
+          let wall: WallDeleteOutcome;
+          try {
+            wall = await wallDeleteIds(env, ids, () => isPruneWindow(clock()));
+          } catch (wallError) {
+            if (quotaTerminated("wall_read_states_delete", wallError)) return createdState();
+            throw wallError;
+          }
+          if (wall.postError !== null) {
+            if (quotaTerminated("wall_posts_delete", wall.postError)) return createdState();
+            if (!isDbSizeError(wall.postError)) {
+              // The posts delete was submitted but the outcome is unknown.
+              lastError = truncateMessage(wall.postError);
+              if (!(await markBlockedOrStop())) return createdState();
+              active = sizeBytes > targetBytes;
+              exhaustedChunks = false;
+              break;
+            }
+          }
+          if (!wall.postsSubmitted) {
+            // The posts delete was never submitted, so its quota is provably
+            // unused; committed read_states deletes are not undone.
+            if (!(await refundOrStop(reserved))) return createdState();
+            if (!lastError) lastError = "prune window closed before wall posts delete";
+            if (!(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
+          if (wall.postError !== null) {
+            // The posts delete failed with a capacity error: posts are known not
+            // deleted, read_states may be committed. 1-row degradation reuses the
+            // same reservation and refunds only provably unused post quota.
+            if (!headroom(DB_PRUNE_DEGRADED_QUERY_RESERVE)) {
+              if (!(await refundOrStop(reserved))) return createdState();
+              lastError = "query headroom insufficient before degraded deletes";
+              if (!(await markBlockedOrStop())) return createdState();
+              active = sizeBytes > targetBytes;
+              exhaustedChunks = false;
+              break;
+            }
+            degraded = true;
+            let degradation: DegradedDeleteResult;
+            try {
+              degradation = await degradedDeleteIds(env, ids, () => isPruneWindow(clock()) && headroom(2));
+            } catch (degError) {
+              if (quotaTerminated("degraded_delete", degError)) return createdState();
+              throw degError;
+            }
+            deleted = degradation.confirmedDeleted;
+            deletedThisRun += deleted;
+            const refundable = degradation.definiteNotDeleted + degradation.notAttempted;
+            if (refundable > 0 && !(await refundOrStop(refundable))) return createdState();
+            lastError = degradation.firstError || truncateMessage(wall.postError);
+            if (!(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
           deleted = wall.deleted;
           if (deleted === null) {
             lastError = "wall posts delete did not return a changes count; keeping quota reservation";
-            await markBlocked();
-          } else {
-            if (deleted < reserved) await refundReservedQuota(reserved - deleted);
-            if (deleted === 0) await markBlocked();
+            if (!(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
           }
+          if (deleted < reserved) {
+            deletedThisRun += deleted;
+            if (!(await refundOrStop(reserved - deleted))) return createdState();
+            if (deleted === 0 && !(await markBlockedOrStop())) return createdState();
+            active = sizeBytes > targetBytes;
+            exhaustedChunks = false;
+            break;
+          }
+          processed = true;
         }
       }
+
+      if (!processed) {
+        active = sizeBytes > targetBytes;
+        exhaustedChunks = false;
+        break;
+      }
+
       const counted = deleted === null ? 0 : deleted;
       deletedThisRun += counted;
+      let targetReached = false;
+      if (counted > 0) {
+        const probed = await readDatabaseSizeBytes(env);
+        if (probed === null) {
+          lastError = "size_after unavailable";
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        sizeBytes = probed;
+        targetReached = sizeBytes <= targetBytes;
+      }
 
-      if (degraded) {
-        active = sizeBytes > targetBytes;
-        exhaustedChunks = false;
-        break;
-      }
-      if (counted === 0) {
-        active = sizeBytes > targetBytes;
-        exhaustedChunks = false;
-        break;
-      }
-
-      const probed = await readDatabaseSizeBytes(env);
-      if (probed === null) {
-        lastError = "size_after unavailable";
-        active = sizeBytes > targetBytes;
-        exhaustedChunks = false;
-        break;
-      }
-      sizeBytes = probed;
-      if (sizeBytes <= targetBytes) {
+      if (targetReached) {
+        if (!isPruneWindow(clock())) {
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        if ((await persistCursor("")) === "stop") {
+          if (dailyWriteQuotaExhausted) return createdState();
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        cursor = null;
         active = false;
         exhaustedChunks = false;
         break;
       }
+      if (!pageFull) {
+        if (!isPruneWindow(clock())) {
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        if ((await persistCursor("")) === "stop") {
+          if (dailyWriteQuotaExhausted) return createdState();
+          active = sizeBytes > targetBytes;
+          exhaustedChunks = false;
+          break;
+        }
+        cursor = null;
+        active = false;
+        exhaustedChunks = false;
+        break;
+      }
+      if (!lastRow) {
+        lastError = "candidate page missing cursor row";
+        active = sizeBytes > targetBytes;
+        exhaustedChunks = false;
+        break;
+      }
+      const nextCursor: PruneCandidateCursor = { publishedAt: String(lastRow.published_at ?? ""), id: Number(lastRow.id), restartAt };
+      if (!nextCursor.publishedAt || !Number.isSafeInteger(nextCursor.id) || nextCursor.id <= 0) {
+        lastError = "candidate cursor row is invalid";
+        active = sizeBytes > targetBytes;
+        exhaustedChunks = false;
+        break;
+      }
+      if (!isPruneWindow(clock())) {
+        active = sizeBytes > targetBytes;
+        exhaustedChunks = false;
+        break;
+      }
+      if ((await persistCursor(JSON.stringify([nextCursor.publishedAt, nextCursor.id, nextCursor.restartAt]))) === "stop") {
+        if (dailyWriteQuotaExhausted) return createdState();
+        active = sizeBytes > targetBytes;
+        exhaustedChunks = false;
+        break;
+      }
+      cursor = nextCursor;
     }
     if (exhaustedChunks) active = sizeBytes > targetBytes;
     if (deletedThisRun === 0 && !lastError && baseError) lastError = baseError;
@@ -1123,51 +1459,35 @@ export async function pruneOldPostsBySize(env: Env, options: PruneGateOptions = 
     const finalStatements: D1PreparedStatement[] = [stateUpsert(env, STATE_ACTIVE_KEY, active ? "1" : "0", finishedAt)];
     if (deletedThisRun > 0) finalStatements.push(stateUpsert(env, STATE_LAST_AT_KEY, finishedAt, finishedAt));
     if (deletedThisRun > 0 || lastError) finalStatements.push(stateUpsert(env, STATE_LAST_ERROR_KEY, lastError, finishedAt));
-    if (queryRemaining() >= 2) {
-      try {
-        await env.DB.batch(finalStatements);
-      } catch (error) {
-        console.error("prune final state batch failed", truncateMessage(error));
-      }
-    } else {
-      console.error("query budget exhausted before final prune state write");
+    try {
+      await finalMeter.runFinalStateBatch(finalStatements);
+    } catch (error) {
+      if (quotaTerminated("final_state_batch", error)) return createdState();
+      console.error("prune final state batch failed", truncateMessage(error));
     }
 
     // The blocked flag clear stays best-effort and outside the atomic final
     // batch: a clear failure must not roll back active/last_at/last_error.
-    if (!degraded && sizeBytes < limitBytes && queryRemaining() >= 1) {
+    if (!degraded && sizeBytes < limitBytes) {
       try {
-        await stateUpsert(env, STATE_BLOCKED_KEY, "0", finishedAt).run();
-      } catch (clearError) {
-        console.error("prune blocked flag clear failed", truncateMessage(clearError));
+        await finalMeter.clearFinalBlockedFlag(finishedAt);
+      } catch (error) {
+        if (quotaTerminated("blocked_flag_clear", error)) return createdState();
+        console.error("prune blocked flag clear failed", truncateMessage(error));
       }
     }
 
     return createdState();
   } catch (error) {
+    if (quotaTerminated("prune", error)) return createdState();
     lastError = truncateMessage(error);
     console.error("pruneOldPostsBySize failed", lastError);
     try {
       await stateUpsert(env, STATE_LAST_ERROR_KEY, lastError, nowIso()).run();
     } catch (persistError) {
+      if (quotaTerminated("error_key", persistError)) return createdState();
       console.error("pruneOldPostsBySize failed to persist error state", truncateMessage(persistError));
     }
-    return {
-      skipped: false,
-      sizeBytes,
-      limitBytes: thresholds.limitBytes,
-      targetBytes: thresholds.targetBytes,
-      active,
-      deletedToday: state.deletedToday,
-      deletedThisRun,
-      lastError,
-      paidPlan,
-      maxCapacityBytes,
-      fivePostThresholdBytes,
-      indexState: indexState?.value ?? null,
-      indexVerified,
-      indexDay,
-      dailyCap
-    };
+    return createdState();
   }
 }

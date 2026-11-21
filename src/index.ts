@@ -1,8 +1,8 @@
 import { accountInfo, currentUser, login, logout, newTelegramBindCode, register, updateEmail, updateTelegram } from "./auth";
 import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
-import { DB_PRUNE_BACKGROUND_QUERY_RESERVE, DB_PRUNE_CLAIM_QUERY_RESERVE, DB_PRUNE_DAILY_CAP, DB_PRUNE_FINAL_QUERY_RESERVE, DB_PRUNE_PRUNE_QUERY_RESERVE, D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, acquirePruneLease, buildAndVerifyReadStatesIndex, canClaimIndexBuild, claimIndexBuild, cleanupFtsOrphans, createQueryMeter, decideMaxNewPosts, isPruneWindow, pruneOldPostsBySize, pruneThresholds, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readIndexState, readPruneState, recoverIndexState, refreshPruneLease, releasePruneLease, runIsolated, isIndexDay, planBackgroundTasks, claimAbortsNormalWork, indexStateChanged } from "./prune";
-import type { PruneRunResult } from "./prune";
+import { DailyWriteQuotaExhaustedError, DB_PRUNE_BACKGROUND_QUERY_RESERVE, DB_PRUNE_CLAIM_QUERY_RESERVE, DB_PRUNE_DAILY_CAP, DB_PRUNE_PRUNE_QUERY_RESERVE, D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, acquirePruneLease, buildAndVerifyReadStatesIndex, canClaimIndexBuild, claimIndexBuild, cleanupFtsOrphans, createQueryMeter, decideMaxNewPosts, isDailyWriteQuotaError, isPruneWindow, pruneOldPostsBySize, pruneThresholds, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readIndexState, readPruneState, recoverIndexState, refreshPruneLease, runIsolated, isIndexDay, planBackgroundTasks, claimAbortsNormalWork, indexStateChanged } from "./prune";
+import type { IndexStateSnapshot, PruneRunResult } from "./prune";
 import { queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { backfillSearchIndexes, recordSearchIndexError } from "./search";
@@ -35,6 +35,10 @@ function goInterstitial(): Response {
 
 function requireUser(user: User | null): Response | null {
   return user ? null : json({ error: "需要登录" }, 401);
+}
+
+function isQuotaStop(error: unknown): boolean {
+  return error instanceof DailyWriteQuotaExhaustedError || isDailyWriteQuotaError(error);
 }
 
 async function listHighlights(env: Env, user: User): Promise<Response> {
@@ -180,16 +184,38 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
   // Cheap point-read only: building/lastError summary, never counts or cursors.
   const searchIndexState = await measure("searchIndexMs", async () => env.DB.prepare("SELECT complete FROM search_index_state WHERE id = 1").first<{ complete: number }>());
   const storage = await measure("storageMs", async () => {
-    const paidPlan = await readD1PaidEnabled(env);
-    const sizeBytes = await readDatabaseSizeBytes(env);
-    const limitMb = await readDbPruneLimitMb(env, paidPlan);
-    const { limitBytes, targetBytes } = pruneThresholds(limitMb, paidPlan);
-    const maxCapacityBytes = (paidPlan ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB) * 1_000_000;
-    const fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
+    const sizeBytes = await readDatabaseSizeBytes(env).catch((error: unknown) => {
+      console.error("readDatabaseSizeBytes failed", error instanceof Error ? error.message : String(error));
+      return null;
+    });
     const pruneState = await readPruneState(env);
     const indexState = await readIndexState(env);
     const indexDay = indexState.value === "2" ? isIndexDay(indexState) : false;
-    return { sizeBytes, limitBytes, targetBytes, active: pruneState.active, deletedToday: pruneState.deletedToday, lastPruneAt: pruneState.lastAt || null, lastPruneError: pruneState.lastError || null, paidPlan, maxCapacityBytes, fivePostThresholdBytes, blockedFull: pruneState.blockedFull, indexState: indexState.value, indexStateRaw: indexState.raw, indexStateInvalid: indexState.invalid, indexDay, dailyCap: DB_PRUNE_DAILY_CAP };
+    const base = {
+      sizeBytes,
+      active: pruneState.active,
+      deletedToday: pruneState.deletedToday,
+      lastPruneAt: pruneState.lastAt || null,
+      lastPruneError: pruneState.lastError || null,
+      blockedFull: pruneState.blockedFull,
+      indexState: indexState.value,
+      indexStateRaw: indexState.raw,
+      indexStateInvalid: indexState.invalid,
+      indexDay,
+      dailyCap: DB_PRUNE_DAILY_CAP
+    };
+    let paidPlan: boolean;
+    let limitMb: number;
+    try {
+      paidPlan = await readD1PaidEnabled(env);
+      limitMb = await readDbPruneLimitMb(env, paidPlan);
+    } catch (error) {
+      return { ...base, paidPlan: null, limitBytes: null, targetBytes: null, maxCapacityBytes: null, fivePostThresholdBytes: null, error: error instanceof Error ? error.message : String(error) };
+    }
+    const { limitBytes, targetBytes } = pruneThresholds(limitMb, paidPlan);
+    const maxCapacityBytes = (paidPlan ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB) * 1_000_000;
+    const fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
+    return { ...base, paidPlan, limitBytes, targetBytes, maxCapacityBytes, fivePostThresholdBytes };
   });
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
@@ -388,24 +414,44 @@ export default {
     const meter = createQueryMeter(env);
     const cronEnv = meter.env;
 
-    let indexState = await readIndexState(cronEnv);
+    let indexState: IndexStateSnapshot;
+    try {
+      indexState = await readIndexState(cronEnv);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isQuotaStop(error)) {
+        console.error("d1_daily_write_quota_exhausted", "initial_state", message);
+      } else {
+        console.error("readIndexState failed; skipping scheduled work", message);
+      }
+      return;
+    }
     if (indexState.invalid) {
       console.error("Invalid db_prune_index_state value; keeping it and disabling index/prune", indexState.raw);
     }
     // State-1 recovery may run in an overlapping invocation, but only the
     // observed updated_at can prove the holder is gone. Recovery itself never
-    // starts normal work.
+    // starts normal work: this invocation ends unconditionally after one
+    // recovery attempt, whatever state (or error) it produces.
     if (!indexState.invalid && indexState.value === "1") {
-      const recovery = await recoverIndexState(cronEnv, indexState);
-      if (recovery.state.value === "1") return;
-      indexState = recovery.state;
+      try {
+        await recoverIndexState(cronEnv, indexState);
+      } catch (error) {
+        console.error("recoverIndexState failed; ending invocation", error instanceof Error ? error.message : String(error));
+      }
+      return;
     }
 
     let leaseToken: string | null = null;
     try {
       leaseToken = await acquirePruneLease(cronEnv);
     } catch (error) {
-      console.error("acquirePruneLease failed; skipping normal cron work", error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      if (isQuotaStop(error)) {
+        console.error("d1_daily_write_quota_exhausted", "acquire_lease", message);
+      } else {
+        console.error("acquirePruneLease failed; skipping normal cron work", message);
+      }
       return;
     }
     if (!leaseToken) {
@@ -413,10 +459,28 @@ export default {
       return;
     }
     const token = leaseToken;
-    const background: Array<Promise<unknown>> = [];
+    const releaseLease = async (): Promise<void> => {
+      try {
+        await meter.releaseLeaseOnce(token);
+      } catch (error) {
+        console.error("releaseLeaseOnce failed", error instanceof Error ? error.message : String(error));
+      }
+    };
+    let backgroundChain: Promise<void> | null = null;
 
     try {
-      const stateAfterLease = await readIndexState(cronEnv);
+      let stateAfterLease: IndexStateSnapshot;
+      try {
+        stateAfterLease = await readIndexState(cronEnv);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isQuotaStop(error)) {
+          console.error("d1_daily_write_quota_exhausted", "state_after_lease", message);
+        } else {
+          console.error("readIndexState after lease failed; aborting", message);
+        }
+        return;
+      }
       if (indexStateChanged(stateAfterLease, indexState)) {
         console.warn("db_prune_index_state changed after lease acquisition; aborting normal work");
         return;
@@ -424,41 +488,79 @@ export default {
       indexState = stateAfterLease;
 
       const startedAt = Date.now();
-      const paidPlan = await readD1PaidEnabled(cronEnv);
-      const limitMb = await readDbPruneLimitMb(cronEnv, paidPlan);
-      const maxCapacityBytes = (paidPlan ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB) * 1_000_000;
-      const fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
+      let settingsOk = true;
+      let paidKnown = false;
+      let paidPlan = false;
+      let limitMb = 0;
+      try {
+        paidPlan = await readD1PaidEnabled(cronEnv);
+        paidKnown = true;
+        limitMb = await readDbPruneLimitMb(cronEnv, paidPlan);
+      } catch (error) {
+        if (isQuotaStop(error)) {
+          console.error("prune settings read hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+          return;
+        }
+        settingsOk = false;
+        const key = paidKnown ? "db_prune_limit_mb" : "d1_paid_enabled";
+        const message = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+        console.error("prune_settings_read_failed", JSON.stringify({ key, message }));
+      }
+
       let sizeProbe: number | null = null;
       try {
         sizeProbe = await readDatabaseSizeBytes(cronEnv);
       } catch (error) {
+        if (isQuotaStop(error)) {
+          console.error("readDatabaseSizeBytes hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+          return;
+        }
         console.error("readDatabaseSizeBytes before sync failed", error instanceof Error ? error.message : String(error));
       }
-      const maxNewPosts = decideMaxNewPosts({ sizeBytes: sizeProbe, fivePostThresholdBytes });
+      const maxNewPosts = decideMaxNewPosts({ sizeBytes: sizeProbe, paid: paidKnown ? paidPlan : null });
       const result = await safeSyncRss(cronEnv, maxNewPosts === undefined ? undefined : { maxNewPosts });
+      if (!result.ok && isQuotaStop(result.error)) {
+        console.error("RSS sync hit D1 daily write quota; ending invocation", String(result.error ?? ""));
+        return;
+      }
       let subscriptionTimings = { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
       let subscriptionsOk = true;
       if (result.ok && !result.firstSync) {
         try {
           subscriptionTimings = await processSubscriptions(cronEnv, result.insertedPosts);
         } catch (error) {
+          if (isQuotaStop(error)) {
+            console.error("processSubscriptions hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+            return;
+          }
           subscriptionsOk = false;
           console.error("processSubscriptions failed; skipping index claim", error instanceof Error ? error.message : String(error));
         }
       }
 
-      const leaseHeld = await refreshPruneLease(cronEnv, token);
+      let leaseHeld = false;
+      try {
+        leaseHeld = await refreshPruneLease(cronEnv, token);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isQuotaStop(error)) {
+          console.error("d1_daily_write_quota_exhausted", "refresh_lease", message);
+        } else {
+          console.error("refreshPruneLease failed; skipping maintenance", message);
+        }
+        return;
+      }
       if (!leaseHeld) {
         console.warn("prune lease lost before maintenance; skipping claim and prune");
         return;
       }
 
       let maintenanceInvocation = false;
-      if (!indexState.invalid && indexState.value === "0" && canClaimIndexBuild(indexState)) {
+      if (settingsOk && !indexState.invalid && indexState.value === "0" && canClaimIndexBuild(indexState)) {
         if (!result.ok || !subscriptionsOk) {
           console.warn("sync or subscriptions did not complete; staying in db_prune_index_state 0");
-        } else if (meter.used() + DB_PRUNE_CLAIM_QUERY_RESERVE > meter.limit) {
-          console.warn("query headroom insufficient for claim+DDL+verify+failure cleanup; staying 0", JSON.stringify({ used: meter.used(), limit: meter.limit }));
+        } else if (meter.remaining() < DB_PRUNE_CLAIM_QUERY_RESERVE) {
+          console.warn("query headroom insufficient for claim+DDL+verify+failure cleanup; staying 0", JSON.stringify({ remaining: meter.remaining() }));
         } else {
           try {
             const fresh = await readIndexState(cronEnv);
@@ -476,6 +578,10 @@ export default {
               }
             }
           } catch (error) {
+            if (isQuotaStop(error)) {
+              console.error("index build admission hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+              return;
+            }
             console.error("index build admission failed; staying 0", error instanceof Error ? error.message : String(error));
           }
         }
@@ -484,39 +590,66 @@ export default {
 
       const cleanupStartedAt = Date.now();
       let cleanupOldDataMs = 0;
-      await runIsolated("cleanupOldData", async () => {
-        await cleanupOldData(cronEnv);
-      });
+      try {
+        await runIsolated("cleanupOldData", async () => {
+          await cleanupOldData(cronEnv);
+        });
+      } catch (error) {
+        if (isQuotaStop(error)) {
+          console.error("cleanupOldData hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+          return;
+        }
+        console.error("cleanupOldData failed unexpectedly; continuing", error instanceof Error ? error.message : String(error));
+      }
       cleanupOldDataMs = Date.now() - cleanupStartedAt;
 
-      await runIsolated("recordCronTiming", async () => {
-        await recordCronTiming(cronEnv, {
-          recordedAt: new Date().toISOString(),
-          ok: result.ok,
-          firstSync: result.firstSync,
-          inserted: result.inserted,
-          ranProcessSubscriptions: result.ok && !result.firstSync,
-          timings: {
-            rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
-            processSubscriptionsMs: subscriptionTimings.totalMs,
-            cleanupOldDataMs,
-            totalMs: Date.now() - startedAt
-          },
-          cpu: {
-            rssParseItemsMs: result.cpu?.parseItemsMs || 0,
-            processSubscriptionsCompileMs: subscriptionTimings.compileRegexMs,
-            processSubscriptionsMatchMs: subscriptionTimings.matchMs,
-            cleanupPrepMs: 0,
-            totalMs: (result.cpu?.parseItemsMs || 0) + subscriptionTimings.compileRegexMs + subscriptionTimings.matchMs
-          },
-          ...(result.error ? { error: result.error } : {})
+      try {
+        await runIsolated("recordCronTiming", async () => {
+          await recordCronTiming(cronEnv, {
+            recordedAt: new Date().toISOString(),
+            ok: result.ok,
+            firstSync: result.firstSync,
+            inserted: result.inserted,
+            ranProcessSubscriptions: result.ok && !result.firstSync,
+            timings: {
+              rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
+              processSubscriptionsMs: subscriptionTimings.totalMs,
+              cleanupOldDataMs,
+              totalMs: Date.now() - startedAt
+            },
+            cpu: {
+              rssParseItemsMs: result.cpu?.parseItemsMs || 0,
+              processSubscriptionsCompileMs: subscriptionTimings.compileRegexMs,
+              processSubscriptionsMatchMs: subscriptionTimings.matchMs,
+              cleanupPrepMs: 0,
+              totalMs: (result.cpu?.parseItemsMs || 0) + subscriptionTimings.compileRegexMs + subscriptionTimings.matchMs
+            },
+            ...(result.error ? { error: result.error } : {})
+          });
         });
-      });
+      } catch (error) {
+        if (isQuotaStop(error)) {
+          console.error("recordCronTiming hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+          return;
+        }
+        console.error("recordCronTiming failed unexpectedly; continuing", error instanceof Error ? error.message : String(error));
+      }
 
-      const pruneWindowOpen = !indexState.invalid && indexState.value === "2" && isPruneWindow();
+      const pruneWindowOpen = settingsOk && !indexState.invalid && indexState.value === "2" && isPruneWindow();
       let prune: PruneRunResult | null = null;
       if (pruneWindowOpen) {
-        const stillHeld = await refreshPruneLease(cronEnv, token);
+        let stillHeld = false;
+        try {
+          stillHeld = await refreshPruneLease(cronEnv, token);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (isQuotaStop(error)) {
+            console.error("d1_daily_write_quota_exhausted", "refresh_lease_before_prune", message);
+          } else {
+            console.error("refreshPruneLease before prune failed; skipping prune and background maintenance", message);
+          }
+          return;
+        }
         if (!stillHeld) {
           console.warn("prune lease lost before prune; skipping prune and background maintenance");
           return;
@@ -525,18 +658,24 @@ export default {
           console.warn("query headroom insufficient for prune; skipping this run", JSON.stringify({ remaining: meter.remaining() }));
         } else {
           try {
-            prune = await pruneOldPostsBySize(cronEnv, { indexState, paidPlan, limitMb, queryRemaining: () => meter.remaining() });
+            prune = await pruneOldPostsBySize(cronEnv, { indexState, paidPlan, limitMb, meter, queryRemaining: () => meter.remaining() });
           } catch (error) {
+            if (isQuotaStop(error)) {
+              console.error("pruneOldPostsBySize hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+              return;
+            }
             console.error("pruneOldPostsBySize failed; continuing", error instanceof Error ? error.message : String(error));
           }
         }
       }
 
+      if (prune?.dailyWriteQuotaExhausted) return;
+
       let pruneActive = false;
       if (prune) {
         pruneActive = prune.active;
       } else if (!indexState.invalid && indexState.value === "2") {
-        if (meter.remaining() >= 1 + DB_PRUNE_FINAL_QUERY_RESERVE) {
+        if (meter.remaining() >= 1) {
           try {
             pruneActive = (await readPruneState(cronEnv)).active;
           } catch (error) {
@@ -554,24 +693,56 @@ export default {
         pruneActive,
         pruneDeletedThisRun: prune?.deletedThisRun ?? 0
       });
-      if (backgroundPlan.runFtsOrphans || backgroundPlan.runSearchBackfill) {
-        if (meter.remaining() < DB_PRUNE_BACKGROUND_QUERY_RESERVE + DB_PRUNE_FINAL_QUERY_RESERVE) {
+      const wantOrphans = settingsOk && backgroundPlan.runFtsOrphans;
+      const wantBackfill = backgroundPlan.runSearchBackfill;
+      if (wantOrphans || wantBackfill) {
+        if (meter.remaining() < DB_PRUNE_BACKGROUND_QUERY_RESERVE) {
           console.warn("query headroom insufficient for background maintenance; skipping", JSON.stringify({ remaining: meter.remaining() }));
         } else {
-          if (backgroundPlan.runFtsOrphans) {
-            background.push(cleanupFtsOrphans(cronEnv).catch((error: unknown) => console.error("cleanupFtsOrphans failed", error instanceof Error ? error.message : String(error))));
-          }
-          if (backgroundPlan.runSearchBackfill) {
-            background.push(backfillSearchIndexes(cronEnv).catch((error: unknown) => recordSearchIndexError(cronEnv, error)));
-          }
+          backgroundChain = (async () => {
+            let canBackfill = true;
+            if (wantOrphans) {
+              try {
+                await cleanupFtsOrphans(cronEnv, { paidPlan, limitMb });
+              } catch (error) {
+                if (isQuotaStop(error)) {
+                  meter.markDailyWriteQuotaExhausted();
+                  console.error("cleanupFtsOrphans hit D1 daily write quota; stopping background chain", error instanceof Error ? error.message : String(error));
+                  canBackfill = false;
+                } else {
+                  console.error("cleanupFtsOrphans failed", error instanceof Error ? error.message : String(error));
+                }
+              }
+            }
+            if (canBackfill && wantBackfill && meter.remaining() >= 4) {
+              try {
+                await backfillSearchIndexes(cronEnv);
+              } catch (error) {
+                if (isQuotaStop(error)) {
+                  meter.markDailyWriteQuotaExhausted();
+                  console.error("backfillSearchIndexes hit D1 daily write quota; stopping background chain", error instanceof Error ? error.message : String(error));
+                } else {
+                  try {
+                    await recordSearchIndexError(cronEnv, error);
+                  } catch (recordError) {
+                    if (isQuotaStop(recordError)) {
+                      meter.markDailyWriteQuotaExhausted();
+                      console.error("recordSearchIndexError hit D1 daily write quota; stopping background chain", recordError instanceof Error ? recordError.message : String(recordError));
+                    } else {
+                      console.error("recordSearchIndexError failed", recordError instanceof Error ? recordError.message : String(recordError));
+                    }
+                  }
+                }
+              }
+            }
+          })();
         }
       }
     } finally {
-      if (background.length > 0) {
-        const release = () => releasePruneLease(env, token);
-        ctx.waitUntil(Promise.allSettled(background).then(release, release));
+      if (backgroundChain) {
+        ctx.waitUntil(backgroundChain.then(releaseLease, releaseLease));
       } else {
-        await releasePruneLease(env, token);
+        await releaseLease();
       }
     }
   }
