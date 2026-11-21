@@ -1,5 +1,5 @@
 import { json, nowIso, one } from "./db";
-import { D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, decodeStoredPruneLimitMb, encodePruneLimitMb } from "./prune";
+import { D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, decodeStoredPruneLimitMb, encodePruneLimitMb, readIndexState } from "./prune";
 import type { Env } from "./types";
 
 const encryptedKeys = new Set(["brevo_api_key", "telegram_bot_token"]);
@@ -11,7 +11,6 @@ export interface RuntimeSettings {
   mailFrom: string;
   mailFromName: string;
   readStateRetentionDays: number;
-  postRetentionDays: number;
   dbPruneLimitMb: number;
   d1PaidEnabled: boolean;
   d1MaxCapacityMb: number;
@@ -103,14 +102,13 @@ export async function setSetting(env: Env, key: string, value: string): Promise<
 }
 
 export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
-  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, postDays, dbPruneLimit, d1Paid, pushDays, pageSize, searchResultLimit] = await Promise.all([
+  const [brevoApiKey, telegramBotToken, telegramBotUsername, mailFrom, mailFromName, readDays, dbPruneLimit, d1Paid, pushDays, pageSize, searchResultLimit] = await Promise.all([
     getSetting(env, "brevo_api_key"),
     getSetting(env, "telegram_bot_token"),
     getSetting(env, "telegram_bot_username"),
     getSetting(env, "mail_from"),
     getSetting(env, "mail_from_name"),
     getSetting(env, "read_state_retention_days"),
-    getSetting(env, "post_retention_days"),
     getSetting(env, "db_prune_limit_mb"),
     getSetting(env, "d1_paid_enabled"),
     getSetting(env, "push_log_retention_days"),
@@ -126,7 +124,6 @@ export async function runtimeSettings(env: Env): Promise<RuntimeSettings> {
     mailFrom: mailFrom || env.MAIL_FROM || "",
     mailFromName: mailFromName || env.MAIL_FROM_NAME || "NodeSeek RSS Reader",
     readStateRetentionDays: clampDays(readDays || env.READ_STATE_RETENTION_DAYS, 7),
-    postRetentionDays: clampDays(postDays || env.POST_RETENTION_DAYS, 365),
     dbPruneLimitMb: decodeStoredPruneLimitMb(dbPruneLimit, paid),
     d1PaidEnabled: paid,
     d1MaxCapacityMb: maxCapacityMb,
@@ -179,6 +176,7 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
 export async function adminSettingsResponse(request: Request, env: Env): Promise<Response> {
   if (!(await isAdmin(request, env))) return json({ admin: false, adminSecretConfigured: !!env.ADMIN_SECRET }, 401);
   const settings = await runtimeSettings(env);
+  const indexState = await readIndexState(env);
   return json({
     admin: true,
     adminSecretConfigured: !!env.ADMIN_SECRET,
@@ -188,14 +186,15 @@ export async function adminSettingsResponse(request: Request, env: Env): Promise
     mailFrom: settings.mailFrom,
     mailFromName: settings.mailFromName,
     readStateRetentionDays: settings.readStateRetentionDays,
-    postRetentionDays: settings.postRetentionDays,
     dbPruneLimitMb: settings.dbPruneLimitMb,
     d1PaidEnabled: settings.d1PaidEnabled,
     d1MaxCapacityMb: settings.d1MaxCapacityMb,
     d1FivePostThresholdMb: settings.d1FivePostThresholdMb,
     pushLogRetentionDays: settings.pushLogRetentionDays,
     pageSize: settings.pageSize,
-    searchResultLimit: settings.searchResultLimit
+    searchResultLimit: settings.searchResultLimit,
+    dbPruneIndexState: indexState.value,
+    dbPruneIndexStateInvalid: indexState.invalid
   });
 }
 
@@ -208,7 +207,6 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
     telegramBotToken?: unknown;
     telegramBotUsername?: unknown;
     readStateRetentionDays?: unknown;
-    postRetentionDays?: unknown;
     dbPruneLimitMb?: unknown;
     d1PaidEnabled?: unknown;
     pushLogRetentionDays?: unknown;
@@ -222,9 +220,6 @@ export async function updateAdminSettings(request: Request, env: Env): Promise<R
   if (typeof body.telegramBotToken === "string" && body.telegramBotToken.trim()) updates.push(["telegram_bot_token", body.telegramBotToken.trim()]);
   if (typeof body.telegramBotUsername === "string") updates.push(["telegram_bot_username", body.telegramBotUsername.trim()]);
   if (body.readStateRetentionDays !== undefined) updates.push(["read_state_retention_days", String(clampDays(body.readStateRetentionDays, 7))]);
-  // The admin page no longer submits postRetentionDays; keep the legacy value
-  // (and its background cleanup) untouched unless a caller explicitly sends it.
-  if (body.postRetentionDays !== undefined) updates.push(["post_retention_days", String(clampDays(body.postRetentionDays, 365))]);
   const paidProvided = body.d1PaidEnabled !== undefined;
   const paid = paidProvided ? parseD1Paid(body.d1PaidEnabled) : undefined;
   if (paidProvided) updates.push(["d1_paid_enabled", paid ? "1" : "0"]);
@@ -289,5 +284,5 @@ function adminPageHtml(token: string): string {
 
 function baseAdminPageHtml(token: string): string {
   const safeToken = token.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch));
-  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeSeek RSS Reader 管理员</title><style>:root{color-scheme:light dark}body{font-family:system-ui;margin:0;background:#f8f8f8;color:#111}.wrap{max-width:860px;margin:0 auto;padding:14px}.card{display:grid;gap:10px;background:#fff;border:1px solid #ddd;border-radius:18px;padding:14px;margin-bottom:14px}input,button{font:inherit;border:1px solid #ddd;border-radius:12px;padding:.5rem}.primary{background:#1663ff;border-color:#1663ff;color:#fff}.danger{background:#d71920;border-color:#d71920;color:#fff}label{display:grid;gap:4px}.muted{color:#666}.user{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border:1px solid #ddd;border-radius:14px;padding:10px}.user b{overflow:hidden;text-overflow:ellipsis}.stats{font-size:12px;color:#666}details{border:1px solid #ddd;border-radius:14px;padding:10px}summary{cursor:pointer;font-weight:700}li{margin:.25rem 0}@media(prefers-color-scheme:dark){body{background:#000;color:#f5f5f5}.card,input,button,.user,details{background:#000;color:#f5f5f5;border-color:#2a2a2a}.muted,.stats{color:#aaa}}</style><body><main class="wrap"><h1>管理员配置</h1><form class="card" id="adminForm"><label>Brevo API Key<input name="brevoApiKey" id="brevoApiKey"></label><details><summary>查看 Brevo API Key 获取教程</summary><ol><li>打开 <a href="https://www.brevo.com/" target="_blank" rel="noreferrer">Brevo 官网</a> 并注册或登录账号。</li><li>进入 Brevo 控制台后，打开右上角账号菜单。</li><li>进入「SMTP & API」。</li><li>切换到「API Keys」。也可以直接尝试打开 <a href="https://app.brevo.com/settings/keys/api" target="_blank" rel="noreferrer">Brevo API Keys 页面</a>。</li><li>点击「Generate a new API key」。</li><li>名称可填写 <b>NodeSeek RSS Reader</b>。</li><li>复制生成的 API Key，粘贴到本页的「Brevo API Key」。</li><li>继续填写「发件邮箱」和「发件人名称」，然后点击保存。</li></ol><p class="muted">注意：发件邮箱必须是 Brevo 允许发送的邮箱或已验证域名下的邮箱；如果邮件发不出去，请先在 Brevo 检查 Sender / Domain 是否已验证。API Key 保存后不会明文显示，留空保存不会覆盖旧 Key。</p></details><label>发件邮箱<input name="mailFrom" id="mailFrom"></label><label>发件人名称<input name="mailFromName" id="mailFromName"></label><label>Telegram Bot Token<input name="telegramBotToken" id="telegramBotToken"></label><label>Telegram Bot 用户名<input name="telegramBotUsername" id="telegramBotUsername" placeholder="@your_bot_name"></label><label>已读保留天数<input name="readStateRetentionDays" id="readStateRetentionDays" type="number" min="1" max="3650"></label><label>付费版 D1<select name="d1PaidEnabled" id="d1PaidEnabled"><option value="0">免费版（500MB）</option><option value="1">付费版（10GB）</option></select></label><label>数据库自动清理触发阈值（MB）<input name="dbPruneLimitMb" id="dbPruneLimitMb" type="number" min="100" max="9850" step="1" required><span class="muted" id="dbPruneHint">达到阈值后自动删除最旧帖子，降到阈值以下 30MB 停止；每天最多删除 2 万条；接近套餐最大容量 2MB 时新帖最多写入 5 条。</span></label><label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label><button class="primary">保存</button><a href="/">返回阅读器</a><p class="muted">管理链接包含 SECRET，请不要分享。请保存当前完整链接为书签。</p></form><section class="card"><h2>用户管理</h2><button type="button" id="refreshUsers">刷新用户列表</button><div id="users" class="muted">加载中</div></section></main><script>const token='${safeToken}';const $=s=>document.querySelector(s);function toast(m){alert(m)}async function load(){const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token));if(!r.ok){toast('管理员 token 不正确');return}const s=await r.json();$('#brevoApiKey').placeholder=s.brevoApiKeyConfigured?'已配置，留空不修改':'未配置';$('#telegramBotToken').placeholder=s.telegramBotTokenConfigured?'已配置，留空不修改':'未配置';$('#telegramBotUsername').value=s.telegramBotUsername||'';$('#mailFrom').value=s.mailFrom||'';$('#mailFromName').value=s.mailFromName||'';$('#readStateRetentionDays').value=s.readStateRetentionDays;$('#d1PaidEnabled').value=s.d1PaidEnabled?'1':'0';$('#dbPruneLimitMb').value=s.dbPruneLimitMb;$('#dbPruneHint').textContent='当前套餐最大容量 '+s.d1MaxCapacityMb+'MB；超过 '+s.d1FivePostThresholdMb+'MB 时新帖最多写入 5 条。达到阈值后自动删除最旧帖子，降到阈值以下 30MB 停止；每天最多删除 2 万条。';$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()}async function loadUsers(){const r=await fetch('/api/admin/users?token='+encodeURIComponent(token));if(!r.ok){$('#users').textContent='用户列表加载失败';return}const data=await r.json();$('#users').innerHTML=data.users.length?data.users.map(u=>'<div class="user"><div><b>'+u.username+'</b><div class="stats">邮箱 '+(u.email?'已绑定':'未绑定')+' · TG '+(u.telegram_chat_id?'已绑定':'未绑定')+' · 高亮 '+u.highlight_group_count+' · 屏蔽 '+u.block_rule_count+' · 订阅 '+u.subscription_count+' · 已读 '+u.read_count+'</div></div><button class="danger" data-del="'+u.id+'" data-name="'+u.username+'">删除</button></div>').join(''):'暂无用户'}$('#refreshUsers').onclick=loadUsers;document.addEventListener('click',async e=>{const b=e.target;if(!b.dataset.del)return;if(!confirm('确认删除用户 '+b.dataset.name+'？该用户的阅读状态、高亮、屏蔽、订阅和推送日志都会被删除。'))return;const r=await fetch('/api/admin/users/'+b.dataset.del+'?token='+encodeURIComponent(token),{method:'DELETE'});toast(r.ok?'已删除':'删除失败');loadUsers()});$('#adminForm').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));body.readStateRetentionDays=Number(body.readStateRetentionDays);body.d1PaidEnabled=Number(body.d1PaidEnabled);body.dbPruneLimitMb=Number(body.dbPruneLimitMb);body.pushLogRetentionDays=Number(body.pushLogRetentionDays);const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});toast(r.ok?'已保存':'保存失败')};$('#d1PaidEnabled').onchange=()=>{$('#dbPruneLimitMb').value=$('#d1PaidEnabled').value==='1'?'9850':'480';};load()</script></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NodeSeek RSS Reader 管理员</title><style>:root{color-scheme:light dark}body{font-family:system-ui;margin:0;background:#f8f8f8;color:#111}.wrap{max-width:860px;margin:0 auto;padding:14px}.card{display:grid;gap:10px;background:#fff;border:1px solid #ddd;border-radius:18px;padding:14px;margin-bottom:14px}input,button{font:inherit;border:1px solid #ddd;border-radius:12px;padding:.5rem}.primary{background:#1663ff;border-color:#1663ff;color:#fff}.danger{background:#d71920;border-color:#d71920;color:#fff}label{display:grid;gap:4px}.muted{color:#666}.user{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border:1px solid #ddd;border-radius:14px;padding:10px}.user b{overflow:hidden;text-overflow:ellipsis}.stats{font-size:12px;color:#666}details{border:1px solid #ddd;border-radius:14px;padding:10px}summary{cursor:pointer;font-weight:700}li{margin:.25rem 0}@media(prefers-color-scheme:dark){body{background:#000;color:#f5f5f5}.card,input,button,.user,details{background:#000;color:#f5f5f5;border-color:#2a2a2a}.muted,.stats{color:#aaa}}</style><body><main class="wrap"><h1>管理员配置</h1><form class="card" id="adminForm"><label>Brevo API Key<input name="brevoApiKey" id="brevoApiKey"></label><details><summary>查看 Brevo API Key 获取教程</summary><ol><li>打开 <a href="https://www.brevo.com/" target="_blank" rel="noreferrer">Brevo 官网</a> 并注册或登录账号。</li><li>进入 Brevo 控制台后，打开右上角账号菜单。</li><li>进入「SMTP & API」。</li><li>切换到「API Keys」。也可以直接尝试打开 <a href="https://app.brevo.com/settings/keys/api" target="_blank" rel="noreferrer">Brevo API Keys 页面</a>。</li><li>点击「Generate a new API key」。</li><li>名称可填写 <b>NodeSeek RSS Reader</b>。</li><li>复制生成的 API Key，粘贴到本页的「Brevo API Key」。</li><li>继续填写「发件邮箱」和「发件人名称」，然后点击保存。</li></ol><p class="muted">注意：发件邮箱必须是 Brevo 允许发送的邮箱或已验证域名下的邮箱；如果邮件发不出去，请先在 Brevo 检查 Sender / Domain 是否已验证。API Key 保存后不会明文显示，留空保存不会覆盖旧 Key。</p></details><label>发件邮箱<input name="mailFrom" id="mailFrom"></label><label>发件人名称<input name="mailFromName" id="mailFromName"></label><label>Telegram Bot Token<input name="telegramBotToken" id="telegramBotToken"></label><label>Telegram Bot 用户名<input name="telegramBotUsername" id="telegramBotUsername" placeholder="@your_bot_name"></label><label>已读保留天数<input name="readStateRetentionDays" id="readStateRetentionDays" type="number" min="1" max="3650"></label><label>付费版 D1<select name="d1PaidEnabled" id="d1PaidEnabled"><option value="0">免费版（500MB）</option><option value="1">付费版（10GB）</option></select></label><label>数据库自动清理触发阈值（MB）<input name="dbPruneLimitMb" id="dbPruneLimitMb" type="number" min="100" max="9850" step="1" required><span class="muted" id="dbPruneHint">索引未验证（状态 0）不删帖；UTC 23:30–00:00 先完成 RSS 同步，再建立并验证 read_states(post_id) 索引；验证通过（状态 2）后才在窗口内裁剪。每个 UTC 日最多 10,000 帖；免费版目标 450MB，付费版默认目标 9GB（触发阈值≤9000MB 时按阈值-30MB）；接近套餐最大容量减 2MB 时新帖最多写入 5 条。</span></label><label>推送日志保留天数<input name="pushLogRetentionDays" id="pushLogRetentionDays" type="number" min="1" max="3650"></label><button class="primary">保存</button><a href="/">返回阅读器</a><p class="muted">管理链接包含 SECRET，请不要分享。请保存当前完整链接为书签。</p></form><section class="card"><h2>用户管理</h2><button type="button" id="refreshUsers">刷新用户列表</button><div id="users" class="muted">加载中</div></section></main><script>const token='${safeToken}';const $=s=>document.querySelector(s);function toast(m){alert(m)}async function load(){const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token));if(!r.ok){toast('管理员 token 不正确');return}const s=await r.json();$('#brevoApiKey').placeholder=s.brevoApiKeyConfigured?'已配置，留空不修改':'未配置';$('#telegramBotToken').placeholder=s.telegramBotTokenConfigured?'已配置，留空不修改':'未配置';$('#telegramBotUsername').value=s.telegramBotUsername||'';$('#mailFrom').value=s.mailFrom||'';$('#mailFromName').value=s.mailFromName||'';$('#readStateRetentionDays').value=s.readStateRetentionDays;$('#d1PaidEnabled').value=s.d1PaidEnabled?'1':'0';$('#dbPruneLimitMb').value=s.dbPruneLimitMb;$('#dbPruneHint').textContent='当前套餐最大容量 '+s.d1MaxCapacityMb+'MB；超过 '+s.d1FivePostThresholdMb+'MB 时新帖最多写入 5 条。索引状态 '+s.dbPruneIndexState+(s.dbPruneIndexStateInvalid?'（配置值无效，已停止索引与裁剪）':'')+'（0=未验证，1=建索引/恢复，2=已验证）；每个 UTC 日最多 10,000 帖；免费版目标 450MB，付费版默认目标 9GB（触发阈值≤9000MB 时按阈值-30MB）；正常删除窗口 UTC 23:30–00:00。';$('#pushLogRetentionDays').value=s.pushLogRetentionDays;loadUsers()}async function loadUsers(){const r=await fetch('/api/admin/users?token='+encodeURIComponent(token));if(!r.ok){$('#users').textContent='用户列表加载失败';return}const data=await r.json();$('#users').innerHTML=data.users.length?data.users.map(u=>'<div class="user"><div><b>'+u.username+'</b><div class="stats">邮箱 '+(u.email?'已绑定':'未绑定')+' · TG '+(u.telegram_chat_id?'已绑定':'未绑定')+' · 高亮 '+u.highlight_group_count+' · 屏蔽 '+u.block_rule_count+' · 订阅 '+u.subscription_count+' · 已读 '+u.read_count+'</div></div><button class="danger" data-del="'+u.id+'" data-name="'+u.username+'">删除</button></div>').join(''):'暂无用户'}$('#refreshUsers').onclick=loadUsers;document.addEventListener('click',async e=>{const b=e.target;if(!b.dataset.del)return;if(!confirm('确认删除用户 '+b.dataset.name+'？该用户的阅读状态、高亮、屏蔽、订阅和推送日志都会被删除。'))return;const r=await fetch('/api/admin/users/'+b.dataset.del+'?token='+encodeURIComponent(token),{method:'DELETE'});toast(r.ok?'已删除':'删除失败');loadUsers()});$('#adminForm').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));body.readStateRetentionDays=Number(body.readStateRetentionDays);body.d1PaidEnabled=Number(body.d1PaidEnabled);body.dbPruneLimitMb=Number(body.dbPruneLimitMb);body.pushLogRetentionDays=Number(body.pushLogRetentionDays);const r=await fetch('/api/admin/settings?token='+encodeURIComponent(token),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});toast(r.ok?'已保存':'保存失败')};$('#d1PaidEnabled').onchange=()=>{$('#dbPruneLimitMb').value=$('#d1PaidEnabled').value==='1'?'9850':'480';};load()</script></body></html>`;
 }

@@ -1,7 +1,8 @@
 import { accountInfo, currentUser, login, logout, newTelegramBindCode, register, updateEmail, updateTelegram } from "./auth";
 import { cleanupOldData } from "./cleanup";
 import { all, json, readJson } from "./db";
-import { D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, cleanupFtsOrphans, decideMaxNewPosts, pruneOldPostsBySize, pruneThresholds, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readPruneState } from "./prune";
+import { DB_PRUNE_BACKGROUND_QUERY_RESERVE, DB_PRUNE_CLAIM_QUERY_RESERVE, DB_PRUNE_DAILY_CAP, DB_PRUNE_FINAL_QUERY_RESERVE, DB_PRUNE_PRUNE_QUERY_RESERVE, D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, acquirePruneLease, buildAndVerifyReadStatesIndex, canClaimIndexBuild, claimIndexBuild, cleanupFtsOrphans, createQueryMeter, decideMaxNewPosts, isPruneWindow, pruneOldPostsBySize, pruneThresholds, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readIndexState, readPruneState, recoverIndexState, refreshPruneLease, releasePruneLease, runIsolated, isIndexDay, planBackgroundTasks, claimAbortsNormalWork, indexStateChanged } from "./prune";
+import type { PruneRunResult } from "./prune";
 import { queryPosts } from "./posts";
 import { renderHome } from "./render";
 import { backfillSearchIndexes, recordSearchIndexError } from "./search";
@@ -182,11 +183,13 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
     const paidPlan = await readD1PaidEnabled(env);
     const sizeBytes = await readDatabaseSizeBytes(env);
     const limitMb = await readDbPruneLimitMb(env, paidPlan);
-    const { limitBytes, targetBytes } = pruneThresholds(limitMb);
+    const { limitBytes, targetBytes } = pruneThresholds(limitMb, paidPlan);
     const maxCapacityBytes = (paidPlan ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB) * 1_000_000;
     const fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
     const pruneState = await readPruneState(env);
-    return { sizeBytes, limitBytes, targetBytes, active: pruneState.active, deletedToday: pruneState.deletedToday, lastPruneAt: pruneState.lastAt || null, lastPruneError: pruneState.lastError || null, paidPlan, maxCapacityBytes, fivePostThresholdBytes, blockedFull: pruneState.blockedFull };
+    const indexState = await readIndexState(env);
+    const indexDay = indexState.value === "2" ? isIndexDay(indexState) : false;
+    return { sizeBytes, limitBytes, targetBytes, active: pruneState.active, deletedToday: pruneState.deletedToday, lastPruneAt: pruneState.lastAt || null, lastPruneError: pruneState.lastError || null, paidPlan, maxCapacityBytes, fivePostThresholdBytes, blockedFull: pruneState.blockedFull, indexState: indexState.value, indexStateRaw: indexState.raw, indexStateInvalid: indexState.invalid, indexDay, dailyCap: DB_PRUNE_DAILY_CAP };
   });
   const latestRss = rssResults.find((result) => result.success && result.latestGuid);
   let missingFromDb: string[] = [];
@@ -381,46 +384,196 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
-  // Capacity pruning runs before sync so a full database frees space first.
-  // pruneOldPostsBySize never throws; it records failures in sync_state.
-  const startedAt = Date.now();
-  const prune = await pruneOldPostsBySize(env);
-  const maxNewPosts = decideMaxNewPosts(prune);
-  const result = await safeSyncRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts });
-  let subscriptionTimings = { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
-  const shouldProcessSubscriptions = result.ok && !result.firstSync;
-  if (shouldProcessSubscriptions) {
-    subscriptionTimings = await processSubscriptions(env, result.insertedPosts);
+
+    const meter = createQueryMeter(env);
+    const cronEnv = meter.env;
+
+    let indexState = await readIndexState(cronEnv);
+    if (indexState.invalid) {
+      console.error("Invalid db_prune_index_state value; keeping it and disabling index/prune", indexState.raw);
+    }
+    // State-1 recovery may run in an overlapping invocation, but only the
+    // observed updated_at can prove the holder is gone. Recovery itself never
+    // starts normal work.
+    if (!indexState.invalid && indexState.value === "1") {
+      const recovery = await recoverIndexState(cronEnv, indexState);
+      if (recovery.state.value === "1") return;
+      indexState = recovery.state;
+    }
+
+    let leaseToken: string | null = null;
+    try {
+      leaseToken = await acquirePruneLease(cronEnv);
+    } catch (error) {
+      console.error("acquirePruneLease failed; skipping normal cron work", error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (!leaseToken) {
+      console.warn("prune lease is held by another invocation; skipping RSS, claim, and prune");
+      return;
+    }
+    const token = leaseToken;
+    const background: Array<Promise<unknown>> = [];
+
+    try {
+      const stateAfterLease = await readIndexState(cronEnv);
+      if (indexStateChanged(stateAfterLease, indexState)) {
+        console.warn("db_prune_index_state changed after lease acquisition; aborting normal work");
+        return;
+      }
+      indexState = stateAfterLease;
+
+      const startedAt = Date.now();
+      const paidPlan = await readD1PaidEnabled(cronEnv);
+      const limitMb = await readDbPruneLimitMb(cronEnv, paidPlan);
+      const maxCapacityBytes = (paidPlan ? D1_PAID_MAX_CAPACITY_MB : D1_FREE_MAX_CAPACITY_MB) * 1_000_000;
+      const fivePostThresholdBytes = Math.max(0, maxCapacityBytes - D1_FIVE_POST_MARGIN_MB * 1_000_000);
+      let sizeProbe: number | null = null;
+      try {
+        sizeProbe = await readDatabaseSizeBytes(cronEnv);
+      } catch (error) {
+        console.error("readDatabaseSizeBytes before sync failed", error instanceof Error ? error.message : String(error));
+      }
+      const maxNewPosts = decideMaxNewPosts({ sizeBytes: sizeProbe, fivePostThresholdBytes });
+      const result = await safeSyncRss(cronEnv, maxNewPosts === undefined ? undefined : { maxNewPosts });
+      let subscriptionTimings = { loadSubsMs: 0, loadSentMs: 0, compileRegexMs: 0, buildPostTextsMs: 0, matchMs: 0, sendMs: 0, totalMs: 0 };
+      let subscriptionsOk = true;
+      if (result.ok && !result.firstSync) {
+        try {
+          subscriptionTimings = await processSubscriptions(cronEnv, result.insertedPosts);
+        } catch (error) {
+          subscriptionsOk = false;
+          console.error("processSubscriptions failed; skipping index claim", error instanceof Error ? error.message : String(error));
+        }
+      }
+
+      const leaseHeld = await refreshPruneLease(cronEnv, token);
+      if (!leaseHeld) {
+        console.warn("prune lease lost before maintenance; skipping claim and prune");
+        return;
+      }
+
+      let maintenanceInvocation = false;
+      if (!indexState.invalid && indexState.value === "0" && canClaimIndexBuild(indexState)) {
+        if (!result.ok || !subscriptionsOk) {
+          console.warn("sync or subscriptions did not complete; staying in db_prune_index_state 0");
+        } else if (meter.used() + DB_PRUNE_CLAIM_QUERY_RESERVE > meter.limit) {
+          console.warn("query headroom insufficient for claim+DDL+verify+failure cleanup; staying 0", JSON.stringify({ used: meter.used(), limit: meter.limit }));
+        } else {
+          try {
+            const fresh = await readIndexState(cronEnv);
+            if (!fresh.invalid && fresh.value === "0" && canClaimIndexBuild(fresh)) {
+              const claim = await claimIndexBuild(cronEnv, fresh.updatedAt);
+              if (claimAbortsNormalWork(claim.status) || (claim.status === "claimed" && !claim.token)) {
+                // The claim may have committed 0 -> 1 but the response was
+                // lost; let the next invocation recover from the main database.
+                console.warn("index claim outcome is unknown; ending normal scheduling for main-DB recovery");
+                return;
+              }
+              if (claim.status === "claimed" && claim.token) {
+                maintenanceInvocation = true;
+                await buildAndVerifyReadStatesIndex(cronEnv, claim.token);
+              }
+            }
+          } catch (error) {
+            console.error("index build admission failed; staying 0", error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
+      if (maintenanceInvocation) return;
+
+      const cleanupStartedAt = Date.now();
+      let cleanupOldDataMs = 0;
+      await runIsolated("cleanupOldData", async () => {
+        await cleanupOldData(cronEnv);
+      });
+      cleanupOldDataMs = Date.now() - cleanupStartedAt;
+
+      await runIsolated("recordCronTiming", async () => {
+        await recordCronTiming(cronEnv, {
+          recordedAt: new Date().toISOString(),
+          ok: result.ok,
+          firstSync: result.firstSync,
+          inserted: result.inserted,
+          ranProcessSubscriptions: result.ok && !result.firstSync,
+          timings: {
+            rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
+            processSubscriptionsMs: subscriptionTimings.totalMs,
+            cleanupOldDataMs,
+            totalMs: Date.now() - startedAt
+          },
+          cpu: {
+            rssParseItemsMs: result.cpu?.parseItemsMs || 0,
+            processSubscriptionsCompileMs: subscriptionTimings.compileRegexMs,
+            processSubscriptionsMatchMs: subscriptionTimings.matchMs,
+            cleanupPrepMs: 0,
+            totalMs: (result.cpu?.parseItemsMs || 0) + subscriptionTimings.compileRegexMs + subscriptionTimings.matchMs
+          },
+          ...(result.error ? { error: result.error } : {})
+        });
+      });
+
+      const pruneWindowOpen = !indexState.invalid && indexState.value === "2" && isPruneWindow();
+      let prune: PruneRunResult | null = null;
+      if (pruneWindowOpen) {
+        const stillHeld = await refreshPruneLease(cronEnv, token);
+        if (!stillHeld) {
+          console.warn("prune lease lost before prune; skipping prune and background maintenance");
+          return;
+        }
+        if (meter.remaining() < DB_PRUNE_PRUNE_QUERY_RESERVE) {
+          console.warn("query headroom insufficient for prune; skipping this run", JSON.stringify({ remaining: meter.remaining() }));
+        } else {
+          try {
+            prune = await pruneOldPostsBySize(cronEnv, { indexState, paidPlan, limitMb, queryRemaining: () => meter.remaining() });
+          } catch (error) {
+            console.error("pruneOldPostsBySize failed; continuing", error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
+
+      let pruneActive = false;
+      if (prune) {
+        pruneActive = prune.active;
+      } else if (!indexState.invalid && indexState.value === "2") {
+        if (meter.remaining() >= 1 + DB_PRUNE_FINAL_QUERY_RESERVE) {
+          try {
+            pruneActive = (await readPruneState(cronEnv)).active;
+          } catch (error) {
+            pruneActive = true;
+            console.error("readPruneState for background planning failed; blocking search backfill", error instanceof Error ? error.message : String(error));
+          }
+        } else {
+          pruneActive = true;
+          console.warn("query headroom insufficient to read prune state; blocking search backfill");
+        }
+      }
+
+      const backgroundPlan = planBackgroundTasks({
+        pruneCalled: pruneWindowOpen,
+        pruneActive,
+        pruneDeletedThisRun: prune?.deletedThisRun ?? 0
+      });
+      if (backgroundPlan.runFtsOrphans || backgroundPlan.runSearchBackfill) {
+        if (meter.remaining() < DB_PRUNE_BACKGROUND_QUERY_RESERVE + DB_PRUNE_FINAL_QUERY_RESERVE) {
+          console.warn("query headroom insufficient for background maintenance; skipping", JSON.stringify({ remaining: meter.remaining() }));
+        } else {
+          if (backgroundPlan.runFtsOrphans) {
+            background.push(cleanupFtsOrphans(cronEnv).catch((error: unknown) => console.error("cleanupFtsOrphans failed", error instanceof Error ? error.message : String(error))));
+          }
+          if (backgroundPlan.runSearchBackfill) {
+            background.push(backfillSearchIndexes(cronEnv).catch((error: unknown) => recordSearchIndexError(cronEnv, error)));
+          }
+        }
+      }
+    } finally {
+      if (background.length > 0) {
+        const release = () => releasePruneLease(env, token);
+        ctx.waitUntil(Promise.allSettled(background).then(release, release));
+      } else {
+        await releasePruneLease(env, token);
+      }
+    }
   }
-  const cleanupStartedAt = Date.now();
-  await cleanupOldData(env);
-  const cleanupOldDataMs = Date.now() - cleanupStartedAt;
-  await recordCronTiming(env, {
-    recordedAt: new Date().toISOString(),
-    ok: result.ok,
-    firstSync: result.firstSync,
-    inserted: result.inserted,
-    ranProcessSubscriptions: shouldProcessSubscriptions,
-    timings: {
-      rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
-      processSubscriptionsMs: subscriptionTimings.totalMs,
-      cleanupOldDataMs,
-      totalMs: Date.now() - startedAt
-    },
-    cpu: {
-      rssParseItemsMs: result.cpu?.parseItemsMs || 0,
-      processSubscriptionsCompileMs: subscriptionTimings.compileRegexMs,
-      processSubscriptionsMatchMs: subscriptionTimings.matchMs,
-      cleanupPrepMs: 0,
-      totalMs: (result.cpu?.parseItemsMs || 0) + subscriptionTimings.compileRegexMs + subscriptionTimings.matchMs
-    },
-    ...(result.error ? { error: result.error } : {})
-  });
-  if (!prune.active || prune.deletedThisRun === 0) {
-    ctx.waitUntil(cleanupFtsOrphans(env).catch((error: unknown) => console.error("cleanupFtsOrphans failed", error instanceof Error ? error.message : String(error))));
-  }
-  if (!prune.active) {
-    ctx.waitUntil(backfillSearchIndexes(env).catch((error: unknown) => recordSearchIndexError(env, error)));
-  }
-}
+
 };

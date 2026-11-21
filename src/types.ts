@@ -1,5 +1,7 @@
 import type { SearchAnchorKind } from "./search";
 
+export type DbPruneIndexState = "0" | "1" | "2";
+
 export interface Env {
   DB: D1Database;
   RSS_URL?: string;
@@ -10,7 +12,6 @@ export interface Env {
   MAIL_FROM_NAME?: string;
   ADMIN_SECRET?: string;
   READ_STATE_RETENTION_DAYS?: string;
-  POST_RETENTION_DAYS?: string;
   PUSH_LOG_RETENTION_DAYS?: string;
 }
 
