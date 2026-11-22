@@ -4,12 +4,33 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-04-24",
   "triggers": {
-    "crons": ["*/1 * * * *"]
+    "crons": ["*/1 * * * *", "* * * * *", "0-59 * * * *"]
   },
   "observability": {
     "enabled": true
   },
+  "queues": {
+    "producers": [
+      {
+        "binding": "INGEST_QUEUE",
+        "queue": "nodeseek-rss-reader-ingest"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "nodeseek-rss-reader-ingest",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "max_concurrency": 1,
+        "dead_letter_queue": "nodeseek-rss-reader-ingest-dlq"
+      }
+    ]
+  },
   "vars": {
-    "RSS_URL": "https://rss.nodeseek.com/"
+    "RSS_URL": "https://rss.nodeseek.com/",
+    "INGEST_MODE": "inline",
+    "INGEST_ITEMS_PER_MESSAGE": "5",
+    "HTML_MODE": "regex"
   }
 }

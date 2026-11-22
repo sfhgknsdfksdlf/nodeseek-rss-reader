@@ -1,0 +1,37 @@
+{
+  "name": "observability.shouldEmitRunLog truth table",
+  "module": "observability",
+  "export": "shouldEmitRunLog",
+  "cases": [
+    {
+      "name": "samples a successful run below the 5% threshold",
+      "args": ["ok", 0.04],
+      "expect": true
+    },
+    {
+      "name": "does not sample a successful run at exactly 0.05",
+      "args": ["ok", 0.05],
+      "expect": false
+    },
+    {
+      "name": "does not sample a successful run above the threshold",
+      "args": ["ok", 0.99],
+      "expect": false
+    },
+    {
+      "name": "always keeps a failed run",
+      "args": ["failed", 0.99],
+      "expect": true
+    },
+    {
+      "name": "always keeps a retry run",
+      "args": ["retry", 0.99],
+      "expect": true
+    },
+    {
+      "name": "always keeps a dlq run",
+      "args": ["dlq", 0.99],
+      "expect": true
+    }
+  ]
+}

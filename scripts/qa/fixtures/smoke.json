@@ -1,0 +1,17 @@
+{
+  "name": "search.bigramTokens smoke",
+  "module": "search",
+  "export": "bigramTokens",
+  "cases": [
+    {
+      "name": "encodes each adjacent codepoint pair as a 12-char hex token",
+      "args": ["ab"],
+      "expect": ["000061000062"]
+    },
+    {
+      "name": "emits each bigram token only once",
+      "args": ["aaa"],
+      "expect": ["000061000061"]
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "name": "first-sync.parseTimeoutReleaseGuids timeout release exclusion audit",
+  "module": "first-sync",
+  "export": "parseTimeoutReleaseGuids",
+  "cases": [
+    {
+      "name": "reads a valid timeout release list",
+      "args": ["{\"reason\":\"timeout_released\",\"missingGuids\":[\"g1\",\"g2\"]}"],
+      "expect": ["g1", "g2"]
+    },
+    {
+      "name": "trims entries and dedupes while preserving order",
+      "args": ["{\"reason\":\"timeout_released\",\"missingGuids\":[\" g1 \",\"g2\",\"g1\",\"  \",\"g3\"]}"],
+      "expect": ["g1", "g2", "g3"]
+    },
+    {
+      "name": "ignores a different reason",
+      "args": ["{\"reason\":\"other\",\"missingGuids\":[\"g1\"]}"],
+      "expect": []
+    },
+    {
+      "name": "ignores the legacy missing/requeued shape",
+      "args": ["{\"missing\":2,\"requeued\":0,\"at\":\"2023-11-14T22:13:20.000Z\"}"],
+      "expect": []
+    },
+    {
+      "name": "ignores malformed JSON",
+      "args": ["{\"reason\":\"timeout_released\""],
+      "expect": []
+    },
+    {
+      "name": "ignores a non-array missingGuids",
+      "args": ["{\"reason\":\"timeout_released\",\"missingGuids\":\"g1\"}"],
+      "expect": []
+    },
+    {
+      "name": "keeps only non-empty string entries",
+      "args": ["{\"reason\":\"timeout_released\",\"missingGuids\":[\"g1\",1,null,\" g2 \",\"\"]}"],
+      "expect": ["g1", "g2"]
+    },
+    {
+      "name": "caps the exclusion list at 50 GUIDs",
+      "args": [
+        "{\"reason\":\"timeout_released\",\"missingGuids\":[\"g1\",\"g2\",\"g3\",\"g4\",\"g5\",\"g6\",\"g7\",\"g8\",\"g9\",\"g10\",\"g11\",\"g12\",\"g13\",\"g14\",\"g15\",\"g16\",\"g17\",\"g18\",\"g19\",\"g20\",\"g21\",\"g22\",\"g23\",\"g24\",\"g25\",\"g26\",\"g27\",\"g28\",\"g29\",\"g30\",\"g31\",\"g32\",\"g33\",\"g34\",\"g35\",\"g36\",\"g37\",\"g38\",\"g39\",\"g40\",\"g41\",\"g42\",\"g43\",\"g44\",\"g45\",\"g46\",\"g47\",\"g48\",\"g49\",\"g50\",\"g51\",\"g52\",\"g53\",\"g54\",\"g55\",\"g56\",\"g57\",\"g58\",\"g59\",\"g60\"]}"
+      ],
+      "expect": [
+        "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+        "g11", "g12", "g13", "g14", "g15", "g16", "g17", "g18", "g19", "g20",
+        "g21", "g22", "g23", "g24", "g25", "g26", "g27", "g28", "g29", "g30",
+        "g31", "g32", "g33", "g34", "g35", "g36", "g37", "g38", "g39", "g40",
+        "g41", "g42", "g43", "g44", "g45", "g46", "g47", "g48", "g49", "g50"
+      ]
+    },
+    {
+      "name": "a null value yields no exclusions",
+      "args": [null],
+      "expect": []
+    }
+  ]
+}

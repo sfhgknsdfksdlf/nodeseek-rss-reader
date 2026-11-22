@@ -1,0 +1,37 @@
+{
+  "name": "subscriptions.normalizeLegacyCursor legacy MAX cursor scope",
+  "module": "subscriptions",
+  "export": "normalizeLegacyCursor",
+  "cases": [
+    {
+      "name": "bumps the exact legacy no-subscription MAX cursor to MAX+1",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }],
+      "expect": { "postId": 15, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }
+    },
+    {
+      "name": "leaves a pending MAX cursor untouched when subscriptions exist",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": 7, "maxPostId": 14, "cursorPresent": true }],
+      "expect": { "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": 7, "maxPostId": 14, "cursorPresent": true }
+    },
+    {
+      "name": "leaves a non-MAX no-subscription cursor untouched",
+      "args": [{ "postId": 13, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }],
+      "expect": { "postId": 13, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }
+    },
+    {
+      "name": "leaves a MAX cursor with a non-zero subscription id untouched",
+      "args": [{ "postId": 14, "subscriptionId": 3, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }],
+      "expect": { "postId": 14, "subscriptionId": 3, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }
+    },
+    {
+      "name": "leaves a MAX cursor with a pending channel untouched",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "email", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }],
+      "expect": { "postId": 14, "subscriptionId": 0, "channel": "email", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }
+    },
+    {
+      "name": "leaves a missing cursor untouched for the bootstrap path",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": false }],
+      "expect": { "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": false }
+    }
+  ]
+}

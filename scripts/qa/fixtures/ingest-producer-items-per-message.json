@@ -1,0 +1,14 @@
+{
+  "name": "ingest-producer.resolveIngestItemsPerMessage canary downgrade",
+  "module": "ingest-producer",
+  "export": "resolveIngestItemsPerMessage",
+  "cases": [
+    { "name": "explicit 1 stays 1", "args": ["1"], "expect": 1 },
+    { "name": "explicit 3 stays 3", "args": ["3"], "expect": 3 },
+    { "name": "explicit 5 stays 5", "args": ["5"], "expect": 5 },
+    { "name": "an empty value falls back to 5", "args": [""], "expect": 5 },
+    { "name": "an absent value falls back to 5", "args": [], "expect": 5 },
+    { "name": "4 is not a supported size and falls back to 5", "args": ["4"], "expect": 5 },
+    { "name": "non-numeric text falls back to 5", "args": ["abc"], "expect": 5 }
+  ]
+}

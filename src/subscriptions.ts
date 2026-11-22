@@ -1,5 +1,6 @@
 import { all, nowIso, one, readJson } from "./db";
 import { compileChainedRule, matchChainedRule } from "./filters";
+import { FIRST_SYNC_INCOMPLETE_KEY, parseTimeoutReleaseGuids } from "./first-sync";
 import { recordPushLog, sendBrevo, sendTelegram } from "./notifications";
 import { budgetRemaining, consumeQuery } from "./query-budget";
 import type { QueryBudget } from "./query-budget";
@@ -24,6 +25,22 @@ interface NotificationCursor {
   postId: number;
   subscriptionId: number;
   channel: NotificationChannel | "";
+}
+
+/**
+ * One bounded read of the whole notification frontier. `postId` is the next
+ * post id to process (the posts scan stays `id >= postId`). `cursorPresent`
+ * is false when any of the three cursor keys is missing or unparseable, in
+ * which case the first-sync bootstrap must run.
+ */
+export interface NotificationSnapshot {
+  postId: number;
+  subscriptionId: number;
+  channel: string;
+  firstSubId: number | null;
+  maxPostId: number;
+  cursorPresent: boolean;
+  excludedGuids?: string[];
 }
 
 interface NotificationPostRow {
@@ -79,23 +96,65 @@ function parseCursorInteger(value: string): number | null {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
-async function loadNotificationCursor(env: Env): Promise<NotificationCursor | null> {
-  const row = await one<{ postId: string | null; subscriptionId: string | null; channel: string | null }>(
+export async function loadNotificationSnapshot(env: Env): Promise<NotificationSnapshot> {
+  const row = await one<{
+    postId: string | null;
+    subscriptionId: string | null;
+    channel: string | null;
+    firstSubId: number | null;
+    maxPostId: number | null;
+    firstSyncIncomplete: string | null;
+  }>(
     env.DB.prepare(`SELECT
       (SELECT value FROM sync_state WHERE key = ?) AS postId,
       (SELECT value FROM sync_state WHERE key = ?) AS subscriptionId,
-      (SELECT value FROM sync_state WHERE key = ?) AS channel`).bind(
+      (SELECT value FROM sync_state WHERE key = ?) AS channel,
+      (SELECT id FROM subscriptions LIMIT 1) AS firstSubId,
+      (SELECT MAX(id) FROM posts) AS maxPostId,
+      (SELECT value FROM sync_state WHERE key = ?) AS firstSyncIncomplete`).bind(
       NOTIFICATION_CURSOR_POST_ID,
       NOTIFICATION_CURSOR_SUBSCRIPTION_ID,
-      NOTIFICATION_CURSOR_CHANNEL
+      NOTIFICATION_CURSOR_CHANNEL,
+      FIRST_SYNC_INCOMPLETE_KEY
     )
   );
-  if (!row || row.postId === null || row.subscriptionId === null || row.channel === null) return null;
-  const postId = parseCursorInteger(row.postId);
-  const subscriptionId = parseCursorInteger(row.subscriptionId);
-  if (postId === null || subscriptionId === null) return null;
-  if (row.channel !== "" && row.channel !== "email" && row.channel !== "telegram") return null;
-  return { postId, subscriptionId, channel: row.channel };
+  const rawMax = row?.maxPostId ?? null;
+  const maxPostId = typeof rawMax === "number" && Number.isInteger(rawMax) && rawMax >= 0 ? rawMax : 0;
+  const rawFirst = row?.firstSubId ?? null;
+  const firstSubId = typeof rawFirst === "number" && Number.isInteger(rawFirst) && rawFirst >= 0 ? rawFirst : null;
+  const rawPostId = row?.postId ?? null;
+  const rawSubscriptionId = row?.subscriptionId ?? null;
+  const rawChannel = row?.channel ?? null;
+  const postId = rawPostId === null ? null : parseCursorInteger(rawPostId);
+  const subscriptionId = rawSubscriptionId === null ? null : parseCursorInteger(rawSubscriptionId);
+  const channelValid = rawChannel === "" || rawChannel === "email" || rawChannel === "telegram";
+  const cursorPresent = postId !== null && subscriptionId !== null && channelValid;
+  return {
+    postId: postId ?? maxPostId,
+    subscriptionId: subscriptionId ?? 0,
+    channel: channelValid && rawChannel !== null ? rawChannel : "",
+    firstSubId,
+    maxPostId,
+    cursorPresent,
+    excludedGuids: parseTimeoutReleaseGuids(row?.firstSyncIncomplete ?? null)
+  };
+}
+
+/**
+ * The old bootstrap stored MAX(posts.id) although the cursor means "next id to
+ * process", so `id >= cursor` reprocessed the newest imported post. Only the
+ * no-subscription shape can come from that bootstrap (the first sync has no
+ * users/subscriptions yet, and the zero-subscription catch-up wrote MAX); when
+ * subscriptions exist a cursor equal to MAX is a real pending post and must not
+ * be skipped.
+ */
+export function normalizeLegacyCursor(snapshot: NotificationSnapshot): NotificationSnapshot {
+  if (!snapshot.cursorPresent) return snapshot;
+  if (snapshot.firstSubId !== null) return snapshot;
+  if (snapshot.postId === snapshot.maxPostId && snapshot.subscriptionId === 0 && snapshot.channel === "") {
+    return { ...snapshot, postId: snapshot.maxPostId + 1 };
+  }
+  return snapshot;
 }
 
 function cursorUpserts(env: Env, cursor: NotificationCursor): D1PreparedStatement[] {
@@ -116,7 +175,7 @@ async function persistNotificationCursor(env: Env, cursor: NotificationCursor, b
 
 export async function initializeNotificationCursor(env: Env): Promise<void> {
   const row = await one<{ maxPostId: number | null }>(env.DB.prepare("SELECT MAX(id) AS maxPostId FROM posts"));
-  await env.DB.batch(cursorUpserts(env, { postId: row?.maxPostId ?? 0, subscriptionId: 0, channel: "" }));
+  await env.DB.batch(cursorUpserts(env, { postId: (row?.maxPostId ?? 0) + 1, subscriptionId: 0, channel: "" }));
 }
 
 function notificationPost(row: NotificationPostRow): RssNewPost {
@@ -176,7 +235,8 @@ async function loadPushStatuses(env: Env, posts: NotificationPostRow[]): Promise
  */
 export async function processNotifications(
   env: Env,
-  budget: QueryBudget
+  budget: QueryBudget,
+  snapshot?: NotificationSnapshot
 ): Promise<{
   attempts: number;
   matches: number;
@@ -188,27 +248,41 @@ export async function processNotifications(
 }> {
   const compileTimings = { compileMs: 0 };
   let matchMs = 0;
-  consumeQuery(budget);
-  const storedCursor = await loadNotificationCursor(env);
 
-  consumeQuery(budget);
-  const summary = await one<{ firstSubId: number | null; maxPostId: number | null }>(
-    env.DB.prepare("SELECT (SELECT id FROM subscriptions LIMIT 1) AS firstSubId, (SELECT MAX(id) FROM posts) AS maxPostId")
-  );
-  const hasSubscriptions = summary !== null && summary.firstSubId !== null;
-  const maxPostId = summary?.maxPostId ?? 0;
+  let current: NotificationSnapshot;
+  if (snapshot) {
+    current = snapshot;
+  } else {
+    consumeQuery(budget);
+    current = await loadNotificationSnapshot(env);
+  }
+  const normalized = normalizeLegacyCursor(current);
+  const legacyAdjusted = normalized.postId !== current.postId;
+  const maxPostId = normalized.maxPostId;
+  const excludedGuids = new Set(normalized.excludedGuids ?? []);
 
-  if (!storedCursor) {
-    const bootstrapCursor: NotificationCursor = { postId: maxPostId, subscriptionId: 0, channel: "" };
+  if (!normalized.cursorPresent) {
+    const bootstrapCursor: NotificationCursor = { postId: maxPostId + 1, subscriptionId: 0, channel: "" };
     await persistNotificationCursor(env, bootstrapCursor, budget);
     return { attempts: 0, matches: 0, skipped: 0, cursorPostId: bootstrapCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: bootstrapCursor };
   }
 
+  const storedCursor: NotificationCursor = {
+    postId: normalized.postId,
+    subscriptionId: normalized.subscriptionId,
+    channel: normalized.channel === "email" || normalized.channel === "telegram" ? normalized.channel : ""
+  };
+  const hasSubscriptions = normalized.firstSubId !== null;
+
   if (!hasSubscriptions) {
-    if (maxPostId > storedCursor.postId) {
-      const advancedCursor: NotificationCursor = { postId: maxPostId, subscriptionId: 0, channel: "" };
+    const catchupTarget = maxPostId + 1;
+    if (storedCursor.postId < catchupTarget) {
+      const advancedCursor: NotificationCursor = { postId: catchupTarget, subscriptionId: 0, channel: "" };
       await persistNotificationCursor(env, advancedCursor, budget);
       return { attempts: 0, matches: 0, skipped: 0, cursorPostId: advancedCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: advancedCursor };
+    }
+    if (legacyAdjusted) {
+      await persistNotificationCursor(env, storedCursor, budget);
     }
     return { attempts: 0, matches: 0, skipped: 0, cursorPostId: storedCursor.postId, compileMs: compileTimings.compileMs, matchMs, cursor: storedCursor };
   }
@@ -256,6 +330,17 @@ export async function processNotifications(
   };
 
   outer: for (const postRow of posts) {
+    // The release audit stores trimmed GUIDs, but posts.guid may retain feed
+    // whitespace, so compare the trimmed stored value without normalizing it.
+    if (excludedGuids.has(postRow.guid.trim())) {
+      // Released first-sync GUIDs may be inserted later, but they are historical
+      // and must never notify. Skip the whole post (even mid-cursor) with no
+      // queries, logs, or sends and advance the frontier past it.
+      cursor = { postId: postRow.id + 1, subscriptionId: 0, channel: "" };
+      cursorDirty = true;
+      subPageStart = -1;
+      continue;
+    }
     const post = notificationPost(postRow);
     const haystack = `${postRow.title}\n${postRow.content_text}\n${postRow.author || ""}\n${postRow.board_key || ""}`;
     const isResumePost = postRow.id === resumePostId;

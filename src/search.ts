@@ -86,18 +86,19 @@ function encodeCodepoint(codepoint: string): string {
 }
 
 export function bigramTokens(text: string): string[] {
-  const codepoints = Array.from(text);
   const tokens: string[] = [];
   const seen = new Set<string>();
-  for (let index = 0; index + 1 < codepoints.length; index += 1) {
-    const first = codepoints[index];
-    const second = codepoints[index + 1];
-    if (first === undefined || second === undefined) continue;
-    const token = encodeCodepoint(first) + encodeCodepoint(second);
-    if (!seen.has(token)) {
-      seen.add(token);
-      tokens.push(token);
+  let previousHex: string | null = null;
+  for (const codepoint of text) {
+    const currentHex = encodeCodepoint(codepoint);
+    if (previousHex !== null) {
+      const token = previousHex + currentHex;
+      if (!seen.has(token)) {
+        seen.add(token);
+        tokens.push(token);
+      }
     }
+    previousHex = currentHex;
   }
   return tokens;
 }
@@ -129,40 +130,64 @@ export async function indexPostForSearch(env: Env, post: Pick<Post, "id" | "titl
   await env.DB.batch(indexStatements(env, post));
 }
 
-export async function recordSearchIndexError(env: Env, error: unknown): Promise<void> {
+export async function recordSearchIndexError(env: Env, error: unknown): Promise<boolean> {
   const message = error instanceof Error ? error.message : String(error);
   const timestamp = nowIso();
   try {
     await env.DB.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('last_search_index_error', ?, ?)")
       .bind(`${timestamp} ${message}`.slice(0, 500), timestamp)
       .run();
+    return true;
   } catch (diagnosticError) {
     const diagnosticMessage = diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError);
     console.error("Search index diagnostic failed", diagnosticMessage);
+    return false;
   }
 }
 
-export async function markSearchIndexRetryPending(env: Env): Promise<void> {
+export async function markSearchIndexRetryPending(env: Env): Promise<boolean> {
   try {
     await env.DB.prepare("UPDATE search_index_state SET complete = 0, updated_at = ? WHERE id = 1").bind(nowIso()).run();
+    return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("Search index retry-flag update failed", message);
+    return false;
   }
 }
 
-export async function backfillSearchIndexes(env: Env): Promise<void> {
+export interface SearchBackfillResult {
+  indexed: number;
+  complete: boolean;
+  lastPostId: number;
+}
+
+/**
+ * Indexes one resumable batch of posts.
+ *
+ * `batchSize` bounds the SELECT and therefore the cursor advance: the same
+ * value drives the post page and the `last_post_id` update, so a caller using
+ * a smaller batch (the maintenance cron uses 5) keeps the exact same
+ * checkpoint/complete semantics. Callers that omit it keep the 20-post cron
+ * backfill used by the inline sync path.
+ */
+export async function backfillSearchIndexes(env: Env, batchSize: number = SEARCH_BACKFILL_BATCH): Promise<SearchBackfillResult> {
   const state = await one<{ last_post_id: number; complete: number }>(env.DB.prepare("SELECT last_post_id, complete FROM search_index_state WHERE id = 1"));
-  if (state?.complete === 1) return;
+  if (state?.complete === 1) return { indexed: 0, complete: true, lastPostId: state?.last_post_id ?? 0 };
   const lastPostId = state?.last_post_id ?? 0;
   const posts = await all<Pick<Post, "id" | "title" | "content_text">>(
-    env.DB.prepare("SELECT id, title, content_text FROM posts WHERE id > ? ORDER BY id ASC LIMIT ?").bind(lastPostId, SEARCH_BACKFILL_BATCH)
+    env.DB.prepare("SELECT id, title, content_text FROM posts WHERE id > ? ORDER BY id ASC LIMIT ?").bind(lastPostId, batchSize)
   );
   if (!posts.length) {
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO search_index_state (id, last_post_id, complete, updated_at) VALUES (1, ?, 1, ?) ON CONFLICT(id) DO UPDATE SET complete = 1, updated_at = excluded.updated_at").bind(lastPostId, nowIso())
-    ]);
-    return;
+    // Completion is conditional on the exact checkpoint we read and on no posts
+    // existing past it. A concurrent consumer write advances last_post_id or
+    // inserts a post, so changes stays 0 and this pass must not clobber the
+    // consumer's complete=0 repair flag.
+    const completed = await env.DB.prepare(
+      "UPDATE search_index_state SET complete = 1, updated_at = ? WHERE id = 1 AND last_post_id = ? AND NOT EXISTS (SELECT 1 FROM posts WHERE id > ?)"
+    ).bind(nowIso(), lastPostId, lastPostId).run();
+    const isComplete = completed.meta.changes === 1;
+    return { indexed: 0, complete: isComplete, lastPostId };
   }
   const maxId = posts[posts.length - 1]?.id ?? lastPostId;
   const statements = posts.flatMap((post) => indexStatements(env, post));
@@ -170,4 +195,5 @@ export async function backfillSearchIndexes(env: Env): Promise<void> {
     env.DB.prepare("INSERT INTO search_index_state (id, last_post_id, complete, updated_at) VALUES (1, ?, 0, ?) ON CONFLICT(id) DO UPDATE SET last_post_id = excluded.last_post_id, complete = 0, updated_at = excluded.updated_at").bind(maxId, nowIso())
   );
   await env.DB.batch(statements);
+  return { indexed: posts.length, complete: false, lastPostId: maxId };
 }

@@ -1,0 +1,31 @@
+{
+  "name": "ingest-producer.selectFirstSyncGuids snapshot selection",
+  "module": "ingest-producer",
+  "export": "selectFirstSyncGuids",
+  "cases": [
+    {
+      "name": "trims, drops blanks, and dedupes while preserving feed order",
+      "args": [[" g1 ", "", "g2", "g1", "  ", "g3"]],
+      "expect": ["g1", "g2", "g3"]
+    },
+    {
+      "name": "caps the snapshot at 20 GUIDs",
+      "args": [
+        [
+          "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+          "g11", "g12", "g13", "g14", "g15", "g16", "g17", "g18", "g19", "g20",
+          "g21", "g22", "g23", "g24", "g25"
+        ]
+      ],
+      "expect": [
+        "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+        "g11", "g12", "g13", "g14", "g15", "g16", "g17", "g18", "g19", "g20"
+      ]
+    },
+    {
+      "name": "an empty feed yields an empty snapshot",
+      "args": [[]],
+      "expect": []
+    }
+  ]
+}

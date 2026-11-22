@@ -1,0 +1,72 @@
+{
+  "name": "rss.parseChunkFields shared field extraction",
+  "module": "rss",
+  "export": "parseChunkFields",
+  "cases": [
+    {
+      "name": "rss item extracts every field without sanitizing the body",
+      "args": [
+        "<item><guid>g1</guid><title>T</title><link>https://example.com/1</link><description>hello</description><pubDate>2024-01-01T00:00:00Z</pubDate><category>tech</category><dc:creator>bob</dc:creator></item>"
+      ],
+      "expect": {
+        "guid": "g1",
+        "title": "T",
+        "link": "https://example.com/1",
+        "contentRaw": "hello",
+        "author": "bob",
+        "board": "tech",
+        "publishedAt": "2024-01-01T00:00:00.000Z",
+        "guidMismatch": false
+      }
+    },
+    {
+      "name": "atom entry reads link href and summary as the body",
+      "args": [
+        "<entry><id>atom-1</id><title>Atom</title><link href=\"https://example.com/a\"/><summary>atom body</summary><dc:creator>alice</dc:creator><category>news</category><updated>2024-02-02T03:04:05Z</updated></entry>"
+      ],
+      "expect": {
+        "guid": "atom-1",
+        "title": "Atom",
+        "link": "https://example.com/a",
+        "contentRaw": "atom body",
+        "author": "alice",
+        "board": "news",
+        "publishedAt": "2024-02-02T03:04:05.000Z",
+        "guidMismatch": false
+      }
+    },
+    {
+      "name": "missing guid falls back to the link",
+      "args": [
+        "<item><title>No guid</title><link>https://example.com/n</link><description>body</description><pubDate>2024-03-03T00:00:00Z</pubDate></item>"
+      ],
+      "expect": {
+        "guid": "https://example.com/n",
+        "title": "No guid",
+        "link": "https://example.com/n",
+        "contentRaw": "body",
+        "author": "",
+        "board": "",
+        "publishedAt": "2024-03-03T00:00:00.000Z",
+        "guidMismatch": false
+      }
+    },
+    {
+      "name": "mismatching hint reports the mismatch while keeping parsed fields",
+      "args": [
+        "<item><guid>g9</guid><title>T9</title><link>https://example.com/9</link><description>body9</description><pubDate>2024-04-04T00:00:00Z</pubDate></item>",
+        "other"
+      ],
+      "expect": {
+        "guid": "g9",
+        "title": "T9",
+        "link": "https://example.com/9",
+        "contentRaw": "body9",
+        "author": "",
+        "board": "",
+        "publishedAt": "2024-04-04T00:00:00.000Z",
+        "guidMismatch": true
+      }
+    }
+  ]
+}

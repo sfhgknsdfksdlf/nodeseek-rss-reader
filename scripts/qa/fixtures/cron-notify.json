@@ -1,0 +1,32 @@
+{
+  "name": "cron-notify.notificationSnapshotHasWork empty-path gate",
+  "module": "cron-notify",
+  "export": "notificationSnapshotHasWork",
+  "cases": [
+    {
+      "name": "treats a missing cursor as work so bootstrap runs",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": false }],
+      "expect": true
+    },
+    {
+      "name": "reports no work when the no-subscription cursor is already MAX+1",
+      "args": [{ "postId": 15, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }],
+      "expect": false
+    },
+    {
+      "name": "reports work for the legacy no-subscription MAX cursor to normalize",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": null, "maxPostId": 14, "cursorPresent": true }],
+      "expect": true
+    },
+    {
+      "name": "reports work when a subscription has a pending post at MAX",
+      "args": [{ "postId": 14, "subscriptionId": 0, "channel": "", "firstSubId": 7, "maxPostId": 14, "cursorPresent": true }],
+      "expect": true
+    },
+    {
+      "name": "reports no work when the cursor is past the newest post with subscriptions",
+      "args": [{ "postId": 15, "subscriptionId": 0, "channel": "", "firstSubId": 7, "maxPostId": 14, "cursorPresent": true }],
+      "expect": false
+    }
+  ]
+}

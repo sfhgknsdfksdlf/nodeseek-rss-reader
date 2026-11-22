@@ -1,0 +1,406 @@
+{
+  "name": "ingest-message.buildIngestMessages",
+  "module": "ingest-message",
+  "export": "buildIngestMessages",
+  "cases": [
+    {
+      "name": "empty input yields no messages, oversize, or invalid items",
+      "args": [
+        [],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z"
+        }
+      ],
+      "expect": {
+        "messages": [],
+        "oversize": [],
+        "invalid": []
+      }
+    },
+    {
+      "name": "splits 3 short items into 2+1 when maxItems=2 and keeps input order",
+      "args": [
+        [
+          {
+            "guid": "g1",
+            "chunk": "a"
+          },
+          {
+            "guid": "g2",
+            "chunk": "b"
+          },
+          {
+            "guid": "g3",
+            "chunk": "c"
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z",
+          "maxItems": 2
+        }
+      ],
+      "expect": {
+        "messages": [
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "g1",
+                "chunk": "a"
+              },
+              {
+                "guid": "g2",
+                "chunk": "b"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          },
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "g3",
+                "chunk": "c"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          }
+        ],
+        "oversize": [],
+        "invalid": []
+      }
+    },
+    {
+      "name": "splits 11 short items into 10+1 with the default maxItems",
+      "args": [
+        [
+          {
+            "guid": "g1",
+            "chunk": "x"
+          },
+          {
+            "guid": "g2",
+            "chunk": "x"
+          },
+          {
+            "guid": "g3",
+            "chunk": "x"
+          },
+          {
+            "guid": "g4",
+            "chunk": "x"
+          },
+          {
+            "guid": "g5",
+            "chunk": "x"
+          },
+          {
+            "guid": "g6",
+            "chunk": "x"
+          },
+          {
+            "guid": "g7",
+            "chunk": "x"
+          },
+          {
+            "guid": "g8",
+            "chunk": "x"
+          },
+          {
+            "guid": "g9",
+            "chunk": "x"
+          },
+          {
+            "guid": "g10",
+            "chunk": "x"
+          },
+          {
+            "guid": "g11",
+            "chunk": "x"
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z"
+        }
+      ],
+      "expect": {
+        "messages": [
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "g1",
+                "chunk": "x"
+              },
+              {
+                "guid": "g2",
+                "chunk": "x"
+              },
+              {
+                "guid": "g3",
+                "chunk": "x"
+              },
+              {
+                "guid": "g4",
+                "chunk": "x"
+              },
+              {
+                "guid": "g5",
+                "chunk": "x"
+              },
+              {
+                "guid": "g6",
+                "chunk": "x"
+              },
+              {
+                "guid": "g7",
+                "chunk": "x"
+              },
+              {
+                "guid": "g8",
+                "chunk": "x"
+              },
+              {
+                "guid": "g9",
+                "chunk": "x"
+              },
+              {
+                "guid": "g10",
+                "chunk": "x"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          },
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "g11",
+                "chunk": "x"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          }
+        ],
+        "oversize": [],
+        "invalid": []
+      }
+    },
+    {
+      "name": "flushes at target size before appending the next item",
+      "args": [
+        [
+          {
+            "guid": "t1",
+            "chunk": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "guid": "t2",
+            "chunk": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z",
+          "targetBytes": 100,
+          "hardBytes": 10000
+        }
+      ],
+      "expect": {
+        "messages": [
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "t1",
+                "chunk": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          },
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "t2",
+                "chunk": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          }
+        ],
+        "oversize": [],
+        "invalid": []
+      }
+    },
+    {
+      "name": "flags a single item over the hard limit as oversize without truncating",
+      "args": [
+        [
+          {
+            "guid": "big",
+            "chunk": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z",
+          "hardBytes": 50
+        }
+      ],
+      "expect": {
+        "messages": [],
+        "oversize": [
+          {
+            "guid": "big",
+            "chunk": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        ],
+        "invalid": []
+      }
+    },
+    {
+      "name": "rejects empty guid and empty chunk as invalid",
+      "args": [
+        [
+          {
+            "guid": "",
+            "chunk": "ok"
+          },
+          {
+            "guid": "g",
+            "chunk": ""
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z"
+        }
+      ],
+      "expect": {
+        "messages": [],
+        "oversize": [],
+        "invalid": [
+          {
+            "guid": "",
+            "chunk": "ok"
+          },
+          {
+            "guid": "g",
+            "chunk": ""
+          }
+        ]
+      }
+    },
+    {
+      "name": "measures multi-byte chunks in UTF-8 bytes, not characters",
+      "args": [
+        [
+          {
+            "guid": "m1",
+            "chunk": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中"
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z",
+          "hardBytes": 280
+        }
+      ],
+      "expect": {
+        "messages": [],
+        "oversize": [
+          {
+            "guid": "m1",
+            "chunk": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中"
+          }
+        ],
+        "invalid": []
+      }
+    },
+    {
+      "name": "keeps multi-byte chunks intact when they fit",
+      "args": [
+        [
+          {
+            "guid": "m2",
+            "chunk": "中文测试"
+          }
+        ],
+        {
+          "syncRunId": "run-1",
+          "feedUrl": "https://rss.nodeseek.com/",
+          "enqueuedAt": "2026-11-22T00:00:00.000Z"
+        }
+      ],
+      "expect": {
+        "messages": [
+          {
+            "v": 1,
+            "kind": "rss-ingest",
+            "syncRunId": "run-1",
+            "source": "cron",
+            "feedUrl": "https://rss.nodeseek.com/",
+            "firstSyncCandidate": false,
+            "maxNewPosts": null,
+            "items": [
+              {
+                "guid": "m2",
+                "chunk": "中文测试"
+              }
+            ],
+            "enqueuedAt": "2026-11-22T00:00:00.000Z"
+          }
+        ],
+        "oversize": [],
+        "invalid": []
+      }
+    }
+  ]
+}

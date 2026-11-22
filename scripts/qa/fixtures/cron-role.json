@@ -1,0 +1,37 @@
+{
+  "name": "cron-role.resolveCronRole exact-match routing",
+  "module": "cron-role",
+  "export": "resolveCronRole",
+  "cases": [
+    {
+      "name": "maps the sync expression",
+      "args": ["*/1 * * * *"],
+      "expect": "sync"
+    },
+    {
+      "name": "maps the notify expression",
+      "args": ["* * * * *"],
+      "expect": "notify"
+    },
+    {
+      "name": "maps the maintenance expression",
+      "args": ["0-59 * * * *"],
+      "expect": "maintenance"
+    },
+    {
+      "name": "maps an empty cron to unknown",
+      "args": [""],
+      "expect": "unknown"
+    },
+    {
+      "name": "maps an undefined cron to unknown",
+      "args": [],
+      "expect": "unknown"
+    },
+    {
+      "name": "maps an unsupported every-two-minute expression to unknown",
+      "args": ["*/2 * * * *"],
+      "expect": "unknown"
+    }
+  ]
+}

@@ -1,0 +1,205 @@
+{
+  "name": "ingest-producer.planBootstrapEnqueue snapshot-only selection",
+  "module": "ingest-producer",
+  "export": "planBootstrapEnqueue",
+  "cases": [
+    {
+      "name": "queues only snapshot GUIDs resident in the feed and missing from the DB",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "s2", "s3"],
+          "chunks": ["c1", "c2", "c3", "c4"],
+          "guids": ["s1", "s2", "n1", "s3"],
+          "existingGuids": ["s1"]
+        }
+      ],
+      "expect": {
+        "items": [
+          { "guid": "s2", "chunk": "c2" },
+          { "guid": "s3", "chunk": "c4" }
+        ],
+        "missingGuids": ["s2", "s3"],
+        "invalidGuids": [],
+        "missingFromFeed": [],
+        "cappedCount": 0,
+        "allPresent": false,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "never queues posts outside the snapshot while bootstrap is incomplete",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "gone"],
+          "chunks": ["c1", "c2"],
+          "guids": ["s1", "new"],
+          "existingGuids": ["s1"]
+        }
+      ],
+      "expect": {
+        "items": [],
+        "missingGuids": ["gone"],
+        "invalidGuids": [],
+        "missingFromFeed": ["gone"],
+        "cappedCount": 0,
+        "allPresent": false,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "detects completion when every snapshot GUID is already committed",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "s2"],
+          "chunks": [],
+          "guids": [],
+          "existingGuids": ["s1", "s2"]
+        }
+      ],
+      "expect": {
+        "items": [],
+        "missingGuids": [],
+        "invalidGuids": [],
+        "missingFromFeed": [],
+        "cappedCount": 0,
+        "allPresent": true,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "treats a resident snapshot GUID with a blank chunk as invalid, not rolled out",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "s2"],
+          "chunks": ["c1", ""],
+          "guids": ["s1", "s2"],
+          "existingGuids": ["s1"]
+        }
+      ],
+      "expect": {
+        "items": [],
+        "missingGuids": ["s2"],
+        "invalidGuids": ["s2"],
+        "missingFromFeed": [],
+        "cappedCount": 0,
+        "allPresent": false,
+        "invalidCount": 1,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "dedupes and trims snapshot GUIDs and counts blank or duplicate feed entries",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "s1", " s2 "],
+          "chunks": ["c1", "c2", "", "c3"],
+          "guids": ["s1", "s2", "", "s2"],
+          "existingGuids": []
+        }
+      ],
+      "expect": {
+        "items": [
+          { "guid": "s1", "chunk": "c1" },
+          { "guid": "s2", "chunk": "c2" }
+        ],
+        "missingGuids": ["s1", "s2"],
+        "invalidGuids": [],
+        "missingFromFeed": [],
+        "cappedCount": 0,
+        "allPresent": false,
+        "invalidCount": 1,
+        "duplicateCount": 1
+      }
+    },
+    {
+      "name": "an empty snapshot is never treated as completed",
+      "args": [
+        {
+          "snapshotGuids": [],
+          "chunks": [],
+          "guids": [],
+          "existingGuids": []
+        }
+      ],
+      "expect": {
+        "items": [],
+        "missingGuids": [],
+        "invalidGuids": [],
+        "missingFromFeed": [],
+        "cappedCount": 0,
+        "allPresent": false,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "maxNewPosts caps bootstrap dispatch and the deferred GUIDs are not unreachable",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "s2", "s3"],
+          "chunks": ["c1", "c2", "c3"],
+          "guids": ["s1", "s2", "s3"],
+          "existingGuids": [],
+          "maxNewPosts": 1
+        }
+      ],
+      "expect": {
+        "items": [{ "guid": "s1", "chunk": "c1" }],
+        "missingGuids": ["s1", "s2", "s3"],
+        "invalidGuids": [],
+        "missingFromFeed": [],
+        "cappedCount": 2,
+        "allPresent": false,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "a zero cap defers every packable GUID without reporting it as unreachable",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "s2"],
+          "chunks": ["c1", "c2"],
+          "guids": ["s1", "s2"],
+          "existingGuids": [],
+          "maxNewPosts": 0
+        }
+      ],
+      "expect": {
+        "items": [],
+        "missingGuids": ["s1", "s2"],
+        "invalidGuids": [],
+        "missingFromFeed": [],
+        "cappedCount": 2,
+        "allPresent": false,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    },
+    {
+      "name": "a cap still reports snapshot GUIDs that rolled out of the feed",
+      "args": [
+        {
+          "snapshotGuids": ["s1", "gone"],
+          "chunks": ["c1"],
+          "guids": ["s1"],
+          "existingGuids": [],
+          "maxNewPosts": 0
+        }
+      ],
+      "expect": {
+        "items": [],
+        "missingGuids": ["s1", "gone"],
+        "invalidGuids": [],
+        "missingFromFeed": ["gone"],
+        "cappedCount": 1,
+        "allPresent": false,
+        "invalidCount": 0,
+        "duplicateCount": 0
+      }
+    }
+  ]
+}

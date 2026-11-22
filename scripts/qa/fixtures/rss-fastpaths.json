@@ -1,0 +1,57 @@
+{
+  "name": "rss.decodeXml fastpath equivalence",
+  "module": "rss",
+  "export": "decodeXml",
+  "cases": [
+    {
+      "name": "plain ascii passes through",
+      "args": ["abc"],
+      "expect": "abc"
+    },
+    {
+      "name": "bare ampersand without a known entity is untouched",
+      "args": ["a&b"],
+      "expect": "a&b"
+    },
+    {
+      "name": "amp entity decodes to ampersand",
+      "args": ["&amp;"],
+      "expect": "&"
+    },
+    {
+      "name": "lt entity decodes to angle bracket",
+      "args": ["&lt;"],
+      "expect": "<"
+    },
+    {
+      "name": "apos numeric entity decodes to apostrophe",
+      "args": ["&#39;"],
+      "expect": "'"
+    },
+    {
+      "name": "doubly encoded amp-lt decodes one level",
+      "args": ["&amp;lt;"],
+      "expect": "&lt;"
+    },
+    {
+      "name": "doubly encoded amp-amp decodes one level",
+      "args": ["&amp;amp;"],
+      "expect": "&amp;"
+    },
+    {
+      "name": "consecutive entities all decode in order",
+      "args": ["&lt;&gt;&amp;&quot;&#39;"],
+      "expect": "<>&\"'"
+    },
+    {
+      "name": "unsupported numeric entity stays literal",
+      "args": ["&#123;"],
+      "expect": "&#123;"
+    },
+    {
+      "name": "empty string stays empty",
+      "args": [""],
+      "expect": ""
+    }
+  ]
+}

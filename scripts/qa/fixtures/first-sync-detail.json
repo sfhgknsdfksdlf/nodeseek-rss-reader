@@ -1,0 +1,31 @@
+{
+  "name": "first-sync.buildTimeoutReleaseDetail release audit payload",
+  "module": "first-sync",
+  "export": "buildTimeoutReleaseDetail",
+  "cases": [
+    {
+      "name": "serializes exactly reason/startedAt/releasedAt/missingGuids with trim and dedupe",
+      "args": ["2023-11-14T22:13:20.000Z", "2023-11-14T22:23:20.000Z", [" g1 ", "g2", "g1", "", "  "]],
+      "expect": "{\"reason\":\"timeout_released\",\"startedAt\":\"2023-11-14T22:13:20.000Z\",\"releasedAt\":\"2023-11-14T22:23:20.000Z\",\"missingGuids\":[\"g1\",\"g2\"]}"
+    },
+    {
+      "name": "keeps an empty exclusion list as an empty array",
+      "args": ["2023-11-14T22:13:20.000Z", "2023-11-14T22:23:20.000Z", []],
+      "expect": "{\"reason\":\"timeout_released\",\"startedAt\":\"2023-11-14T22:13:20.000Z\",\"releasedAt\":\"2023-11-14T22:23:20.000Z\",\"missingGuids\":[]}"
+    },
+    {
+      "name": "bounds the exclusion list to 50 GUIDs",
+      "args": [
+        "2023-11-14T22:13:20.000Z",
+        "2023-11-14T22:23:20.000Z",
+        ["g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+         "g11", "g12", "g13", "g14", "g15", "g16", "g17", "g18", "g19", "g20",
+         "g21", "g22", "g23", "g24", "g25", "g26", "g27", "g28", "g29", "g30",
+         "g31", "g32", "g33", "g34", "g35", "g36", "g37", "g38", "g39", "g40",
+         "g41", "g42", "g43", "g44", "g45", "g46", "g47", "g48", "g49", "g50",
+         "g51", "g52", "g53", "g54", "g55"]
+      ],
+      "expect": "{\"reason\":\"timeout_released\",\"startedAt\":\"2023-11-14T22:13:20.000Z\",\"releasedAt\":\"2023-11-14T22:23:20.000Z\",\"missingGuids\":[\"g1\",\"g2\",\"g3\",\"g4\",\"g5\",\"g6\",\"g7\",\"g8\",\"g9\",\"g10\",\"g11\",\"g12\",\"g13\",\"g14\",\"g15\",\"g16\",\"g17\",\"g18\",\"g19\",\"g20\",\"g21\",\"g22\",\"g23\",\"g24\",\"g25\",\"g26\",\"g27\",\"g28\",\"g29\",\"g30\",\"g31\",\"g32\",\"g33\",\"g34\",\"g35\",\"g36\",\"g37\",\"g38\",\"g39\",\"g40\",\"g41\",\"g42\",\"g43\",\"g44\",\"g45\",\"g46\",\"g47\",\"g48\",\"g49\",\"g50\"]}"
+    }
+  ]
+}

@@ -14,14 +14,14 @@ Cloudflare Workers + D1 application serving only `https://rss.nodeseek.com/` as 
 ./
 ├── src/                    # Worker routes and application modules
 ├── migrations/             # Sequential D1 schema migrations
-├── scripts/                # Cloudflare build/deploy config generation
+├── scripts/                # Cloudflare build/deploy config generation + `scripts/qa` fixture runner
 ├── public/                 # PWA icon.svg + manifest.webmanifest — repo assets only; the Worker serves embedded copies from src/index.ts, never these files
 ├── README.md               # Deployment and administrator setup
 ├── AGENTS.md               # Knowledge base + merged approved design (this file)
-├── package.json            # Scripts (dev/migrate/deploy/typecheck); no test or lint scripts
+├── package.json            # Scripts (dev/migrate/deploy/typecheck/qa:fixtures); no test or lint scripts
 ├── tsconfig.json           # strict/no-emit TypeScript config
-├── wrangler.jsonc            # Source Worker/D1/cron configuration (no committed DB binding)
-├── wrangler.local-qa.jsonc # Committed local-dev/QA config with placeholder D1 binding (`npm run dev` and `db:migrate:local` use it); intentionally no cron/observability blocks
+├── wrangler.jsonc            # Source Worker/D1/three-cron/Queue configuration (no committed DB binding)
+├── wrangler.local-qa.jsonc # Committed local-dev/QA config with placeholder D1 binding and queue bindings (`npm run dev` and `db:migrate:local` use it); intentionally no cron/observability blocks
 ├── package-lock.json       # npm lockfile; all deps are devDependencies (@cloudflare/workers-types, typescript, wrangler)
 └── .gitignore              # ignores .wrangler/, transient wrangler.generated.jsonc, .dev.vars, logs, QA captures, agent state; the `.codegraph/` index is excluded only via local `.git/info/exclude`, never `git add` it
 ```
@@ -32,8 +32,17 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 | Symbol/module | Location | Role |
 |---|---|---|
-| Worker `fetch`/`scheduled` | `src/index.ts` | Request routing, state-machine cron orchestration (state 0 sync→claim/build; state 1 verify/recover only; state 2 sync→subscriptions→cleanup→prune), debug status, static `/go` interstitial shell |
-| RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, diagnostics |
+| Worker `fetch`/`scheduled`/`queue` | `src/index.ts` | Request routing; three-cron role routing with `cron_route` log; inline per-minute gate; state-machine cron orchestration (state 0 sync→claim/build; state 1 verify/recover only; state 2 sync→subscriptions→cleanup→prune); Queue consumer entry; debug status; static `/go` interstitial shell |
+| RSS sync/parser | `src/rss.ts` | Fetch strategies, parse, D1 insert, chunk full-parse helpers for the ingest consumer, diagnostics |
+| Cron role routing | `src/cron-role.ts` | Maps the three distinct cron texts to `sync`/`notify`/`maintenance` (`unknown` otherwise) |
+| Inline sync gate | `src/inline-gate.ts` | `last_inline_tick_minute` per-UTC-minute claim so merged/duplicate triggers run RSS once; D1 failure fails open |
+| Ingest message contract | `src/ingest-message.ts` | Versioned `IngestMessageV1`, ≤10 items / 64KB target / 120KB hard cap, pack + validate |
+| Ingest producer | `src/ingest-producer.ts` | GUID prefilter, feed dedupe, first-sync bootstrap (`first_sync_guids`/`first_sync_started_at`/`first_sync_incomplete` timeout audit), `sendBatch` |
+| Ingest consumer | `src/ingest-consumer.ts` | Queue handler: full parse, sanitize, `INSERT OR IGNORE`, FTS indexing |
+| Notification cron | `src/cron-notify.ts` | Notify-role entry, `notification_lease`, snapshot-driven bounded dispatch |
+| Maintenance cron | `src/cron-maintenance.ts` | Maintenance-role entry, `MAINTENANCE_BACKFILL_BATCH=5` search backfill |
+| HTML sanitize (experimental) | `src/html.ts` | HTMLRewriter streaming sanitize + text extraction behind `HTML_MODE=rewriter` |
+| Run observability | `src/observability.ts` | One `run` JSON line per invocation (success 5% sampled, failures always kept); cron timing 1/10 sampled |
 | Home query | `src/posts.ts` | Page/board query, literal-keyword FTS5 search (title+body), pagination, read state |
 | SSR shell/client script | `src/render.ts` | HTML rendering, search-term marking + local search pager, browser interactions |
 | FTS5 search index/query | `src/search.ts` | Query parsing (literal terms, trigram/bigram anchor), per-post index writes, resumable backfill, index error/retry state |
@@ -59,8 +68,11 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 | RSS/cron latency | `src/rss.ts`, `src/subscriptions.ts`, `src/cleanup.ts` | Inspect `/api/debug/status`; preserve structured timings |
 | D1 容量/满库 | `src/prune.ts`, `src/index.ts`, `src/settings.ts` | Cron prunes after sync only in state `"2"`; check `storage` and `sync_state.db_prune_*`; state machine, normal batch, full-DB fallback (`read_states` then `posts`), FTS orphan cursors; no `PRAGMA page_count`/`dbstat`/REST |
 | Homepage latency | `src/posts.ts`, `src/render.ts` | Preserve page size and scan behavior |
-| Search latency/index gaps | `src/search.ts`, `src/posts.ts` | Check `search_index_state.complete` and `sync_state.last_search_index_error`; cron backfill ≤25 posts/min, resumable |
+| Search latency/index gaps | `src/search.ts`, `src/posts.ts` | Check `search_index_state.complete` and `sync_state.last_search_index_error`; cron backfill ≤20 posts/min, resumable |
 | Notification dedupe | `src/notifications.ts`, `src/subscriptions.ts`, `migrations/0009*.sql`, `migrations/0010*.sql` | Use `post_guid`, never `post_id` |
+| Queue 摄取 / 三 cron 路由 | `src/index.ts`, `src/cron-role.ts`, `src/inline-gate.ts`, `src/ingest-producer.ts`, `src/ingest-consumer.ts` | `INGEST_MODE=inline` 时同步内联；`queue` 时 producer 入队、consumer 入库；`cron_route` 日志确认平台是否合并三 cron；Queue 模式代码阻塞项已修复但仍未放行，见 APPROVED DESIGN「Queue 阻塞项修复状态」 |
+| 通知 cron 与租约 | `src/cron-notify.ts`, `src/subscriptions.ts` | 游标语义是“下一个待处理 id”，首同步初始化 `MAX+1`；拿锁后重读 snapshot（已修复）；租约键 `notification_lease`（16 分钟） |
+| 搜索回填 | `src/cron-maintenance.ts`, `src/search.ts` | 维护 cron 每轮 5 帖/批；inline 模式仍在同步链内 20 帖/分钟 |
 | Admin/debug routes | `src/index.ts`, `src/settings.ts` | Admin auth is the URL-query token model (`/admin?token=ADMIN_SECRET`, owner-approved); comparison must stay constant-time (`secretTokensEqual`) |
 | User rule handoff | `src/rules.ts`, `src/render.ts` | Payload/version/cache keys stay user-scoped |
 | Rule list ordering | `src/rules.ts`, `src/index.ts`, `src/render.ts` (`keywordRows`) | Canonical order is `id ASC` for user-facing rule lists; see CONVENTIONS |
@@ -82,9 +94,13 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 - TypeScript is strict/no-emit; target Workers and Web APIs, not Node-only APIs.
 - **CPU hard limit (MUST):** Workers Free allows **10 ms CPU per HTTP request and 10 ms CPU per Cron Trigger**; network waits (RSS 21–24 s sleeps, `fetch`, D1 queries) do not count toward CPU, but Cron wall-clock is capped at 15 min. Every change MUST consider CPU usage: no unbounded loops or full-table scans, no full FTS rebuilds, keep regex/JSON/HTML and per-post work bounded, and check `home.timings`, `sync_state.last_cron_timing`, or Workers Logs before merging. Exceeding CPU terminates the invocation (Error 1102) and can break cron recovery. Source: https://developers.cloudflare.com/workers/platform/limits/
 - **D1 free-tier read/write quotas (MUST):** D1 Free allows **5,000,000 rows read/day and 100,000 rows written/day per account** (resets 00:00 UTC), **50 queries per Worker invocation**, **500 MB per database / 5 GB per account**, and **10 databases**. Rows read counts every row **scanned**, not just returned (`SELECT COUNT(*)` over 340k posts = 340k rows; 34 debug calls = 11.59M rows and exhausted the daily quota). Rows written counts every `INSERT`/`UPDATE`/`DELETE` row; indexes add writes. Every change MUST consider D1 read/write usage: no new full-table scans/counts on hot paths or monitoring endpoints, no full reindex/import loops, batch and paginate writes, keep diagnostics bounded, and check D1 Row Metrics or `meta.rows_read`/`rows_written` before merging. Exceeding the daily quota makes all queries fail until 00:00 UTC. Source: https://developers.cloudflare.com/d1/platform/limits/ · https://developers.cloudflare.com/d1/platform/pricing/
-- Package is ESM (`"type": "module"`); tsconfig `include` is `src/**/*.ts` only. `wrangler.local-qa.jsonc` intentionally omits the production cron trigger and observability blocks (local QA only).
+- Package is ESM (`"type": "module"`); tsconfig `include` is `src/**/*.ts` only. `wrangler.local-qa.jsonc` intentionally omits the three production cron triggers and observability blocks while keeping the queue producer/consumer bindings (local QA only).
 - D1 owns all persistent state. Do not add KV, Durable Objects, R2, or another store without an explicit request.
 - D1 capacity pruning (see APPROVED DESIGN「D1 容量自动裁剪」) is gated by the `sync_state.db_prune_index_state` machine (`"0"` unverified → `"1"` building/recovering → `"2"` verified). State `"0"` runs normal RSS and never prunes; state `"1"` pauses every scheduled task except state I/O, the idempotent 0014 DDL, independent verification, and error logging; state `"2"` never re-runs 0014 and prunes only inside UTC 23:30–00:00 with a valid `read_states(post_id)` index. Only posts whose `published_at` AND `fetched_at` are both older than 24h are eligible, deleted oldest-first (`published_at ASC, id ASC`); the normal path deletes `read_states`, both FTS tables, and `posts` in one `env.DB.batch()`, while the full-DB fallback deletes single-statement `read_states` then `posts` and leaves FTS orphans for the cursor cleanup. Every UTC day caps pruning at 10,000 posts; every batch is an atomic conditional reservation before each 100-post batch, every delete entry (including initialization and fallback) passes the same window/index/daily-cap gate, and 00:00Z starts no new batch. There is no application-level total write cap: when D1 rejects a write because the platform daily quota is exhausted, the round logs to Workers Logs and stops without looping or degrading, and pruning resumes only after the next 00:00 UTC reset and the following 23:30–00:00 window. Defaults are free 480 MB trigger with a trigger-30 MB target (default 450 MB), paid 9850 MB trigger / 9000 MB target (paid target 9000 only when the trigger is above 9000; otherwise trigger-30 MB); new posts are capped at 5 only above plan max capacity - 2 MB. Size comes only from `SELECT 1` + `meta.size_after`: never `PRAGMA page_count`/`dbstat`, the Cloudflare REST API/token, or `VACUUM`. Every admin setting is preserve-on-omit: a PUT only writes the fields it provides, so an omitted field keeps its stored value.
+- Cron role routing (see APPROVED DESIGN「免费套餐 Queue 摄取与 CPU 优化」): `*/1 * * * *` = sync, `* * * * *` = notify, `0-59 * * * *` = maintenance. The texts are deliberately distinct so deployed `cron_route` logs reveal whether the platform merged them; never rely on role being preserved when merged. Inline mode (`INGEST_MODE=inline`, default) runs the full sync, and every recognized invocation must first win `sync_state.last_inline_tick_minute` (`inline-gate.ts`), so merged/duplicate triggers still yield at most one RSS sync per UTC minute; the claim fails open on D1 errors (duplicate sync is harmless, a stopped RSS is not). `INGEST_MODE=queue` is implemented; the six original blockers are fixed and locally verified, but production enablement still requires deployed three-cron/CPU/Queues-ops verification and owner approval.
+- `HTML_MODE=regex` is the default sanitize path; `HTML_MODE=rewriter` (`src/html.ts`) is experimental and has known semantic differences (dropped `style` and unclosed `script` contents, single `&` encoding in `href`). Keep the second sanitize pass in `src/render.ts`.
+- Ingest messages are versioned (`IngestMessageV1`): ≤10 items, 64KB target, 120KB hard cap in UTF-8. Never truncate post bodies to fit; an oversize single item is recorded in `sync_state.last_ingest_error` and skipped.
+- This phase adds no D1 migration; only `sync_state` keys (`last_inline_tick_minute`, `first_sync_guids`, `first_sync_started_at`, `first_sync_incomplete` timeout release audit, `notification_lease`, `notification_cursor_post_id`/`notification_cursor_subscription_id`/`notification_cursor_channel`, `last_ingest_error`). Queue names are fixed: `nodeseek-rss-reader-ingest` + `nodeseek-rss-reader-ingest-dlq` (consumer `max_batch_size=1`, `max_concurrency=1`, `max_retries=5`).
 - RSS scope is fixed to `https://rss.nodeseek.com/`; `posts.guid` is the stable RSS identity.
 - Post cards open the source URL through the root-relative `/go?v=2#p=<post id>&u=<encodeURIComponent(source URL)>` interstitial (owner-approved 2026-09-06, see APPROVED DESIGN「后台打开标红 /go 中转」); root-relative links resolve against the current domain, so multiple custom domains need no detection logic. Read receipts still go through `POST /api/read-state`. The interstitial is a static client-side shell served at `GET /go`; the server never redirects.
 - Logged-in read state is D1-backed; anonymous read state is localStorage-backed.
@@ -115,6 +131,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 ## DATA AND MIGRATIONS
 
 - Current chain is `0001_initial`..`0012_search_indexes` and `0014_read_states_post_id_index`.
+- Queue ingest and the three-cron split added no migration (2026-11-22); only `sync_state` keys: `last_inline_tick_minute`, `first_sync_guids`, `first_sync_started_at`, `first_sync_incomplete` (timeout release audit), `notification_lease`, `notification_cursor_post_id`/`notification_cursor_subscription_id`/`notification_cursor_channel`, `last_ingest_error`.
 - `0009` moved push idempotency to `post_guid`; `0010` removed legacy `push_logs.post_id`, its FK, unique constraint, and index.
 - `0011_sessions_expiry_index` adds `sessions(expires_at)` for the daily expired-session purge in `cleanupOldData`.
 - `0012_search_indexes` adds the FTS5 search index: contentless `posts_search_trigram` (`tokenize='trigram'`) and `posts_search_bigrams` (hex-codepoint bigram tokens), both keyed by `rowid = posts.id`, plus singleton `search_index_state(id=1, last_post_id, complete, updated_at)` for the resumable cron backfill.
@@ -129,15 +146,18 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 ## RUNTIME AND HOTSPOTS
 
 - Scheduled sync waits 21..24s before RSS and before browser fallback after failure. `/api/rss-test` is the no-sleep diagnostic path.
-- Cron order depends on `db_prune_index_state`: `"0"` → RSS sync → notifications (cursor-bounded) → lease refresh → (window only) atomic `0`→`1` claim → idempotent 0014 DDL → independent `sqlite_schema` + `PRAGMA index_info` verification → `2`; `"1"` → verify/recover only (no RSS, prune, notifications, retention cleanup, FTS orphan maintenance, search backfill, or non-essential timing writes), and an invocation that starts in `"1"` ends immediately after verify/recover regardless of the result (`0`/`1`/`2`); the next cron reads the main DB again before any normal work; `"2"` → RSS sync → notifications → lease refresh → cleanup → timing → prune (window + valid index + cap only), then one sequential background chain: FTS orphan cleanup first, then search backfill only if planned, without a daily-quota termination, and with query headroom ≥4; the lease is released after the chain settles. A verification failure returns to `"0"` without a same-window retry; a crash after writing `"1"` is recovered by verifying first (never re-running the DDL). Prune trigger defaults free 480 MB / paid 9850 MB; the free target is trigger-30 MB (default 450 MB) and the paid target is 9000 MB (trigger-30 MB when the trigger is at or below 9000 MB); normal delete window is UTC 23:30–00:00; every UTC day caps pruning at 10,000 posts; normal path is the 4-statement batch, full-DB path is single-statement `read_states` then `posts` with FTS rows left as orphans. `DB_PRUNE_MAX_SCAN_PAGES=5`: at most 5 candidate SELECTs, 500 candidate records, 5 delete batches, and 500 posts per invocation, with the 10,000/day cap unchanged; `sync_state.db_prune_candidate_cursor` stores JSON `[publishedAt, id, restartAt]` (missing/empty starts oldest, a short/empty fully processed page or reaching the target clears it, window/daily/query stops keep the last completed page, never wraps within one invocation, and only a lease-holding state-`"2"` prune writes it). FTS orphan cursors process ≤25 rows per table per invocation only below the trigger, when not blocked, and when `db_prune_fts_orphans_pending="1"`. `SEARCH_BACKFILL_BATCH=20`; sync caps new posts at 5 only when size > plan max capacity - 2 MB, never 0. Free plan hard limits are 10 ms CPU per HTTP request and per Cron Trigger, 50 D1 queries and 50 subrequests per invocation, 100,000 requests/day, and D1's 5,000,000 rows read/day plus 100,000 rows written/day (00:00 UTC reset), 500 MB per database / 5 GB per account; keep prune, cleanup, sync, and diagnostics within that budget (reserve constants `DB_PRUNE_BACKGROUND_QUERY_RESERVE=14`, `DB_PRUNE_CLAIM_QUERY_RESERVE=16`, `DB_PRUNE_PRUNE_QUERY_RESERVE=12`, `DB_PRUNE_BATCH_QUERY_RESERVE=12`, `DB_PRUNE_DEGRADED_QUERY_RESERVE=24`, `DB_PRUNE_FINAL_QUERY_RESERVE=4`, all in D1 calls; `batch()` counts once and prepare/bind count zero), and remember wall-clock waits (21–24 s sleeps, fetch/D1) do not count as CPU. Rows read counts scanned rows, so no full-table COUNT in hot paths or monitors. Prune failures land in `sync_state.db_prune_last_error`/`db_prune_blocked_full` and never block sync; settings-read failures and daily-write-quota termination are logged to Workers Logs only and do not write `db_prune_last_error`/state (settings failure logs `prune_settings_read_failed`).
+- Three-cron routing: `scheduled` resolves `event.cron` through `cron-role.ts` and always logs `cron_route` (`cron`, `role`, `mode`) before working. The platform may merge the three texts, so role is a hint, not a guarantee; only `event.cron === CRON_SYNC` takes the sync path in queue mode. Inline mode gates every recognized trigger on `sync_state.last_inline_tick_minute` (fail-open), so at most one RSS sync runs per UTC minute even when triggers are merged or duplicated.
+- Queue mode is implemented; the six original blockers (first-sync ordering/retry cap, sendBatch chunking, consumer FTS recovery, notification lease, item count) are fixed and locally verified. Production remains inline-only until deployed three-cron behavior, CPU, and Queues ops are verified and the owner approves.
+- `observability.ts` emits one `run` JSON line per invocation: success sampled at 5%, every non-`ok` outcome kept; `last_cron_timing` is written on 1 in 10 healthy runs and always on failure/state-machine/quota anomalies. Do not add per-post logs or extra D1 reads for diagnostics.
+- Cron order (inline mode, the default) depends on `db_prune_index_state`: `"0"` → RSS sync → notifications (cursor-bounded) → lease refresh → (window only) atomic `0`→`1` claim → idempotent 0014 DDL → independent `sqlite_schema` + `PRAGMA index_info` verification → `2`; `"1"` → verify/recover only (no RSS, prune, notifications, retention cleanup, FTS orphan maintenance, search backfill, or non-essential timing writes), and an invocation that starts in `"1"` ends immediately after verify/recover regardless of the result (`0`/`1`/`2`); the next cron reads the main DB again before any normal work; `"2"` → RSS sync → notifications → lease refresh → cleanup → timing → prune (window + valid index + cap only), then one sequential background chain: FTS orphan cleanup first, then search backfill only if planned, without a daily-quota termination, and with query headroom ≥4; the lease is released after the chain settles. A verification failure returns to `"0"` without a same-window retry; a crash after writing `"1"` is recovered by verifying first (never re-running the DDL). Prune trigger defaults free 480 MB / paid 9850 MB; the free target is trigger-30 MB (default 450 MB) and the paid target is 9000 MB (trigger-30 MB when the trigger is at or below 9000 MB); normal delete window is UTC 23:30–00:00; every UTC day caps pruning at 10,000 posts; normal path is the 4-statement batch, full-DB path is single-statement `read_states` then `posts` with FTS rows left as orphans. `DB_PRUNE_MAX_SCAN_PAGES=5`: at most 5 candidate SELECTs, 500 candidate records, 5 delete batches, and 500 posts per invocation, with the 10,000/day cap unchanged; `sync_state.db_prune_candidate_cursor` stores JSON `[publishedAt, id, restartAt]` (missing/empty starts oldest, a short/empty fully processed page or reaching the target clears it, window/daily/query stops keep the last completed page, never wraps within one invocation, and only a lease-holding state-`"2"` prune writes it). FTS orphan cursors process ≤25 rows per table per invocation only below the trigger, when not blocked, and when `db_prune_fts_orphans_pending="1"`. `SEARCH_BACKFILL_BATCH=20`; sync caps new posts at 5 only when size > plan max capacity - 2 MB, never 0. Free plan hard limits are 10 ms CPU per HTTP request and per Cron Trigger, 50 D1 queries and 50 subrequests per invocation, 100,000 requests/day, and D1's 5,000,000 rows read/day plus 100,000 rows written/day (00:00 UTC reset), 500 MB per database / 5 GB per account; keep prune, cleanup, sync, and diagnostics within that budget (reserve constants `DB_PRUNE_BACKGROUND_QUERY_RESERVE=14`, `DB_PRUNE_CLAIM_QUERY_RESERVE=16`, `DB_PRUNE_PRUNE_QUERY_RESERVE=12`, `DB_PRUNE_BATCH_QUERY_RESERVE=12`, `DB_PRUNE_DEGRADED_QUERY_RESERVE=24`, `DB_PRUNE_FINAL_QUERY_RESERVE=4`, all in D1 calls; `batch()` counts once and prepare/bind count zero), and remember wall-clock waits (21–24 s sleeps, fetch/D1) do not count as CPU. Rows read counts scanned rows, so no full-table COUNT in hot paths or monitors. Prune failures land in `sync_state.db_prune_last_error`/`db_prune_blocked_full` and never block sync; settings-read failures and daily-write-quota termination are logged to Workers Logs only and do not write `db_prune_last_error`/state (settings failure logs `prune_settings_read_failed`).
 - `src/rss.ts` uses `cf.cacheTtl = 60`; preserve attempt diagnostics because upstream often returns 503.
 - `/api/debug/status?token=ADMIN_SECRET` is non-live unless `live=1`; `safeSyncRss()` records cron failure in `sync_state.last_sync_error`.
 - `sync_state` fixed-key write contract (`first_sync_done`, `last_sync_at`, `last_sync_error`, `last_sync_strategy`, `last_cron_timing`, `last_cleanup_at`): missing keys are initialized with guarded `INSERT ... SELECT ... WHERE NOT EXISTS ... ON CONFLICT(key) DO NOTHING`, then updated with conditional `UPDATE ... WHERE value IS NOT ?`; each success path and each failure path runs as one D1 batch. Strategy/error updates fire only on value change, so a stable cron no longer rewrites state every minute. Conditions are evaluated in-DB: with overlapping syncs the later-committing batch wins (success clears the current error, failure keeps it), and there are deliberately no locks or versioning. `last_home_timing` and all search-state writes are outside this contract and unchanged.
 - Worker search matches only `title` and `content_text` via the FTS5 index (see APPROVED DESIGN「索引关键词搜索」); browser rules use the synced payload. Ordinary listings apply block rules in the browser, search results skip block rules, and highlights + literal search-term marking render in the browser. In `src/posts.ts`, ordinary listings scan only until the requested page fills; defer `content_html` until final IDs are known.
-- Search index lifecycle: new posts index on insert (failure records `last_search_index_error` and flags retry), cron backfills ≤20 posts/min while `search_index_state.complete = 0`, and once complete the scheduler skips the backfill call entirely (the state read is merged into the invocation read context, still one query); capacity pruning deletes both FTS rows in the same post batch, and the full-DB fallback leaves FTS orphans gated by `db_prune_fts_orphans_pending`. Search timings live in `home.timings.queryPosts` (`searchParseMs`/`searchQueryMs`).
+- Search index lifecycle: new posts index on insert (failure records `last_search_index_error` and flags retry); inline mode backfills ≤20 posts/min inside the sync chain while `search_index_state.complete = 0`, queue mode uses the maintenance cron at 5 posts/batch, and once complete the scheduler skips the backfill call entirely (the state read is merged into the invocation read context, still one query); capacity pruning deletes both FTS rows in the same post batch, and the full-DB fallback leaves FTS orphans gated by `db_prune_fts_orphans_pending`. Search timings live in `home.timings.queryPosts` (`searchParseMs`/`searchQueryMs`).
 - Slow scan chunk size is intentionally 1000. Diagnose with `home.timings.queryPosts` before changing it.
 - Subscription work scales users × subscriptions × posts: batch reads/log checks, cache runtime settings, and precompile regexes.
-- Notifications are cursor-driven and bounded per invocation: only posts inserted by this sync are eligible (`insertedPosts` = the `INSERT OR IGNORE` results with truthy `meta.changes`; feed-internal GUID dedupe keeps the first occurrence per GUID, already-present GUIDs and `changes=0` conflicts never match), and the scheduler gate stays `result.ok && !result.firstSync` — the first success (including first-fail-then-success) only imports, never notifies. Each invocation advances `notification_cursor_post_id`/`notification_cursor_subscription_id`/`notification_cursor_channel` (`post.id ASC` → `subscription.id ASC` → `channel ASC`) with at most 20 channel attempts and 500 match units; `push_logs` unique `(user_id, subscription_id, post_guid, channel)` is the idempotency defense, and external failures leave the cursor in place for retry. `INSERT OR IGNORE` + the `posts.guid` unique constraint remain the final defense against duplicates.
+- Notifications are cursor-driven and bounded per invocation: inline mode only notifies posts inserted by this sync (`insertedPosts` = the `INSERT OR IGNORE` results with truthy `meta.changes`; feed-internal GUID dedupe keeps the first occurrence per GUID, already-present GUIDs and `changes=0` conflicts never match), and the scheduler gate stays `result.ok && !result.firstSync` — the first success (including first-fail-then-success) only imports, never notifies. Queue mode's notify cron instead scans only committed posts up to `MAX(posts.id)` with the same cursor triple; first sync initializes the cursor to `MAX+1` so history is never notified. Each invocation advances `notification_cursor_post_id`/`notification_cursor_subscription_id`/`notification_cursor_channel` (`post.id ASC` → `subscription.id ASC` → `channel ASC`) with at most 20 channel attempts and 500 match units; `push_logs` unique `(user_id, subscription_id, post_guid, channel)` is the idempotency defense, and external failures leave the cursor in place for retry. `INSERT OR IGNORE` + the `posts.guid` unique constraint remain the final defense against duplicates.
 - Rule payloads must be scoped to the logged-in user; browser processing blocks before highlighting.
 - Highlight imports preallocate positive group ids (`Date.now()*1000 + crypto random + index`) so one batch can bind child rows; any batch failure rolls back atomically and returns 500.
 
@@ -159,6 +179,7 @@ This is one package, not a monorepo. `migrations/` and `scripts/` are independen
 
 ```bash
 npm run typecheck             # tsc --noEmit; requires installed dependencies
+npm run qa:fixtures           # 运行 scripts/qa/fixtures 下的纯函数等价 fixture
 npm run dev                   # wrangler dev
 npm run db:migrate:local      # apply local D1 migrations
 npm run db:migrate            # apply remote D1 migrations
@@ -181,13 +202,13 @@ De-facto QA method: run `wrangler dev`, then exercise routes with `curl.exe` usi
 
 ## DEPLOY AND CONFIG
 
-- `npm run deploy` runs the generator, applies remote migrations, verifies D1 (five tables: `posts`, `users`, `sync_state`, `app_settings`, `admin_sessions`), dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
+- `npm run deploy` runs the generator (D1 create/reuse, Queue + DLQ create/reuse with post-create visibility polling), applies remote migrations, verifies D1 (five tables: `posts`, `users`, `sync_state`, `app_settings`, `admin_sessions`), dry-runs deployment, then deploys with `wrangler.generated.jsonc`.
 - All deployments use Worker/D1 `nodeseek-rss-reader`; per-branch environment isolation comes from separate Cloudflare accounts, not branch logic. `WORKER_NAME` / `D1_DATABASE_NAME` env vars override these names.
 - Cloudflare Workers Builds injects only `WORKERS_CI_BRANCH` (never `CF_PAGES_BRANCH`/`CF_BRANCH`/`GITHUB_REF_NAME`/`BRANCH`); the old env-var chain therefore never fired in CF builds — root cause of the factory incidents. The script is intentionally branch-agnostic; do not reintroduce branch detection.
 - A Workers Builds project can only deploy the Worker it is connected to: on config `name` mismatch, CI overrides the name (warning; it may also auto-open a PR editing `wrangler.jsonc`). Both account projects must be named `nodeseek-rss-reader`.
-- `npm run cf:build` is preparation-only (D1 create/reuse, migrations, table verify, dry-run — no deploy); `npm run deploy:generated` is final-deploy-only. The build script rewrites BOTH `wrangler.generated.jsonc` and the root `wrangler.jsonc` (name + D1 binding) — that is why the committed root config carries no binding.
+- `npm run cf:build` is preparation-only (D1 create/reuse, queue create/reuse, migrations, table verify, dry-run — no deploy); `npm run deploy:generated` is final-deploy-only. The build script rewrites BOTH `wrangler.generated.jsonc` and the root `wrangler.jsonc` (name + D1 binding + queue blocks) — that is why the committed root config carries no binding.
 - Before pushing the `factory` branch, the factory-connected build project in the production account must be deleted, or that project rebuilds and redeploys production.
-- The build generator applies ALL pending migrations. `wrangler.jsonc` `vars` contains `RSS_URL` plus `COMMIT_VERSION`, injected at build time by `scripts/cloudflare-build.mjs` (`git rev-parse --short=7 HEAD`; written to both the generated and root configs); `wrangler.local-qa.jsonc` pins `COMMIT_VERSION: "local"` for dev. `SESSION_SECRET`, `ADMIN_USERNAME`, and `MAIL_PROVIDER` were removed — code never reads them.
+- The build generator applies ALL pending migrations. `wrangler.jsonc` `vars` contains `RSS_URL`, `INGEST_MODE` (`inline` default), `HTML_MODE` (`regex` default), plus `COMMIT_VERSION`, injected at build time by `scripts/cloudflare-build.mjs` (`git rev-parse --short=7 HEAD`; written to both the generated and root configs); `wrangler.local-qa.jsonc` pins `COMMIT_VERSION: "local"` for dev. `SESSION_SECRET`, `ADMIN_USERNAME`, and `MAIL_PROVIDER` were removed — code never reads them.
 - `wrangler.local-qa.jsonc` is committed (placeholder `database_id: local-qa-only`): `npm run dev` and `npm run db:migrate:local` point at it so local development has the `DB` binding; remote deploy always uses the build-generated config.
 - Generated config stays at repository root; moving it under `.wrangler/` previously broke migrations.
 - Missing `DB` produces `Cannot read properties of undefined (reading 'prepare')`; `/health` is the quickest binding/table check.
@@ -487,3 +508,104 @@ README 记录 Cloudflare Workers GitHub 集成流程：主路径无需手动建 
 **缓存隔离**：有界编译规则缓存最多 256 条，键为 subscription id + pattern + updated_at（编译失败也缓存；按 updated_at 惰性失效；缓存绝不成为正确性依赖）；只缓存 `ADMIN_SECRET` 派生的 `CryptoKey`，绝不缓存任何设置值。
 
 **诊断**：新增可选计时字段 `guidExtractMs`/`guidExtractCount`/`fullParseMs`/`fullParseCount`；cron 计时快照增加 notifications 阶段计时与 `notificationCursor`；`/api/debug/status` 暴露三个通知游标字段；全部诊断不增加任何 D1 查询。
+
+### 免费套餐 Queue 摄取与 CPU 优化（2026-11-22 owner 批准）
+
+**代码已实现（2026-11-22）；默认 `INGEST_MODE=inline`、`HTML_MODE=regex`。原 6 个 Queue 阻塞项已在本地修复并通过复审；Queue 模式仍未放行，需部署日志确认三 cron、CPU 与 Queues ops 后由 owner 批准**；inline 模式已加每 UTC 分钟一次 sync 的门禁，可在三 cron 被平台合并/重复触发时保证 RSS 只跑一次。实现与验证仅限本地/测试账号，平台三 cron 是否合并、CPU 与 Queues ops 仍需部署后日志确认。
+
+#### 实现状态（2026-11-22）
+
+- 新增模块：`src/cron-role.ts`（cron 文本 → `sync`/`notify`/`maintenance`/`unknown`）、`src/inline-gate.ts`（`last_inline_tick_minute` 每 UTC 分钟一次 sync 领取，D1 失败 fail-open）、`src/ingest-message.ts`（版本化 `IngestMessageV1`，≤10 item、目标 64KB、硬上限 120KB，UTF-8 计）、`src/ingest-producer.ts`（GUID 预筛、feed 内去重、首同步引导、`sendBatch`）、`src/ingest-consumer.ts`（完整解析、清洗、`INSERT OR IGNORE`、FTS 索引）、`src/cron-notify.ts`（独立通知 cron 与 `notification_lease`）、`src/cron-maintenance.ts`（维护 cron，`MAINTENANCE_BACKFILL_BATCH=5`）、`src/html.ts`（HTMLRewriter sanitize 实验路径）、`src/observability.ts`（单条 `run` 日志，成功 5% 采样、失败必记；cron timing 仅 1/10 采样）。
+- `src/index.ts` 的 `scheduled` 先输出 `cron_route` 日志再按角色路由；`queue` handler 消费摄取消息。inline 模式下任何被识别的调用都要先赢下 `last_inline_tick_minute` 才执行同步主体，因此三个 cron 被合并或重复触发时每个 UTC 分钟仍只有一次 sync。
+- 默认模式：`INGEST_MODE=inline`、`HTML_MODE=regex`。Queue 为 `nodeseek-rss-reader-ingest`，DLQ 为 `nodeseek-rss-reader-ingest-dlq`；consumer 配置 `max_batch_size=1`、`max_batch_timeout=5`、`max_retries=5`、`max_concurrency=1`。
+- 三 cron 文本固定且刻意不同：`*/1 * * * *`（sync）、`* * * * *`（notify）、`0-59 * * * *`（maintenance），用于部署后判断平台是否合并触发。
+- `sync_state` 新增键：`last_inline_tick_minute`、`first_sync_guids`（首同步 GUID 快照）、`first_sync_started_at`（首同步 10 分钟重试窗口起点）、`first_sync_incomplete`（有界重试失败诊断；超时放行时保存 `timeout_released` 与缺失 GUID 审计）、`notification_lease`（通知租约，16 分钟，拿锁后重读 snapshot）、`notification_cursor_post_id`/`notification_cursor_subscription_id`/`notification_cursor_channel`（通知游标）、`last_ingest_error`（oversize/入队诊断，≤500 字符）。
+- 本地验证（2026-11-22）：`npm run qa:fixtures` 153/153；Queue E2E 覆盖 cron 入队、consumer 入库与 FTS、`first_sync_done=1`、通知游标 `MAX+1`；通知 5 个场景；维护回填 5 帖/批；HTMLRewriter A/B 10/12 文本一致，2 个差异为 `style` 与未闭合 `script` 内容被安全丢弃。原 6 个阻塞项已修复；153/153 fixtures、tsc 0、diff-check 0；另验证首同步 10 分钟窗口到期不再重投、FTS 条件完成竞态（changes 0→1）。B 超时放行与通知排除已验证；非法/缺失起点修复为新窗口、严格 ISO 往返校验拒绝 `2024-02-30` 与 `"0"`。
+
+#### Queue 阻塞项修复状态（2026-11-22）
+
+原 6 项均已在本地修复并通过复审：
+
+1. **首同步时序**：先持久化快照，只补快照中的 GUID；全部提交后用原子 batch 写 `first_sync_done=1` 与通知游标 `MAX(posts.id)+1`，再投递新帖。E2E 已验证先 A、后 A+B 的顺序。
+2. **快照范围 / retry cap**：新增 `first_sync_started_at` 与 10 分钟重试窗口；`planBootstrapEnqueue` 和 `planEnqueueTargets` 均受 `maxNewPosts` 约束，retry 优先但绝不超 cap；窗口到期原子放行：写 `notification_cursor_post_id=MAX(posts.id)+1`、`first_sync_done=1`，保留 `first_sync_incomplete` 的 `timeout_released` 缺失 GUID 审计并清空快照/起点；放行后再投递普通新帖。审计 GUID 在后续普通入队中过滤，并在通知处理时用 trim 比较跳过；晚到入库也永不通知。非法/缺失起点修复为新窗口，不立即放行。
+3. **`sendBatch` 规模**：`chunkMessagesForSend` 按 ≤100 条消息、≤240 KiB 分组。
+4. **consumer FTS 崩溃恢复**：插入后按 GUID 回读 D1 的 `title/content_text` 建索引；诊断标记写失败返回 `ok:false` 触发 Queue 重试；空页 `complete=1` 改为条件更新，避免覆盖 consumer 的 `complete=0`。
+5. **通知 lease**：租约 16 分钟，拿锁后重读 snapshot，慢渠道不会与下一调用重复发送。
+6. **消息 item 数**：默认 5，`INGEST_ITEMS_PER_MESSAGE=1|3|5`；`max_batch_size=1` 只限制消息数，不限制每条消息内的 item 数。
+
+**仍未放行**：`INGEST_MODE=queue` 需部署日志确认三 cron 是否合并、免费套餐 CPU 与 Queues ops，并由 owner 批准。其余策略已定：单项超限保留跳过+诊断；维护回填保持 1×5；legacy 通知游标保留 `firstSubId === null` 守卫；HTMLRewriter 继续默认 regex。未来只有实际积压/CPU 数据支持时才考虑维护升档，只有语义与 CPU 双门槛通过后才考虑 rewriter。
+
+#### 需求与约束
+
+- Workers 免费套餐：每次 invocation 10ms CPU、D1 50 queries/invocation、Queues 10,000 ops/day（约 3 ops/条消息，24h 保留）、免费 cron triggers 5 个/账号。
+- 目标：把 RSS 完整解析/清洗/入库/FTS 移出 sync cron；通知与搜索回填各自独立 invocation；减少每轮固定开销；保持通知不漏发、搜索索引可恢复。
+- 本阶段不新增 D1 migration（仅新增 `sync_state` 键）；不新增 KV/DO/R2/依赖。
+
+#### Queue 摄取架构
+
+- sync cron（`*/1 * * * *`）：只做 RSS fetch、轻量 GUID 预筛、feed 内 GUID 去重、`posts.guid` 分块存在性查询、`maxNewPosts`、first-sync GUID 集合记录、`sendBatch` 入队、状态/诊断写入；不做完整解析、清洗、入库、FTS、通知。
+- Queue consumer：每消息完整解析、`sanitizePostHtml`、文本提取、`INSERT OR IGNORE`、FTS 索引；幂等（`posts.guid` 唯一 + FTS delete/insert）；失败由 Queues 重试/DLQ 承接；FTS 失败不回滚插入，记录错误并置 `complete=0` 交由回填修复；不获取 prune lease、不读写 `db_prune_index_state`；状态 `"1"` 时允许消费已入队消息。
+- 消息契约：版本化 `IngestMessage`（`v`、`runId`、`items[{guid, chunk}]`）；≤10 item、目标 64KB、硬上限 120KB（UTF-8 计）；超限拆消息；单个 item >120KB 时不得截断正文，当前记录 `last_ingest_error` 并跳过（已定策略：跳过并记录诊断）。
+- Queue 配置：`max_batch_size=1`、`max_concurrency=1`、`max_retries=5`、DLQ；业务目标 ≤6000 ops/day，平台硬上限 10000。
+- 消费者 CPU 尚未实测：按 Workers 免费套餐推断为 10ms/invocation；消息 item 数必须自适应，起步 5，canary 若 p95>7ms 降到 3/1，不得假设 Queues 文档的 30s 默认适用于免费套餐。
+
+#### 通知
+
+- 已拍板：独立 cron，每分钟，使用与 sync 不同的文本（`* * * * *`）；平台是否合并三个 cron 待部署后由 `cron_route` 日志确认，若合并，回退独立 Worker 或 `*/2`（需 owner 批准）。
+- 只扫描已提交帖子；以 `MAX(posts.id)` 为本轮上界；游标语义为“下一个待处理 id”；bootstrap/零订阅追平写 `MAX(id)+1`；修正现有 `id >= cursor` 差一。
+- 空路径合并为 1 条有界查询（3 个 cursor + 首个订阅 + MAX）；仅在有工作时获取 `sync_state.notification_lease`，finally 释放；租约 16 分钟，拿锁后重读 snapshot；`db_prune_index_state="1"` 或 `first_sync_done=0` 时跳过。
+- 外部发送失败不推进游标；`push_logs` 唯一键继续做最终幂等；不把匹配放进 ingest consumer。
+
+#### 首同步
+
+- 首轮把当前 feed 的 GUID 集合（≤20）存 `sync_state.first_sync_guids`，同时写 `first_sync_started_at`；10 分钟内只重投快照中仍在 feed 且未入库的 GUID，且受 `maxNewPosts` 约束。窗口到期后原子放行（游标 `MAX+1`、`first_sync_done=1`、保留 `timeout_released` 缺失 GUID 审计），之后普通新帖正常入队；被释放 GUID 即使晚到入库也永不通知。
+- 每轮 sync 做一次有界 `IN` 存在性查询；全部存在时用一个原子 batch 设置 `first_sync_done=1`、通知游标 `MAX(posts.id)+1`、清空 GUID 键。
+- GUID 长期缺失：窗口内按 feed 重投；到期后放行并记录审计，不静默当作完整历史；审计中的 GUID 从后续普通入队过滤，并在通知处理中跳过。
+- 已有 `first_sync_done=1` 的库不重新引导。
+
+#### 搜索回填
+
+- 已拍板：移出 sync 的 waitUntil；由维护 cron 在 `search_index_state.complete=0` 且 `db_prune_index_state!="1"` 时执行 5 帖/批（`MAINTENANCE_BACKFILL_BATCH=5`）；不进 Queue。
+- 已拍板每轮 1 个 5 帖批次（1×5），不再开放一轮串行多批次；文档需写明修复吞吐与 340k 全量重建的时间量级。
+- `complete=1` 时只做状态读取；不得与 prune/DDL 重负载轮叠加；保留断点与条件更新。
+
+#### 每轮固定开销
+
+- `last_cron_timing` 仅在成功轮 1/10 采样、或失败/状态机/配额异常时写入；新增 `sampled` 语义；`/api/debug/status` 标明采样。
+- 通知空路径合并查询；不删除 lease 后的 index-state 重读。
+- 保留 `sync_state` 条件写契约；不得为省调用改变心跳/状态语义。
+
+#### JS 热路径
+
+- bigram 单遍：顺序迭代码点、复用上一码点的 6 位 hex，去掉 `Array.from`；输出 token 顺序与去重结果必须逐 token 等价。
+- RSS 快路径：`decodeXml` 无 `&` 直接返回；仅出现 `![` 时执行 Markdown 图片替换；完整解析复用已提取 GUID；所有快路径需 fixture 证明输出等价。
+- HTMLRewriter（`src/html.ts`，`HTML_MODE=rewriter`）：一次流式 pass 输出 sanitize HTML + 纯文本，但仍是实验路径，与 regex 路径存在已知语义差异（`style` 与未闭合 `script` 的内容被丢弃、`href` 中的 `&` 只编码一次）；默认 `HTML_MODE=regex`。启用前需补闭合/隐式闭合/混合嵌套文本断言；只处理 HTML，不替代 RSS/XML 解析；`src/render.ts` 的二次 sanitize 保留作为防御。
+
+#### 观测
+
+- 平台 `cpuTimeMs`/`outcome`/`requestId` 全量保留；应用摘要 5% 随机采样 + 失败/retry/DLQ/平台 CPU 超阈值必记。
+- 单条短结构化日志：`role`、`syncRunId`、`newGuidCount`、`itemCount`、`fullParseCount`、`fallback`、`feedChars`、`insertedCount`、`indexedCount`、`notificationAttempts`、`queueOps`、`firstInIsolate`、`outcome`、`failureStage`；不记录正文/token/逐帖日志，不新增 D1 查询。
+- 线上 `performance.now()`/`Date.now()` 在纯 CPU 段不前进，函数级归因只能用本地 CPU profile + fixture；应用无法读取平台 `cpuTimeMs`，因此“cpuTimeMs>=8 必记”只能作为平台日志过滤/告警，不能在 Worker 内判断。
+
+#### 配置、构建与回滚
+
+- 新增 Queue producer/consumer/DLQ bindings；三个 cron 职责：`*/1 * * * *` sync、`* * * * *` notify、`0-59 * * * *` maintenance（搜索回填）。cron 路由需部署后由 `cron_route` 日志确认平台是否合并；不能假设三个文本会分别触发。
+- `wrangler.jsonc` 与 `wrangler.local-qa.jsonc` 同步 queue/cron 配置；`scripts/cloudflare-build.mjs` 在 `writeGeneratedConfig` 前幂等 `queues info`/`queues create`，创建后用 `queues info` 最多轮询 10 次、每次间隔 5 秒确认 Queue 已对 deploy 校验可见（Queues 创建是最终一致的，立即 deploy 会报 `Queue ... does not exist`），并在生成的 root/generated 配置中保留 queue blocks；Workers Builds token 无 Queues 权限时给 README CLI 回退。
+- 临时回滚开关：`INGEST_MODE=inline|queue`（默认 inline，canary 后切 queue）、`HTML_MODE=regex|rewriter`；切换期间 consumer 保持部署直到 backlog 排空（24h 保留）。
+- 分支 `feat/queue-ingest`；单行中文 commit；每个阶段可独立回滚。
+
+#### 验收指标
+
+- 本地已验证（2026-11-22）：`qa:fixtures` 153/153；Queue E2E（入队、consumer 入库与 FTS、`first_sync_done=1`、游标 `MAX+1`）；通知 5 个场景；维护回填 5 帖/批；HTMLRewriter A/B 10/12 文本一致。
+- 仍待部署日志确认：免费账号 24h 的 sync `exceededCpu=0`、consumer 无 CPU 终止、Queue ops ≤6000/day、DLQ=0、通知漏发/重复=0；本地/测试账号结果不能替代这些指标。
+- 回填：5 帖/批可断点续跑，`complete` 能从 0 恢复到 1。
+
+#### 仍待部署验证
+
+- 三个 cron 被平台合并时的回退方式（独立 Worker 或 notify 改 `*/2`）；Queue canary 与 `INGEST_MODE=queue` 放行仍待部署日志及 owner 批准。
+
+#### 参考
+
+- Cloudflare Queues 定价/限制/本地开发文档；Queues free plan changelog（2026-02-04）。
+- `angristan/larafeed`、`ituff/cfrss`、`philippdubach/cloudflare-rss-aggregator`、`adewale/planet_cf`、`macieklamberski/feedsmith`。
+- HTMLRewriter 官方文档；SQLite FTS5 contentless/trigram 文档。

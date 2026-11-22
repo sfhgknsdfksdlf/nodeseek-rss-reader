@@ -1,9 +1,11 @@
 import type { SearchAnchorKind } from "./search";
+import type { IngestMessageV1 } from "./ingest-message";
 
 export type DbPruneIndexState = "0" | "1" | "2";
 
 export interface Env {
   DB: D1Database;
+  INGEST_QUEUE: Queue<IngestMessageV1>;
   RSS_URL?: string;
   COMMIT_VERSION?: string;
   TELEGRAM_BOT_TOKEN?: string;
@@ -13,6 +15,9 @@ export interface Env {
   ADMIN_SECRET?: string;
   READ_STATE_RETENTION_DAYS?: string;
   PUSH_LOG_RETENTION_DAYS?: string;
+  INGEST_MODE?: string;
+  INGEST_ITEMS_PER_MESSAGE?: string;
+  HTML_MODE?: string;
 }
 
 export interface User {
@@ -160,4 +165,7 @@ export interface CronTimingSnapshot {
   };
   error?: string;
   notificationCursor?: NotificationCursor;
+  sampled?: boolean;
+  sampleRate?: number;
+  forced?: boolean;
 }

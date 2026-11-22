@@ -53,6 +53,7 @@
 
 - Cloudflare Workers 免费额度。
 - Cloudflare D1 免费额度（单库上限 500MB；数据库接近上限时由自动清理删除最旧帖子腾出空间）。
+- Cloudflare Queues 免费额度（每天 10,000 次操作，消息最长保留 24 小时）。
 - Cloudflare Cron Triggers。
 - GitHub 免费仓库。
 
@@ -66,9 +67,10 @@
 4. 选择你刚刚 Fork 的仓库。
 5. 构建命令填写 `npm run deploy`。
 6. 其余配置保持默认并开始部署。
-7. 构建脚本会自动创建或复用 D1 数据库 `nodeseek-rss-reader`，自动生成 D1 绑定配置，并自动执行数据库迁移。
-8. 部署完成后打开 Workers 域名，注册第一个用户。
-9. 如需邮件或 Telegram 推送，在 Cloudflare 项目设置中添加对应 Secrets 和变量，然后重新部署。
+7. 构建脚本会自动创建或复用 D1 数据库 `nodeseek-rss-reader`，自动创建或复用 Queue `nodeseek-rss-reader-ingest` 与死信队列 `nodeseek-rss-reader-ingest-dlq`，生成 D1/Queue 绑定配置，并自动执行数据库迁移。
+8. 部署后在 Workers Logs 观察 `cron_route` 日志：`INGEST_MODE=inline` 已保证每个 UTC 分钟最多执行一次 sync；先确认 sync / notify / maintenance 三个 role 分别触发，再考虑后续 Queue 阶段。
+9. 部署完成后打开 Workers 域名，注册第一个用户。
+10. 如需邮件或 Telegram 推送，在 Cloudflare 项目设置中添加对应 Secrets 和变量，然后重新部署。
 
 ## 自动构建命令
 
@@ -82,8 +84,9 @@ npm run deploy
 
 - 查询当前 Cloudflare 账号下是否已有 `nodeseek-rss-reader` D1 数据库。
 - 不存在时自动创建该 D1 数据库。
-- 生成 `wrangler.generated.jsonc`。
-- 同步更新根目录 `wrangler.jsonc`，确保 Cloudflare 最终部署阶段也带有 `DB` 绑定。
+- 查询并幂等创建 Queue `nodeseek-rss-reader-ingest` 及其死信队列 `nodeseek-rss-reader-ingest-dlq`（已存在时复用）。
+- 生成 `wrangler.generated.jsonc`，包含三个 Cron Triggers、Queue producer/consumer/DLQ、D1 绑定和运行时变量。
+- 同步更新根目录 `wrangler.jsonc`，确保 Cloudflare 最终部署阶段也带有 `DB` 与 `INGEST_QUEUE` 绑定。
 - 自动执行全部待应用的数据库迁移（`migrations/` 目录）。
 - 验证 `posts`、`users`、`sync_state` 表已经存在。
 - 执行 Worker 打包 dry-run 校验。
@@ -91,15 +94,52 @@ npm run deploy
 
 迁移链为 `0001..0012` 与 `0014`（中间编号有意空缺）。搜索索引迁移（`migrations/0012_search_indexes.sql`）会随上述迁移步骤自动应用；`migrations/0014_read_states_post_id_index.sql` 是 ledger-only/no-op 迁移，不会在部署时预建 `read_states(post_id)` 索引。cron 在首个 UTC 23:30–00:00 窗口按 0→1→2 状态机建立该索引，并用 `sqlite_schema` + `PRAGMA index_info` 独立验证，验证通过后才启用容量裁剪。旧版显式 `"450"` 在运行时按 480 生效，无需迁移；管理员重新保存 450 仍按 450 生效。部署完成后由 cron 每分钟最多回填 20 条历史帖子，逐步补齐搜索索引，可断点续跑；回填保留为首次构建与写入失败后的修复路径，完成历史索引后不再单独执行；无需手动执行任何批量 SQL。
 
+## Queue 摄取与分阶段启用
+
+**当前版本请保持 `INGEST_MODE=inline`。** Queue 模式已实现，原 6 个阻塞项（首同步时序、快照范围与 retry cap、`sendBatch` 分批、FTS 崩溃恢复、通知 lease、canary 5 帖/消息）已在本地修复并通过复审；启用前仍需用部署日志确认三 cron 是否合并、免费套餐 CPU 与 Queue ops，并由 owner 放行。详见 `AGENTS.md`「Queue 阻塞项修复状态」。
+
+以下描述目标架构，部署后按阶段启用；各阶段以本节末尾的说明为准。
+
+新架构把 RSS 完整解析、清洗、入库与搜索索引从每分钟同步 cron 移到 Cloudflare Queue 消费者：同步 cron 只做轻量 GUID 预筛与入队，通知和搜索回填各自独立 cron。免费套餐 Queues 配额为每天 10,000 次操作（每条消息约 3 次操作，消息最长保留 24 小时），本项目的业务目标是每天不超过 6,000 次操作。
+
+首同步使用 10 分钟有界重试窗口；窗口到期会原子推进通知游标并保留缺失 GUID 审计，之后普通新帖正常入队。被放行的历史 GUID 即使晚到入库也不会触发通知；非法或缺失的首同步起点会修复为新的 10 分钟窗口，不会立即放行。
+
+三个 Cron Triggers（部署配置顺序固定）：
+
+| 表达式 | 角色 |
+| --- | --- |
+| `*/1 * * * *` | sync：抓取 RSS 并投递摄取消息 |
+| `* * * * *` | notify：按游标分批发送订阅通知 |
+| `0-59 * * * *` | maintenance：搜索索引回填 |
+
+sync 与 notify 的表达式文本不同，但语义都是每分钟；Cloudflare 是否把它们合并成一次触发需要部署后验证。首次上线先保持 `INGEST_MODE=inline`，在 Workers Logs 里查看 `cron_route` 日志：能分别看到 sync / notify / maintenance 路由后，再按阶段推进。Queue 模式本身的原 6 个代码阻塞项已修复，但仍需先用 inline 部署验证平台行为；在 owner 放行前不要切换。如果平台把三个 cron 合并成一次触发，回退到独立 Worker，或把通知 cron 调整为 `*/2 * * * *`（需 owner 批准）。
+
+### 切换与回滚
+
+构建脚本读取环境变量决定部署后的运行模式：
+
+- `INGEST_MODE=inline`（默认）：同步 cron 内联解析、入库与建索引，不依赖 Queue 消费者。
+- `INGEST_MODE=queue`：同步 cron 只入队，由 `nodeseek-rss-reader-ingest` 消费者完成解析入库。
+- `HTML_MODE=regex`（默认）/ `HTML_MODE=rewriter`：正文清洗路径，按阶段启用。
+- `INGEST_ITEMS_PER_MESSAGE=5|3|1`：queue 模式下每条摄取消息携带的帖子数（默认 5）；canary 可降档后重新部署，已入队的 5 帖消息不受影响。
+
+切换方式：在 Cloudflare Workers 构建项目设置里添加同名环境变量，或在本地执行 `INGEST_MODE=queue npm run deploy`。回滚把变量改回 `inline`（或删除变量）后重新部署；从 `queue` 回滚到 `inline` 时，先保持 consumer 部署到队列积压排空（消息最长保留 24 小时）再移除 consumer，避免已入队消息丢失。
+
+本仓库的 Queue 代码路径已实现；部署模板与构建脚本能创建 Queue/DLQ 并写入三个 cron。原 6 个阻塞项已修复并通过本地验证；在完成部署日志验证并由 owner 放行前，请保持 `INGEST_MODE=inline`。
+
 ## 环境变量
 
 `wrangler.jsonc` 已内置：
 
 ```json
 {
-  "RSS_URL": "https://rss.nodeseek.com/"
+  "RSS_URL": "https://rss.nodeseek.com/",
+  "INGEST_MODE": "inline",
+  "HTML_MODE": "regex"
 }
 ```
+
+`COMMIT_VERSION` 由构建脚本按当前 Git commit 注入，不要手动填写。`INGEST_MODE` 与 `HTML_MODE` 可在构建环境变量中覆盖（见上文「Queue 摄取与分阶段启用」）。
 
 通知功能可以在网页管理员后台配置。若要启用管理员后台，请在部署后添加一个 Secret：
 
@@ -225,6 +265,8 @@ npx wrangler login
 npm run deploy
 ```
 
+默认按 `INGEST_MODE=inline` 部署；Queue 模式的代码阻塞项已修复，但需先用部署日志验证三 cron、CPU 与 Queue ops，并由 owner 放行后再用 `INGEST_MODE=queue npm run deploy` 切换。
+
 ## 自动 D1 失败时
 
 正常情况下不需要手动创建数据库。如果 Cloudflare GitHub 构建环境没有足够权限执行 `wrangler d1 create` 或 `wrangler d1 migrations apply`，构建日志会提示失败原因。
@@ -239,6 +281,17 @@ npm run deploy:generated
 ```
 
 这仍然不需要手动复制 SQL 或手动编辑 `database_id`。
+
+### 自动 Queue 创建失败时
+
+构建脚本用 `npx wrangler queues info <name>` 检查 Queue 是否存在，不存在时执行 `npx wrangler queues create <name>`；DLQ 先创建，已存在则复用。创建成功后脚本会轮询 `queues info`（最多 10 次、每次间隔 5 秒），等待 Cloudflare Queue 传播到 deploy 校验可见，避免创建后立即部署触发 `Queue ... does not exist`。如果 Workers Builds 的 token 没有 Queues 权限，构建日志会明确失败并提示对应命令，不会被静默忽略。此时先手动创建两个 Queue，再重新部署：
+
+```bash
+npx wrangler queues create nodeseek-rss-reader-ingest-dlq
+npx wrangler queues create nodeseek-rss-reader-ingest
+```
+
+也可以在 Cloudflare 控制台的 Queues 页面创建同名队列。创建后重新部署即可复用，不需要删除 Worker 或手动改配置文件。
 
 ## 部署检查
 

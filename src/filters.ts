@@ -92,7 +92,8 @@ export function markdownImagesToHtml(value: string): string {
 }
 
 export function sanitizePostHtml(raw: string): string {
-  let html = markdownImagesToHtml(raw);
+  // Fast path: the markdown image regex can only match when "![" is present.
+  let html = raw.includes("![") ? markdownImagesToHtml(raw) : raw;
   html = html.replace(/<script[\s\S]*?<\/script>/gi, "");
   html = html.replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
   html = html.replace(/javascript:/gi, "");

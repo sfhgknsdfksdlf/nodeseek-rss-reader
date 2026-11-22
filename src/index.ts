@@ -1,15 +1,23 @@
 import { accountInfo, currentUser, login, logout, newTelegramBindCode, register, updateEmail, updateTelegram } from "./auth";
 import { cleanupOldData } from "./cleanup";
+import { runMaintenanceCron } from "./cron-maintenance";
+import { runNotificationCron } from "./cron-notify";
+import { resolveCronRole } from "./cron-role";
 import { all, json, readJson } from "./db";
 import { DailyWriteQuotaExhaustedError, DB_PRUNE_BACKGROUND_QUERY_RESERVE, DB_PRUNE_CLAIM_QUERY_RESERVE, DB_PRUNE_DAILY_CAP, DB_PRUNE_PRUNE_QUERY_RESERVE, D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, acquirePruneLease, buildAndVerifyReadStatesIndex, canClaimIndexBuild, claimIndexBuild, cleanupFtsOrphans, decodeIndexSnapshot, decideMaxNewPosts, isDailyWriteQuotaError, isPruneWindow, pruneOldPostsBySize, pruneThresholds, readCronState, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readIndexState, recoverIndexState, refreshPruneLease, releasePruneLease, runIsolated, isIndexDay, planBackgroundTasks, claimAbortsNormalWork, indexStateChanged } from "./prune";
 import { D1_QUERY_LIMIT, DB_PRUNE_FINAL_QUERY_RESERVE, budgetRemaining, consumeQuery, createQueryBudget, markDailyWriteQuotaExhausted } from "./query-budget";
 import type { CronStateSnapshot, IndexStateSnapshot, PruneRunResult } from "./prune";
 import { queryPosts } from "./posts";
 import { renderHome } from "./render";
+import { createRunContext, emitRunLog, noteFirstInIsolate, shouldRecordCronTiming } from "./observability";
 import { backfillSearchIndexes, recordSearchIndexError } from "./search";
 import { getHighlightGroups, getInitialRulePayload } from "./rules";
 import { readValidatedBlockImport, readValidatedHighlightImport, readValidatedSubscriptionImport, validatePatternInput } from "./rule-import";
 import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch } from "./rss";
+import { enqueueRss } from "./ingest-producer";
+import { processIngestMessage } from "./ingest-consumer";
+import { claimInlineSyncMinute } from "./inline-gate";
+import type { IngestMessageV1 } from "./ingest-message";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, initializeNotificationCursor, processNotifications } from "./subscriptions";
 import type { CronTimingSnapshot, Env, HomeTimingSnapshot, HomeTimings, User } from "./types";
@@ -44,9 +52,10 @@ function isQuotaStop(error: unknown): boolean {
 
 // Prefix accounting for the one explicit QueryBudget. The fixed six are the
 // index-state/lease reads, both prune settings reads, and the pre-sync size
-// probe; sync adds the first_sync_done read + sync_state write batch, one GUID
-// chunk per 100 feed GUIDs, the insert batch, one inline index batch per new
-// post, and an index-failure diagnostic pair. Notification dispatch consumes
+// probe; inline mode adds the one per-minute sync claim, and sync adds the
+// first_sync_done read + sync_state write batch, one GUID chunk per 100 feed
+// GUIDs, the insert batch, one inline index batch per new post, and an
+// index-failure diagnostic pair. Notification dispatch consumes
 // this same budget itself, so only the first-sync cursor bootstrap (max(id) +
 // one cursor upsert batch) is charged here as a fixed ceiling. Cleanup (8) and
 // recordCronTiming (1) run after creation but before the first gate; the lease
@@ -71,12 +80,24 @@ const CRON_TIMING_QUERY_CEILING = 1;
 // 1 RSS failure attempt log + 1 failure state batch ≈ 28. 30 keeps margin.
 const SYNC_FAILURE_QUERY_CEILING = 30;
 
-function estimatePrefixQueries(result: Awaited<ReturnType<typeof safeSyncRss>>): number {
-  if (!result.ok) return PRE_BUDGET_QUERY_CEILING + SYNC_FAILURE_QUERY_CEILING;
+// Queue mode keeps all insert/index work out of this invocation: 1 first-sync
+// read (done + snapshot + window start), ≤1 feed GUID existence query, ≤1
+// snapshot/window-start batch or ≤1 window-start repair, ≤1 first-sync
+// completion batch, ≤1 first-sync incomplete diagnostic, 1 success state batch,
+// and one attempt log per failed fetch strategy → ≈9. 10 keeps margin.
+const QUEUE_SYNC_QUERY_CEILING = 10;
+
+function estimatePrefixQueries(result: Awaited<ReturnType<typeof safeSyncRss>>, ingestMode: "inline" | "queue"): number {
+  if (ingestMode === "queue") {
+    return PRE_BUDGET_QUERY_CEILING + QUEUE_SYNC_QUERY_CEILING + (result.ok ? 0 : 2) + CLEANUP_QUERY_CEILING + LEASE_REFRESH_QUERY_CEILING + CRON_TIMING_QUERY_CEILING;
+  }
+  // The inline per-minute sync claim runs before the sync body and is one D1 call.
+  const preBudget = PRE_BUDGET_QUERY_CEILING + 1;
+  if (!result.ok) return preBudget + SYNC_FAILURE_QUERY_CEILING;
   const feedCount = result.timings?.parseItemCount ?? 0;
   const newCount = result.timings?.insertNewCount ?? result.inserted;
   const indexFailures = result.timings?.indexFailureCount ?? 0;
-  return PRE_BUDGET_QUERY_CEILING
+  return preBudget
     + SYNC_STATE_QUERY_CEILING
     + Math.ceil(feedCount / 100)
     + 1
@@ -461,6 +482,7 @@ async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): P
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    noteFirstInIsolate();
     try {
       return await handleFetch(request, env, ctx);
     } catch (error) {
@@ -469,8 +491,56 @@ export default {
       return new Response(`<!doctype html><meta charset="utf-8"><title>NodeSeek RSS Reader Error</title><body style="font-family:system-ui;margin:2rem;line-height:1.6"><h1>NodeSeek RSS Reader Error</h1><pre style="white-space:pre-wrap">${message.replace(/[&<>'"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[ch] || ch))}</pre><p>Check <code>/health</code> and Cloudflare Worker bindings.</p></body>`, { status: 500, headers: { "content-type": "text/html; charset=utf-8" } });
     }
   },
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (!env.DB) throw new Error("Cloudflare D1 binding DB is missing");
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const run = createRunContext("cron", noteFirstInIsolate());
+    const role = resolveCronRole(event.cron);
+    const ingestMode = env.INGEST_MODE === "queue" ? "queue" : "inline";
+    console.log(JSON.stringify({ event: "cron_route", cron: event.cron, role, mode: ingestMode }));
+    if (ingestMode === "inline") {
+      // Inline mode has no queue to absorb work, so every recognized trigger
+      // competes for the single per-UTC-minute sync claim. If the platform
+      // merges the three every-minute expressions (or fires one twice), the
+      // winner runs the sync body no matter which role it reports; the rest
+      // skip. Unknown expressions still do nothing.
+      if (role === "unknown") {
+        emitRunLog(run, "skipped", "role_unknown");
+        return;
+      }
+      if (!env.DB) {
+        emitRunLog(run, "failed", "missing_db");
+        throw new Error("Cloudflare D1 binding DB is missing");
+      }
+      const claimed = await claimInlineSyncMinute(env);
+      if (!claimed) {
+        emitRunLog(run, "skipped", "inline_tick_duplicate");
+        return;
+      }
+    } else {
+      if (role === "notify") {
+        if (!env.DB) {
+          emitRunLog(run, "failed", "missing_db");
+          return;
+        }
+        await runNotificationCron(env, ctx, run);
+        return;
+      }
+      if (role === "maintenance") {
+        if (!env.DB) {
+          emitRunLog(run, "failed", "missing_db");
+          return;
+        }
+        await runMaintenanceCron(env, ctx, run);
+        return;
+      }
+      if (role !== "sync") {
+        emitRunLog(run, "skipped", `role_${role}`);
+        return;
+      }
+      if (!env.DB) {
+        emitRunLog(run, "failed", "missing_db");
+        throw new Error("Cloudflare D1 binding DB is missing");
+      }
+    }
 
     let context: CronStateSnapshot;
     try {
@@ -482,6 +552,7 @@ export default {
       } else {
         console.error("readCronState failed; skipping scheduled work", message);
       }
+      emitRunLog(run, "failed", "read_cron_state");
       return;
     }
     let indexState = context.indexState;
@@ -498,6 +569,7 @@ export default {
       } catch (error) {
         console.error("recoverIndexState failed; ending invocation", error instanceof Error ? error.message : String(error));
       }
+      emitRunLog(run, "maintenance", "index_state_1");
       return;
     }
 
@@ -515,6 +587,7 @@ export default {
     } catch (error) {
       if (isQuotaStop(error)) {
         console.error("prune settings read hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+        emitRunLog(run, "failed", "settings_quota");
         return;
       }
       settingsOk = false;
@@ -529,6 +602,7 @@ export default {
     } catch (error) {
       if (isQuotaStop(error)) {
         console.error("readDatabaseSizeBytes hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+        emitRunLog(run, "failed", "size_probe_quota");
         return;
       }
       console.error("readDatabaseSizeBytes before sync failed", error instanceof Error ? error.message : String(error));
@@ -545,10 +619,12 @@ export default {
       } else {
         console.error("acquirePruneLease failed; skipping normal cron work", message);
       }
+      emitRunLog(run, "failed", "acquire_lease");
       return;
     }
     if (!leaseToken) {
       console.warn("prune lease is held by another invocation; skipping RSS, claim, and prune");
+      emitRunLog(run, "skipped", "lease_held");
       return;
     }
     const token = leaseToken;
@@ -569,32 +645,43 @@ export default {
         } else {
           console.error("readIndexState after lease failed; aborting", message);
         }
+        emitRunLog(run, "failed", "read_index_state");
         return;
       }
       if (indexStateChanged(stateAfterLease, indexState)) {
         console.warn("db_prune_index_state changed after lease acquisition; aborting normal work");
+        emitRunLog(run, "skipped", "index_state_changed");
         return;
       }
       indexState = stateAfterLease;
 
-      const result = await safeSyncRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts });
+      const result = ingestMode === "queue"
+        ? await enqueueRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts })
+        : await safeSyncRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts });
       if (!result.ok && isQuotaStop(result.error)) {
         console.error("RSS sync hit D1 daily write quota; ending invocation", String(result.error ?? ""));
+        emitRunLog(run, "failed", "rss_quota");
         return;
       }
-      if (result.firstSync) {
+      if (ingestMode === "queue") {
+        run.fields.ingestMode = ingestMode;
+        run.fields.enqueuedItems = result.timings?.enqueuedItems ?? 0;
+        run.fields.enqueuedMessages = result.timings?.enqueuedMessages ?? 0;
+      }
+      if (ingestMode === "inline" && result.firstSync) {
         try {
           await initializeNotificationCursor(env);
         } catch (error) {
           if (isQuotaStop(error)) {
             console.error("initializeNotificationCursor hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+            emitRunLog(run, "failed", "notification_cursor_quota");
             return;
           }
           console.error("initializeNotificationCursor failed; continuing", error instanceof Error ? error.message : String(error));
         }
       }
 
-      const estimatedPrefix = estimatePrefixQueries(result);
+      const estimatedPrefix = estimatePrefixQueries(result, ingestMode);
       // An over-cap prefix must never be followed by a post-budget phase: the
       // remaining work (cleanup/timing/release) is already inside the prefix.
       const prefixOverCap = estimatedPrefix > D1_QUERY_LIMIT - DB_PRUNE_FINAL_QUERY_RESERVE;
@@ -605,7 +692,7 @@ export default {
 
       let notificationTimings = { totalMs: 0, compileMs: 0, matchMs: 0, attempts: 0, matches: 0, skipped: 0, cursorPostId: 0, cursorSubscriptionId: 0, cursorChannel: "" };
       let notificationsOk = true;
-      if (!prefixOverCap && result.ok && !result.firstSync) {
+      if (!prefixOverCap && ingestMode === "inline" && result.ok && !result.firstSync) {
         const notificationsStartedAt = Date.now();
         try {
           const notifications = await processNotifications(env, budget);
@@ -623,6 +710,7 @@ export default {
         } catch (error) {
           if (isQuotaStop(error)) {
             console.error("processNotifications hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+            emitRunLog(run, "failed", "notifications_quota");
             return;
           }
           notificationsOk = false;
@@ -641,10 +729,12 @@ export default {
           } else {
             console.error("refreshPruneLease failed; skipping maintenance", message);
           }
+          emitRunLog(run, "failed", "refresh_lease");
           return;
         }
         if (!leaseHeld) {
           console.warn("prune lease lost before maintenance; skipping claim and prune");
+          emitRunLog(run, "skipped", "lease_lost");
           return;
         }
       }
@@ -664,6 +754,7 @@ export default {
                 // The claim may have committed 0 -> 1 but the response was
                 // lost; let the next invocation recover from the main database.
                 console.warn("index claim outcome is unknown; ending normal scheduling for main-DB recovery");
+                emitRunLog(run, "skipped", "index_claim_unknown");
                 return;
               }
               if (claim.status === "claimed" && claim.token) {
@@ -674,13 +765,17 @@ export default {
           } catch (error) {
             if (isQuotaStop(error)) {
               console.error("index build admission hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+              emitRunLog(run, "failed", "index_build_quota");
               return;
             }
             console.error("index build admission failed; staying 0", error instanceof Error ? error.message : String(error));
           }
         }
       }
-      if (maintenanceInvocation) return;
+      if (maintenanceInvocation) {
+        emitRunLog(run, "maintenance", "index_build");
+        return;
+      }
 
       const cleanupStartedAt = Date.now();
       let cleanupOldDataMs = 0;
@@ -691,53 +786,61 @@ export default {
       } catch (error) {
         if (isQuotaStop(error)) {
           console.error("cleanupOldData hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+          emitRunLog(run, "failed", "cleanup_quota");
           return;
         }
         console.error("cleanupOldData failed unexpectedly; continuing", error instanceof Error ? error.message : String(error));
       }
       cleanupOldDataMs = Date.now() - cleanupStartedAt;
 
-      try {
-        await runIsolated("recordCronTiming", async () => {
-          await recordCronTiming(env, {
-            recordedAt: new Date().toISOString(),
-            ok: result.ok,
-            firstSync: result.firstSync,
-            inserted: result.inserted,
-            ranProcessSubscriptions: result.ok && !result.firstSync,
-            timings: {
-              rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
-              processSubscriptionsMs: notificationTimings.totalMs,
-              cleanupOldDataMs,
-              totalMs: Date.now() - startedAt,
-              notifications: {
-                attempts: notificationTimings.attempts,
-                matches: notificationTimings.matches,
-                skipped: notificationTimings.skipped,
-                cursorPostId: notificationTimings.cursorPostId
-              }
-            },
-            cpu: {
-              rssParseItemsMs: result.cpu?.parseItemsMs || 0,
-              processSubscriptionsCompileMs: notificationTimings.compileMs,
-              processSubscriptionsMatchMs: notificationTimings.matchMs,
-              cleanupPrepMs: 0,
-              totalMs: (result.cpu?.parseItemsMs || 0) + notificationTimings.compileMs + notificationTimings.matchMs
-            },
-            notificationCursor: {
-              postId: notificationTimings.cursorPostId,
-              subscriptionId: notificationTimings.cursorSubscriptionId,
-              channel: notificationTimings.cursorChannel
-            },
-            ...(result.error ? { error: result.error } : {})
+      const forceTiming = !result.ok || !notificationsOk;
+      if (shouldRecordCronTiming(forceTiming, Math.random())) {
+        try {
+          await runIsolated("recordCronTiming", async () => {
+            await recordCronTiming(env, {
+              recordedAt: new Date().toISOString(),
+              ok: result.ok,
+              firstSync: result.firstSync,
+              inserted: result.inserted,
+              ranProcessSubscriptions: ingestMode === "inline" && result.ok && !result.firstSync,
+              timings: {
+                rssSync: result.timings || { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 },
+                processSubscriptionsMs: notificationTimings.totalMs,
+                cleanupOldDataMs,
+                totalMs: Date.now() - startedAt,
+                notifications: {
+                  attempts: notificationTimings.attempts,
+                  matches: notificationTimings.matches,
+                  skipped: notificationTimings.skipped,
+                  cursorPostId: notificationTimings.cursorPostId
+                }
+              },
+              cpu: {
+                rssParseItemsMs: result.cpu?.parseItemsMs || 0,
+                processSubscriptionsCompileMs: notificationTimings.compileMs,
+                processSubscriptionsMatchMs: notificationTimings.matchMs,
+                cleanupPrepMs: 0,
+                totalMs: (result.cpu?.parseItemsMs || 0) + notificationTimings.compileMs + notificationTimings.matchMs
+              },
+              notificationCursor: {
+                postId: notificationTimings.cursorPostId,
+                subscriptionId: notificationTimings.cursorSubscriptionId,
+                channel: notificationTimings.cursorChannel
+              },
+              ...(result.error ? { error: result.error } : {}),
+              sampled: !forceTiming,
+              forced: forceTiming,
+              sampleRate: 10
+            });
           });
-        });
-      } catch (error) {
-        if (isQuotaStop(error)) {
-          console.error("recordCronTiming hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
-          return;
+        } catch (error) {
+          if (isQuotaStop(error)) {
+            console.error("recordCronTiming hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+            emitRunLog(run, "failed", "record_timing_quota");
+            return;
+          }
+          console.error("recordCronTiming failed unexpectedly; continuing", error instanceof Error ? error.message : String(error));
         }
-        console.error("recordCronTiming failed unexpectedly; continuing", error instanceof Error ? error.message : String(error));
       }
 
       const pruneWindowOpen = !prefixOverCap && settingsOk && !indexState.invalid && indexState.value === "2" && isPruneWindow();
@@ -753,10 +856,12 @@ export default {
           } else {
             console.error("refreshPruneLease before prune failed; skipping prune and background maintenance", message);
           }
+          emitRunLog(run, "failed", "refresh_lease_before_prune");
           return;
         }
         if (!stillHeld) {
           console.warn("prune lease lost before prune; skipping prune and background maintenance");
+          emitRunLog(run, "skipped", "lease_lost_before_prune");
           return;
         }
         if (budgetRemaining(budget) < DB_PRUNE_PRUNE_QUERY_RESERVE) {
@@ -767,6 +872,7 @@ export default {
           } catch (error) {
             if (isQuotaStop(error)) {
               console.error("pruneOldPostsBySize hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+              emitRunLog(run, "failed", "prune_quota");
               return;
             }
             console.error("pruneOldPostsBySize failed; continuing", error instanceof Error ? error.message : String(error));
@@ -774,7 +880,10 @@ export default {
         }
       }
 
-      if (prune?.dailyWriteQuotaExhausted) return;
+      if (prune?.dailyWriteQuotaExhausted) {
+        emitRunLog(run, "failed", "prune_daily_write_quota");
+        return;
+      }
 
       // A prune result already carries this run's activation; otherwise the
       // merged entry snapshot is reused. No extra sync_state read here.
@@ -790,7 +899,7 @@ export default {
         pruneDeletedThisRun: prune?.deletedThisRun ?? 0
       });
       const wantOrphans = settingsOk && context.ftsOrphansPending && backgroundPlan.runFtsOrphans;
-      const wantBackfill = backgroundPlan.runSearchBackfill && context.searchComplete !== 1;
+      const wantBackfill = ingestMode === "inline" && backgroundPlan.runSearchBackfill && context.searchComplete !== 1;
       if (!prefixOverCap && (wantOrphans || wantBackfill)) {
         if (budgetRemaining(budget) < DB_PRUNE_BACKGROUND_QUERY_RESERVE) {
           console.warn("query headroom insufficient for background maintenance; skipping", JSON.stringify({ remaining: budgetRemaining(budget) }));
@@ -840,6 +949,10 @@ export default {
           })();
         }
       }
+      emitRunLog(run, result.ok && notificationsOk ? "ok" : "failed", result.ok ? (notificationsOk ? null : "notifications") : "rss_sync");
+    } catch (error) {
+      emitRunLog(run, "failed", "unhandled");
+      throw error;
     } finally {
       if (backgroundChain) {
         ctx.waitUntil(backgroundChain.then(releaseLease, releaseLease));
@@ -847,6 +960,42 @@ export default {
         await releaseLease();
       }
     }
+  },
+  async queue(batch: MessageBatch<IngestMessageV1>, env: Env): Promise<void> {
+    const run = createRunContext("consumer", noteFirstInIsolate());
+    let ackCount = 0;
+    let retryCount = 0;
+    let inserted = 0;
+    let indexed = 0;
+    let skipped = 0;
+    let itemCount = 0;
+    for (const message of batch.messages) {
+      itemCount += Array.isArray(message.body?.items) ? message.body.items.length : 0;
+      try {
+        const result = await processIngestMessage(env, message.body);
+        if (!result.ok) {
+          message.retry();
+          retryCount += 1;
+          continue;
+        }
+        message.ack();
+        ackCount += 1;
+        inserted += result.inserted;
+        indexed += result.indexed;
+        skipped += result.skipped;
+      } catch (error) {
+        console.error("ingest consumer failed", error instanceof Error ? error.message : String(error));
+        message.retry();
+        retryCount += 1;
+      }
+    }
+    run.fields.itemCount = itemCount;
+    run.fields.insertedCount = inserted;
+    run.fields.indexedCount = indexed;
+    run.fields.skippedCount = skipped;
+    run.fields.ackCount = ackCount;
+    run.fields.retryCount = retryCount;
+    emitRunLog(run, retryCount === 0 ? "ok" : "failed", retryCount === 0 ? null : "ingest_retry");
   }
 
 };

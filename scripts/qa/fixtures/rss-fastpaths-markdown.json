@@ -1,0 +1,47 @@
+{
+  "name": "filters.markdownImagesToHtml fastpath equivalence",
+  "module": "filters",
+  "export": "markdownImagesToHtml",
+  "cases": [
+    {
+      "name": "plain text without markdown image is untouched",
+      "args": ["plain text only"],
+      "expect": "plain text only"
+    },
+    {
+      "name": "single http markdown image converts",
+      "args": ["![alt](http://example.com/a.png)"],
+      "expect": "<img src=\"http://example.com/a.png\" alt=\"alt\">"
+    },
+    {
+      "name": "single https markdown image converts",
+      "args": ["![alt](https://example.com/a.png)"],
+      "expect": "<img src=\"https://example.com/a.png\" alt=\"alt\">"
+    },
+    {
+      "name": "empty alt markdown image converts",
+      "args": ["![](https://example.com/a.png)"],
+      "expect": "<img src=\"https://example.com/a.png\" alt=\"\">"
+    },
+    {
+      "name": "multiple markdown images all convert",
+      "args": ["![a](https://example.com/a.png) and ![b](https://example.com/b.png)"],
+      "expect": "<img src=\"https://example.com/a.png\" alt=\"a\"> and <img src=\"https://example.com/b.png\" alt=\"b\">"
+    },
+    {
+      "name": "non-http markdown url stays literal",
+      "args": ["![a](ftp://example.com/a.png)"],
+      "expect": "![a](ftp://example.com/a.png)"
+    },
+    {
+      "name": "incomplete markdown image stays literal",
+      "args": ["![alt](https://example.com/a.png"],
+      "expect": "![alt](https://example.com/a.png"
+    },
+    {
+      "name": "bang with bracket converts the image",
+      "args": ["a![b](https://example.com/a.png)"],
+      "expect": "a<img src=\"https://example.com/a.png\" alt=\"b\">"
+    }
+  ]
+}

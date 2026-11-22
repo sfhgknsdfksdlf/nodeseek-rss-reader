@@ -1,0 +1,198 @@
+{
+  "name": "ingest-producer.planEnqueueTargets prefilter/cap/retry selection",
+  "module": "ingest-producer",
+  "export": "planEnqueueTargets",
+  "cases": [
+    {
+      "name": "dedupes feed GUIDs, skips existing posts, and caps new items",
+      "args": [
+        {
+          "chunks": ["c1", "c2", "c3", "c4"],
+          "guids": ["g1", "g1", "g2", "g3"],
+          "existingGuids": ["g2"],
+          "maxNewPosts": 1
+        }
+      ],
+      "expect": {
+        "items": [{ "guid": "g1", "chunk": "c1" }],
+        "invalidCount": 0,
+        "duplicateCount": 1,
+        "existingCount": 1,
+        "cappedCount": 1,
+        "retryQueuedGuids": [],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "counts blank GUID or blank chunk as invalid and keeps valid items",
+      "args": [
+        {
+          "chunks": ["c1", "c2", ""],
+          "guids": ["", "g2", "g3"],
+          "existingGuids": [],
+          "maxNewPosts": null
+        }
+      ],
+      "expect": {
+        "items": [{ "guid": "g2", "chunk": "c2" }],
+        "invalidCount": 2,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 0,
+        "retryQueuedGuids": [],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "cap zero enqueues no new items and reports every capped candidate",
+      "args": [
+        {
+          "chunks": ["c1", "c2"],
+          "guids": ["g1", "g2"],
+          "existingGuids": [],
+          "maxNewPosts": 0
+        }
+      ],
+      "expect": {
+        "items": [],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 2,
+        "retryQueuedGuids": [],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "first-sync retry GUID still in the feed is bounded by the new-post cap",
+      "args": [
+        {
+          "chunks": ["c1", "c2"],
+          "guids": ["g1", "g2"],
+          "existingGuids": [],
+          "maxNewPosts": 1,
+          "retryGuids": ["g2"]
+        }
+      ],
+      "expect": {
+        "items": [{ "guid": "g2", "chunk": "c2" }],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 1,
+        "retryQueuedGuids": ["g2"],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "first-sync retry GUID absent from the feed is reported and never queued",
+      "args": [
+        {
+          "chunks": ["c1"],
+          "guids": ["g1"],
+          "existingGuids": [],
+          "maxNewPosts": null,
+          "retryGuids": ["gx", "g1"]
+        }
+      ],
+      "expect": {
+        "items": [{ "guid": "g1", "chunk": "c1" }],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 0,
+        "retryQueuedGuids": ["g1"],
+        "retryMissingFromFeed": ["gx"]
+      }
+    },
+    {
+      "name": "retry GUIDs are prioritized within the cap and new items fill the rest in feed order",
+      "args": [
+        {
+          "chunks": ["c1", "c2", "c3"],
+          "guids": ["g1", "g2", "g3"],
+          "existingGuids": [],
+          "maxNewPosts": 2,
+          "retryGuids": ["g2"]
+        }
+      ],
+      "expect": {
+        "items": [
+          { "guid": "g2", "chunk": "c2" },
+          { "guid": "g1", "chunk": "c1" }
+        ],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 1,
+        "retryQueuedGuids": ["g2"],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "cap zero enqueues no retry items and reports the skipped retry",
+      "args": [
+        {
+          "chunks": ["c1"],
+          "guids": ["g1"],
+          "existingGuids": [],
+          "maxNewPosts": 0,
+          "retryGuids": ["g1"]
+        }
+      ],
+      "expect": {
+        "items": [],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 1,
+        "retryQueuedGuids": [],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "without a cap keeps feed order and drops existing posts",
+      "args": [
+        {
+          "chunks": ["c1", "c2", "c3"],
+          "guids": ["g3", "g1", "g2"],
+          "existingGuids": ["g1"],
+          "maxNewPosts": null
+        }
+      ],
+      "expect": {
+        "items": [
+          { "guid": "g3", "chunk": "c1" },
+          { "guid": "g2", "chunk": "c3" }
+        ],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 1,
+        "cappedCount": 0,
+        "retryQueuedGuids": [],
+        "retryMissingFromFeed": []
+      }
+    },
+    {
+      "name": "retry GUID already committed is not reported missing when absent from feed",
+      "args": [
+        {
+          "chunks": [],
+          "guids": [],
+          "existingGuids": ["x"],
+          "maxNewPosts": 5,
+          "retryGuids": ["x"]
+        }
+      ],
+      "expect": {
+        "items": [],
+        "invalidCount": 0,
+        "duplicateCount": 0,
+        "existingCount": 0,
+        "cappedCount": 0,
+        "retryQueuedGuids": [],
+        "retryMissingFromFeed": []
+      }
+    }
+  ]
+}

@@ -4,7 +4,9 @@
   "compatibility_date": "2026-04-24",
   "vars": {
     "RSS_URL": "https://rss.nodeseek.com/",
-    "COMMIT_VERSION": "local"
+    "COMMIT_VERSION": "local",
+    "INGEST_MODE": "inline",
+    "INGEST_ITEMS_PER_MESSAGE": "5"
   },
   "d1_databases": [
     {
@@ -12,5 +14,23 @@
       "database_name": "nodeseek-rss-reader",
       "database_id": "local-qa-only"
     }
-  ]
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "INGEST_QUEUE",
+        "queue": "nodeseek-rss-reader-ingest"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "nodeseek-rss-reader-ingest",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "max_concurrency": 1,
+        "dead_letter_queue": "nodeseek-rss-reader-ingest-dlq"
+      }
+    ]
+  }
 }

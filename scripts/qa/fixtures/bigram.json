@@ -1,0 +1,67 @@
+{
+  "name": "search.bigramTokens golden",
+  "module": "search",
+  "export": "bigramTokens",
+  "cases": [
+    {
+      "name": "empty string yields no tokens",
+      "args": [""],
+      "expect": []
+    },
+    {
+      "name": "single ascii codepoint yields no tokens",
+      "args": ["a"],
+      "expect": []
+    },
+    {
+      "name": "two ascii codepoints yield one 12-char hex token",
+      "args": ["ab"],
+      "expect": ["000061000062"]
+    },
+    {
+      "name": "repeated ascii codepoints dedupe to a single token",
+      "args": ["aaa"],
+      "expect": ["000061000061"]
+    },
+    {
+      "name": "alternating ascii codepoints keep first-seen order",
+      "args": ["abab"],
+      "expect": ["000061000062", "000062000061"]
+    },
+    {
+      "name": "cjk codepoints encode six-digit lowercase hex pairs",
+      "args": ["甲乙丙"],
+      "expect": ["007532004e59", "004e59004e19"]
+    },
+    {
+      "name": "single astral emoji (surrogate pair) yields no tokens",
+      "args": ["😀"],
+      "expect": []
+    },
+    {
+      "name": "astral emoji followed by ascii yields one token",
+      "args": ["😀a"],
+      "expect": ["01f600000061"]
+    },
+    {
+      "name": "ascii followed by astral emoji yields one token",
+      "args": ["a😀"],
+      "expect": ["00006101f600"]
+    },
+    {
+      "name": "crlf pair yields one token",
+      "args": ["\r\n"],
+      "expect": ["00000d00000a"]
+    },
+    {
+      "name": "ascii with space encodes the space codepoint",
+      "args": ["a b"],
+      "expect": ["000061000020", "000020000062"]
+    },
+    {
+      "name": "ascii with newline encodes the newline codepoint",
+      "args": ["a\nb"],
+      "expect": ["00006100000a", "00000a000062"]
+    }
+  ]
+}

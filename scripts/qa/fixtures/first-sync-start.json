@@ -1,0 +1,42 @@
+{
+  "name": "first-sync.isValidFirstSyncStart retry window start validation",
+  "module": "first-sync",
+  "export": "isValidFirstSyncStart",
+  "cases": [
+    {
+      "name": "accepts an ISO timestamp",
+      "args": ["2023-11-14T22:13:20.000Z"],
+      "expect": true
+    },
+    {
+      "name": "rejects null",
+      "args": [null],
+      "expect": false
+    },
+    {
+      "name": "rejects an empty string",
+      "args": [""],
+      "expect": false
+    },
+    {
+      "name": "rejects an unparseable string",
+      "args": ["not-a-date"],
+      "expect": false
+    },
+    {
+      "name": "rejects whitespace-only input",
+      "args": ["   "],
+      "expect": false
+    },
+    {
+      "name": "rejects a rolled-over calendar date",
+      "args": ["2024-02-30T00:00:00.000Z"],
+      "expect": false
+    },
+    {
+      "name": "rejects the numeric string zero",
+      "args": ["0"],
+      "expect": false
+    }
+  ]
+}

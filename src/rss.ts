@@ -1,10 +1,11 @@
 import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
+import { sanitizeAndExtract } from "./html";
 import { indexPostForSearch, markSearchIndexRetryPending, recordSearchIndexError } from "./search";
 import type { CronTimingSnapshot, Env, Post, RssNewPost } from "./types";
 
-interface RssItem {
+export interface RssItem {
   guid: string;
   title: string;
   link: string;
@@ -151,7 +152,9 @@ function attrLink(xml: string): string {
   return textBetweenPatterns(xml, linkTextTagPatterns);
 }
 
-function decodeXml(value: string): string {
+export function decodeXml(value: string): string {
+  // Fast path: most text has no entity at all; the replace chain would return it unchanged.
+  if (!value.includes("&")) return value;
   return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
@@ -164,12 +167,30 @@ export function cheapGuid(chunk: string): string {
   return textBetweenPatterns(chunk, guidTagPatterns) || attrLink(chunk) || textBetweenPatterns(chunk, titleTagPatterns);
 }
 
-function parseChunkFull(chunk: string): RssItem {
+interface ParsedChunkResult {
+  item: RssItem;
+  guidMismatch: boolean;
+}
+
+// Field extraction without HTML sanitization, shared by the inline (regex) and
+// Queue (HTMLRewriter) paths so the RSS/XML parsing logic cannot drift. The
+// optional guidHint also yields the same mismatch flag for both paths.
+export interface ParsedChunkFields {
+  guid: string;
+  title: string;
+  link: string;
+  contentRaw: string;
+  author: string;
+  board: string;
+  publishedAt: string;
+  guidMismatch: boolean;
+}
+
+export function parseChunkFields(chunk: string, guidHint?: string): ParsedChunkFields {
   const title = textBetweenPatterns(chunk, titleTagPatterns);
   const link = attrLink(chunk);
   const guid = textBetweenPatterns(chunk, guidTagPatterns) || link || title;
   const contentRaw = textBetweenPatterns(chunk, contentTagPatterns);
-  const contentHtml = sanitizePostHtml(contentRaw);
   const author = textBetweenPatterns(chunk, authorTagPatterns);
   const board = normalizeBoard(textBetweenPatterns(chunk, categoryTagPatterns));
   const dateRaw = textBetweenPatterns(chunk, dateTagPatterns);
@@ -178,16 +199,57 @@ function parseChunkFull(chunk: string): RssItem {
     guid,
     title,
     link,
-    contentHtml,
-    contentText: stripHtml(contentHtml || contentRaw),
+    contentRaw,
     author,
     board,
-    publishedAt: Number.isNaN(date.getTime()) ? nowIso() : date.toISOString()
+    publishedAt: Number.isNaN(date.getTime()) ? nowIso() : date.toISOString(),
+    guidMismatch: typeof guidHint === "string" && guidHint !== guid
+  };
+}
+
+// `guidHint` is the cheap prefilter GUID. A divergence is reported to the caller
+// instead of silently replacing the identity used for dedupe/existence checks.
+export function parseChunkFull(chunk: string, guidHint?: string): ParsedChunkResult {
+  const fields = parseChunkFields(chunk, guidHint);
+  const contentHtml = sanitizePostHtml(fields.contentRaw);
+  return {
+    item: {
+      guid: fields.guid,
+      title: fields.title,
+      link: fields.link,
+      contentHtml,
+      contentText: stripHtml(contentHtml || fields.contentRaw),
+      author: fields.author,
+      board: fields.board,
+      publishedAt: fields.publishedAt
+    },
+    guidMismatch: fields.guidMismatch
+  };
+}
+
+// HTMLRewriter variant used by the Queue consumer when HTML_MODE=rewriter.
+// Same fields and same guidMismatch semantics; only the body pipeline differs.
+export async function parseChunkFullHtml(chunk: string, guidHint?: string): Promise<{ item: RssItem; guidMismatch: boolean; htmlMode: "rewriter" }> {
+  const fields = parseChunkFields(chunk, guidHint);
+  const sanitized = await sanitizeAndExtract(fields.contentRaw);
+  return {
+    item: {
+      guid: fields.guid,
+      title: fields.title,
+      link: fields.link,
+      contentHtml: sanitized.html,
+      contentText: sanitized.html ? sanitized.text : stripHtml(fields.contentRaw),
+      author: fields.author,
+      board: fields.board,
+      publishedAt: fields.publishedAt
+    },
+    guidMismatch: fields.guidMismatch,
+    htmlMode: "rewriter"
   };
 }
 
 function parseChunksFull(chunks: string[]): RssItem[] {
-  return chunks.map(parseChunkFull).filter((item) => item.guid && item.title && item.link);
+  return chunks.map((chunk) => parseChunkFull(chunk).item).filter((item) => item.guid && item.title && item.link);
 }
 
 export function parseItemsFull(xml: string): RssItem[] {
@@ -228,7 +290,7 @@ async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: 
   }
 }
 
-async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number } }> {
+export async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number } }> {
   const rssStrategy = rssFetchStrategies[0];
   const browserStrategy = rssFetchStrategies[1];
   const firstDelaySeconds = randomIntInclusive(21, 24);
@@ -247,6 +309,48 @@ function initSyncState(env: Env, key: string, value: string, updatedAt: string):
   return env.DB.prepare("INSERT INTO sync_state (key, value, updated_at) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM sync_state WHERE key = ?) ON CONFLICT(key) DO NOTHING").bind(key, value, updatedAt, key);
 }
 
+// Feed GUIDs are compared in bounded IN() chunks so a large feed never turns
+// into one oversized statement. Both syncRss and the Queue producer share this.
+export async function queryExistingGuids(env: Env, guids: string[]): Promise<Set<string>> {
+  const existing = new Set<string>();
+  for (let offset = 0; offset < guids.length; offset += 100) {
+    const chunk = guids.slice(offset, offset + 100);
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...chunk));
+    for (const row of rows) existing.add(row.guid);
+  }
+  return existing;
+}
+
+// Success state stays the single fixed-key contract: guarded inserts first,
+// then conditional updates so a stable cron does not rewrite unchanged values.
+// Queue mode passes markFirstSyncDone=false: first_sync_done may only flip once
+// the consumer has actually persisted every bootstrap GUID.
+export async function persistSyncSuccess(env: Env, strategy: string, options?: { markFirstSyncDone?: boolean }): Promise<void> {
+  const updatedAt = nowIso();
+  const statements: D1PreparedStatement[] = [];
+  if (options?.markFirstSyncDone !== false) statements.push(initSyncState(env, "first_sync_done", "1", updatedAt));
+  statements.push(
+    initSyncState(env, "last_sync_at", updatedAt, updatedAt),
+    initSyncState(env, "last_sync_error", "", updatedAt),
+    initSyncState(env, "last_sync_strategy", strategy, updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_at'").bind(updatedAt, updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = '', updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ''").bind(updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_strategy' AND value IS NOT ?").bind(strategy, updatedAt, strategy)
+  );
+  await env.DB.batch(statements);
+}
+
+export async function persistSyncFailure(env: Env, message: string): Promise<void> {
+  const updatedAt = nowIso();
+  await env.DB.batch([
+    initSyncState(env, "last_sync_error", message, updatedAt),
+    initSyncState(env, "last_sync_at", updatedAt, updatedAt),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ?").bind(message, updatedAt, message),
+    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_at'").bind(updatedAt, updatedAt)
+  ]);
+}
+
 async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Promise<void> {
   const updatedAt = nowIso();
   const value = JSON.stringify(snapshot);
@@ -256,7 +360,7 @@ async function setCronTimingSnapshot(env: Env, snapshot: CronTimingSnapshot): Pr
   ]);
 }
 
-interface RssSyncTiming {
+export interface RssSyncTiming {
   fetchRssMs: number;
   fetchFirstStrategyMs: number;
   fetchRetryStrategyMs: number;
@@ -274,7 +378,10 @@ interface RssSyncTiming {
   guidExtractCount?: number;
   fullParseMs?: number;
   fullParseCount?: number;
+  guidMismatchCount?: number;
   indexFailureCount?: number;
+  enqueuedItems?: number;
+  enqueuedMessages?: number;
 }
 
 interface RssSyncResult {
@@ -290,7 +397,7 @@ interface RssSyncResult {
   };
 }
 
-interface SafeRssSyncResult {
+export interface SafeRssSyncResult {
   inserted: number;
   firstSync: boolean;
   insertedPosts: RssNewPost[];
@@ -316,6 +423,7 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
   const useFallback = chunkGuids.some((guid) => !guid.trim());
   let fullParseMs = 0;
   let fullParseCount = 0;
+  let guidMismatchCount = 0;
   const seenGuids = new Set<string>();
   let candidates: RssInsertCandidate[] = [];
   if (useFallback) {
@@ -337,13 +445,7 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
     });
   }
   const guids = candidates.map((candidate) => candidate.guid);
-  const existingGuids = new Set<string>();
-  for (let offset = 0; offset < guids.length; offset += 100) {
-    const guidChunk = guids.slice(offset, offset + 100);
-    const placeholders = guidChunk.map(() => "?").join(",");
-    const rows = await all<{ guid: string }>(env.DB.prepare(`SELECT guid FROM posts WHERE guid IN (${placeholders})`).bind(...guidChunk));
-    for (const row of rows) existingGuids.add(row.guid);
-  }
+  const existingGuids = await queryExistingGuids(env, guids);
   let targetCandidates = candidates.filter((candidate) => !existingGuids.has(candidate.guid));
   const candidateInsertCount = targetCandidates.length;
   const maxNewPosts = options?.maxNewPosts;
@@ -356,13 +458,15 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
     const fullParseStartedAt = Date.now();
     const parsed: RssInsertCandidate[] = [];
     for (const candidate of targetCandidates) {
-      const item = parseChunkFull(candidate.chunk ?? "");
+      const { item, guidMismatch } = parseChunkFull(candidate.chunk ?? "", candidate.guid);
       fullParseCount++;
+      if (guidMismatch) guidMismatchCount++;
       if (item.guid && item.title && item.link) parsed.push({ guid: item.guid, item });
     }
     fullParseMs += Date.now() - fullParseStartedAt;
     targetCandidates = parsed;
   }
+  if (guidMismatchCount > 0) console.warn("RSS GUID mismatch", JSON.stringify({ count: guidMismatchCount }));
   if (capped) console.warn("RSS insert capped", JSON.stringify({ cap: maxNewPosts, candidates: candidateInsertCount }));
   const parseItemsMs = guidExtractMs + fullParseMs;
   const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
@@ -430,20 +534,11 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
     }
   }
   const writeStateStartedAt = Date.now();
-  const updatedAt = nowIso();
-  await env.DB.batch([
-    initSyncState(env, "first_sync_done", "1", updatedAt),
-    initSyncState(env, "last_sync_at", updatedAt, updatedAt),
-    initSyncState(env, "last_sync_error", "", updatedAt),
-    initSyncState(env, "last_sync_strategy", strategy, updatedAt),
-    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_at'").bind(updatedAt, updatedAt),
-    env.DB.prepare("UPDATE sync_state SET value = '', updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ''").bind(updatedAt),
-    env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_strategy' AND value IS NOT ?").bind(strategy, updatedAt, strategy)
-  ]);
+  await persistSyncSuccess(env, strategy);
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
   const insertPostsMs = insertLoopMs;
   insertBindRunMs = Date.now() - batchStartedAt;
-  return { inserted, firstSync: first, insertedPosts, strategy, indexFailureCount, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: chunks.length, prepareInsertMs, insertBindRunMs, insertNewCount, insertExistingCount, insertLoopMs, insertPostsMs, writeSyncStateMs, totalMs: Date.now() - fetchStartedAt, guidExtractMs, guidExtractCount: chunks.length, fullParseMs, fullParseCount, indexFailureCount }, cpu: { parseItemsMs, parseItemCount: chunks.length } };
+  return { inserted, firstSync: first, insertedPosts, strategy, indexFailureCount, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: chunks.length, prepareInsertMs, insertBindRunMs, insertNewCount, insertExistingCount, insertLoopMs, insertPostsMs, writeSyncStateMs, totalMs: Date.now() - fetchStartedAt, guidExtractMs, guidExtractCount: chunks.length, fullParseMs, fullParseCount, guidMismatchCount, indexFailureCount }, cpu: { parseItemsMs, parseItemCount: chunks.length } };
 }
 
 export async function safeSyncRss(env: Env, options?: { maxNewPosts?: number }): Promise<SafeRssSyncResult> {
@@ -453,14 +548,8 @@ export async function safeSyncRss(env: Env, options?: { maxNewPosts?: number }):
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("RSS sync failed", message);
-    const updatedAt = nowIso();
     try {
-      await env.DB.batch([
-        initSyncState(env, "last_sync_error", message, updatedAt),
-        initSyncState(env, "last_sync_at", updatedAt, updatedAt),
-        env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ?").bind(message, updatedAt, message),
-        env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_at'").bind(updatedAt, updatedAt)
-      ]);
+      await persistSyncFailure(env, message);
     } catch (stateError) {
       console.error("RSS sync state persist failed", stateError instanceof Error ? stateError.message : String(stateError));
     }

@@ -10,7 +10,8 @@
     "deploy:generated": "wrangler deploy --config wrangler.generated.jsonc",
     "db:migrate:local": "wrangler d1 migrations apply nodeseek-rss-reader --local --config wrangler.local-qa.jsonc",
     "db:migrate": "wrangler d1 migrations apply nodeseek-rss-reader --remote",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "qa:fixtures": "node scripts/qa/run.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260424.0",

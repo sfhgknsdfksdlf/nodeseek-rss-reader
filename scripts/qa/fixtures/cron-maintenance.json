@@ -1,0 +1,42 @@
+{
+  "name": "cron-maintenance.decideMaintenance gate",
+  "module": "cron-maintenance",
+  "export": "decideMaintenance",
+  "cases": [
+    {
+      "name": "skips while the prune index state machine builds or recovers",
+      "args": [{ "indexState": "1", "searchComplete": 0 }],
+      "expect": { "action": "skip", "reason": "index_state_1" }
+    },
+    {
+      "name": "lets state 1 win over a completed search index",
+      "args": [{ "indexState": "1", "searchComplete": 1 }],
+      "expect": { "action": "skip", "reason": "index_state_1" }
+    },
+    {
+      "name": "skips when the search index is already complete",
+      "args": [{ "indexState": "2", "searchComplete": 1 }],
+      "expect": { "action": "skip", "reason": "complete" }
+    },
+    {
+      "name": "skips complete state 0 as well",
+      "args": [{ "indexState": "0", "searchComplete": 1 }],
+      "expect": { "action": "skip", "reason": "complete" }
+    },
+    {
+      "name": "backfills when both states are missing",
+      "args": [{ "indexState": null, "searchComplete": null }],
+      "expect": { "action": "backfill" }
+    },
+    {
+      "name": "backfills on unverified state 0 with an incomplete index",
+      "args": [{ "indexState": "0", "searchComplete": 0 }],
+      "expect": { "action": "backfill" }
+    },
+    {
+      "name": "backfills on verified state 2 with an incomplete index",
+      "args": [{ "indexState": "2", "searchComplete": 0 }],
+      "expect": { "action": "backfill" }
+    }
+  ]
+}

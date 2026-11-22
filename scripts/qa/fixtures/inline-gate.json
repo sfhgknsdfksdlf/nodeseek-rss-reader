@@ -1,0 +1,27 @@
+{
+  "name": "inline-gate.inlineMinuteKey UTC minute buckets",
+  "module": "inline-gate",
+  "export": "inlineMinuteKey",
+  "cases": [
+    {
+      "name": "epoch zero is minute 0",
+      "args": [0],
+      "expect": "0"
+    },
+    {
+      "name": "the last millisecond of a minute stays in that minute",
+      "args": [59999],
+      "expect": "0"
+    },
+    {
+      "name": "the next millisecond opens the next minute",
+      "args": [60000],
+      "expect": "1"
+    },
+    {
+      "name": "a larger timestamp floors into its minute bucket",
+      "args": [1763000039999],
+      "expect": "29383333"
+    }
+  ]
+}

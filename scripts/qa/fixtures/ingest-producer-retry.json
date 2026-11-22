@@ -1,0 +1,52 @@
+{
+  "name": "ingest-producer.isFirstSyncWindowExpired bounded bootstrap retry window",
+  "module": "ingest-producer",
+  "export": "isFirstSyncWindowExpired",
+  "cases": [
+    {
+      "name": "a start written just now has not expired",
+      "args": ["2023-11-14T22:13:20.000Z", 1700000000000],
+      "expect": false
+    },
+    {
+      "name": "9 minutes 59 seconds elapsed is still inside the window",
+      "args": ["2023-11-14T22:13:20.000Z", 1700000599000],
+      "expect": false
+    },
+    {
+      "name": "10 minutes elapsed closes the retry window",
+      "args": ["2023-11-14T22:13:20.000Z", 1700000600000],
+      "expect": true
+    },
+    {
+      "name": "11 minutes elapsed stays closed",
+      "args": ["2023-11-14T22:13:20.000Z", 1700000660000],
+      "expect": true
+    },
+    {
+      "name": "a missing start is never expired",
+      "args": [null, 1700000600000],
+      "expect": false
+    },
+    {
+      "name": "an unparseable start is never expired",
+      "args": ["not-a-date", 1700000600000],
+      "expect": false
+    },
+    {
+      "name": "a clock that moved backwards is never expired",
+      "args": ["2023-11-14T22:13:20.000Z", 1699999999000],
+      "expect": false
+    },
+    {
+      "name": "a rolled-over calendar date is never expired",
+      "args": ["2024-02-30T00:00:00.000Z", 4102444800000],
+      "expect": false
+    },
+    {
+      "name": "the numeric string zero is never expired",
+      "args": ["0", 4102444800000],
+      "expect": false
+    }
+  ]
+}
