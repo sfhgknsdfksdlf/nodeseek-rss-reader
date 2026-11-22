@@ -1,0 +1,32 @@
+{
+  "name": "搜索索引恢复预标记",
+  "module": "rss",
+  "export": "shouldPreMarkSearchIncomplete",
+  "cases": [
+    {
+      "name": "有新帖且索引已完成时预标记",
+      "args": [3, 1],
+      "expect": true
+    },
+    {
+      "name": "单帖也算有新帖",
+      "args": [1, 1],
+      "expect": true
+    },
+    {
+      "name": "没有插入行时不预标记",
+      "args": [0, 1],
+      "expect": false
+    },
+    {
+      "name": "索引未完成时不预标记",
+      "args": [3, 0],
+      "expect": false
+    },
+    {
+      "name": "缺少读取值时不预标记",
+      "args": [3, null],
+      "expect": false
+    }
+  ]
+}

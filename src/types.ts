@@ -18,6 +18,7 @@ export interface Env {
   INGEST_MODE?: string;
   INGEST_ITEMS_PER_MESSAGE?: string;
   HTML_MODE?: string;
+  MEASURE_CRON?: string;
 }
 
 export interface User {

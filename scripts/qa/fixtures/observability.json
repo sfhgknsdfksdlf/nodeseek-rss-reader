@@ -32,6 +32,16 @@
       "name": "always keeps a dlq run",
       "args": ["dlq", 0.99],
       "expect": true
+    },
+    {
+      "name": "measure mode forces a successful run log",
+      "args": ["ok", 0.99, true],
+      "expect": true
+    },
+    {
+      "name": "measure mode off keeps the 5% success sample",
+      "args": ["ok", 0.99, false],
+      "expect": false
     }
   ]
 }

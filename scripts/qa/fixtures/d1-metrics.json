@@ -1,0 +1,42 @@
+{
+  "name": "d1-metrics.classifySqlPhase sync buckets",
+  "module": "d1-metrics",
+  "export": "classifySqlPhase",
+  "cases": [
+    {
+      "name": "classifies the GUID prefilter query",
+      "args": ["SELECT guid FROM posts WHERE guid IN (?, ?)"],
+      "expect": "guid"
+    },
+    {
+      "name": "classifies the first-sync probe by key text",
+      "args": ["SELECT value FROM sync_state WHERE key = 'first_sync_done'"],
+      "expect": "first"
+    },
+    {
+      "name": "classifies the insert batch statement",
+      "args": ["INSERT OR IGNORE INTO posts (guid, title) VALUES (?, ?)"],
+      "expect": "posts"
+    },
+    {
+      "name": "classifies the merged FTS delete",
+      "args": ["DELETE FROM posts_search_trigram WHERE rowid = ?"],
+      "expect": "fts"
+    },
+    {
+      "name": "falls back for unrelated SQL",
+      "args": ["SELECT 1"],
+      "expect": "fallback"
+    },
+    {
+      "name": "treats a blank statement as fallback",
+      "args": ["   "],
+      "expect": "fallback"
+    },
+    {
+      "name": "normalises case and multiline whitespace",
+      "args": ["INSERT OR IGNORE\n  INTO   Posts (guid) VALUES (?)"],
+      "expect": "posts"
+    }
+  ]
+}

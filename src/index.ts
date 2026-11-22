@@ -4,12 +4,15 @@ import { runMaintenanceCron } from "./cron-maintenance";
 import { runNotificationCron } from "./cron-notify";
 import { resolveCronRole } from "./cron-role";
 import { all, json, readJson } from "./db";
-import { DailyWriteQuotaExhaustedError, DB_PRUNE_BACKGROUND_QUERY_RESERVE, DB_PRUNE_CLAIM_QUERY_RESERVE, DB_PRUNE_DAILY_CAP, DB_PRUNE_PRUNE_QUERY_RESERVE, D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, acquirePruneLease, buildAndVerifyReadStatesIndex, canClaimIndexBuild, claimIndexBuild, cleanupFtsOrphans, decodeIndexSnapshot, decideMaxNewPosts, isDailyWriteQuotaError, isPruneWindow, pruneOldPostsBySize, pruneThresholds, readCronState, readD1PaidEnabled, readDatabaseSizeBytes, readDbPruneLimitMb, readIndexState, recoverIndexState, refreshPruneLease, releasePruneLease, runIsolated, isIndexDay, planBackgroundTasks, claimAbortsNormalWork, indexStateChanged } from "./prune";
+import { DailyWriteQuotaExhaustedError, DB_PRUNE_BACKGROUND_QUERY_RESERVE, DB_PRUNE_CLAIM_QUERY_RESERVE, DB_PRUNE_DAILY_CAP, DB_PRUNE_PRUNE_QUERY_RESERVE, D1_FIVE_POST_MARGIN_MB, D1_FREE_MAX_CAPACITY_MB, D1_PAID_MAX_CAPACITY_MB, acquirePruneLease, buildAndVerifyReadStatesIndex, canClaimIndexBuild, claimIndexBuild, cleanupFtsOrphans, decodeIndexSnapshot, decideMaxNewPosts, isDailyWriteQuotaError, isPruneWindow, pruneOldPostsBySize, pruneThresholds, readCronState, readDatabaseSizeBytes, readIndexState, readIndexStateAfterLease, readPruneSettings, recoverIndexState, refreshPruneLease, releasePruneLease, runIsolated, isIndexDay, planBackgroundTasks, claimAbortsNormalWork, indexStateChanged } from "./prune";
 import { D1_QUERY_LIMIT, DB_PRUNE_FINAL_QUERY_RESERVE, budgetRemaining, consumeQuery, createQueryBudget, markDailyWriteQuotaExhausted } from "./query-budget";
 import type { CronStateSnapshot, IndexStateSnapshot, PruneRunResult } from "./prune";
 import { queryPosts } from "./posts";
 import { renderHome } from "./render";
-import { createRunContext, emitRunLog, noteFirstInIsolate, shouldRecordCronTiming } from "./observability";
+import { createRunContext, emitRunLog, emitRunMeasureLog, noteFirstInIsolate, shouldRecordCronTiming } from "./observability";
+import type { RunFieldValue } from "./observability";
+import { createD1Metrics, createMeasuredDb, snapshotD1Metrics, withPhase } from "./d1-metrics";
+import type { D1Metrics } from "./d1-metrics";
 import { backfillSearchIndexes, recordSearchIndexError } from "./search";
 import { getHighlightGroups, getInitialRulePayload } from "./rules";
 import { readValidatedBlockImport, readValidatedHighlightImport, readValidatedSubscriptionImport, validatePatternInput } from "./rule-import";
@@ -51,10 +54,10 @@ function isQuotaStop(error: unknown): boolean {
 }
 
 // Prefix accounting for the one explicit QueryBudget. The fixed six are the
-// index-state/lease reads, both prune settings reads, and the pre-sync size
-// probe; inline mode adds the one per-minute sync claim, and sync adds the
+// index-state/lease reads, the merged prune settings read, and the pre-sync
+// size probe; inline mode adds the one per-minute sync claim, and sync adds the
 // first_sync_done read + sync_state write batch, one GUID chunk per 100 feed
-// GUIDs, the insert batch, one inline index batch per new post, and an
+// GUIDs, the insert batch, one merged inline FTS index batch, and an
 // index-failure diagnostic pair. Notification dispatch consumes
 // this same budget itself, so only the first-sync cursor bootstrap (max(id) +
 // one cursor upsert batch) is charged here as a fixed ceiling. Cleanup (8) and
@@ -75,9 +78,9 @@ const CRON_TIMING_QUERY_CEILING = 1;
 
 // A failed sync may have completed most insert/index work before throwing, and
 // its result carries zeroed timings, so charge the full one-window ceiling:
-// 1 first_sync read + ≤1 GUID dedupe + 1 insert batch + ≤20 inline index
-// batches + ≤2 index-failure diagnostics + 1 sync_state success batch +
-// 1 RSS failure attempt log + 1 failure state batch ≈ 28. 30 keeps margin.
+// 1 first_sync read + ≤1 GUID dedupe + 1 insert batch + 1 merged inline FTS
+// batch + ≤2 index-failure diagnostics + 1 sync_state success batch +
+// 1 RSS failure attempt log + 1 failure state batch ≈ 10. 30 keeps margin.
 const SYNC_FAILURE_QUERY_CEILING = 30;
 
 // Queue mode keeps all insert/index work out of this invocation: 1 first-sync
@@ -86,6 +89,46 @@ const SYNC_FAILURE_QUERY_CEILING = 30;
 // completion batch, ≤1 first-sync incomplete diagnostic, 1 success state batch,
 // and one attempt log per failed fetch strategy → ≈9. 10 keeps margin.
 const QUEUE_SYNC_QUERY_CEILING = 10;
+
+interface CronMeasureInput {
+  cron: string;
+  cronRole: string;
+  mode: string;
+  scriptVersion: string;
+  inlineClaim: string;
+  inserted: number;
+  indexFailureCount: number;
+  notificationAttempts: number;
+  cleanupRan: boolean;
+  indexState: string;
+  pruneCalled: boolean;
+  backfillCalled: boolean;
+}
+
+function cronMeasureFields(metrics: D1Metrics, input: CronMeasureInput): Record<string, RunFieldValue> {
+  const snapshot = snapshotD1Metrics(metrics);
+  return {
+    cron: input.cron,
+    role: input.cronRole,
+    mode: input.mode,
+    scriptVersion: input.scriptVersion,
+    inlineClaim: input.inlineClaim,
+    d1Calls: snapshot.calls,
+    d1BatchCalls: snapshot.batchCalls,
+    d1DurationMs: Math.round(snapshot.durationMs),
+    d1RowsRead: snapshot.rowsRead,
+    d1RowsWritten: snapshot.rowsWritten,
+    d1SizeAfter: snapshot.sizeAfter,
+    d1PhaseCounts: JSON.stringify(snapshot.phaseCounts),
+    inserted: input.inserted,
+    indexFailureCount: input.indexFailureCount,
+    notificationAttempts: input.notificationAttempts,
+    cleanupDue: input.cleanupRan,
+    indexState: input.indexState,
+    pruneCalled: input.pruneCalled,
+    backfillCalled: input.backfillCalled
+  };
+}
 
 function estimatePrefixQueries(result: Awaited<ReturnType<typeof safeSyncRss>>, ingestMode: "inline" | "queue"): number {
   if (ingestMode === "queue") {
@@ -101,7 +144,7 @@ function estimatePrefixQueries(result: Awaited<ReturnType<typeof safeSyncRss>>, 
     + SYNC_STATE_QUERY_CEILING
     + Math.ceil(feedCount / 100)
     + 1
-    + newCount
+    + (newCount > 0 ? 1 : 0)
     + (indexFailures > 0 ? SEARCH_INDEX_FAILURE_QUERY_CEILING : 0)
     + (result.firstSync ? FIRST_SYNC_CURSOR_QUERY_CEILING : 0)
     + CLEANUP_QUERY_CEILING
@@ -284,8 +327,9 @@ async function debugStatus(request: Request, env: Env): Promise<Response> {
     let paidPlan: boolean;
     let limitMb: number;
     try {
-      paidPlan = await readD1PaidEnabled(env);
-      limitMb = await readDbPruneLimitMb(env, paidPlan);
+      const pruneSettings = await readPruneSettings(env);
+      paidPlan = pruneSettings.paidPlan;
+      limitMb = pruneSettings.limitMb;
     } catch (error) {
       return { ...base, paidPlan: null, limitBytes: null, targetBytes: null, maxCapacityBytes: null, fivePostThresholdBytes: null, error: error instanceof Error ? error.message : String(error) };
     }
@@ -492,9 +536,20 @@ export default {
     }
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const run = createRunContext("cron", noteFirstInIsolate());
     const role = resolveCronRole(event.cron);
     const ingestMode = env.INGEST_MODE === "queue" ? "queue" : "inline";
+    // MEASURE_CRON is a temporary inline-only switch. Flag off keeps the real
+    // binding untouched; the swap below happens before the inline gate so the
+    // gate claim itself is counted.
+    const measure = ingestMode === "inline" && env.MEASURE_CRON === "1" && !!env.DB;
+    const run = createRunContext("cron", noteFirstInIsolate(), measure);
+    const metrics = measure ? createD1Metrics() : null;
+    if (metrics) env = { ...env, DB: createMeasuredDb(env.DB, metrics) };
+    let inlineClaim = "not_attempted";
+    let cleanupRan = false;
+    let pruneCalled = false;
+    let backfillCalled = false;
+    const measureSummary = { inserted: 0, indexFailureCount: 0, notificationAttempts: 0 };
     console.log(JSON.stringify({ event: "cron_route", cron: event.cron, role, mode: ingestMode }));
     if (ingestMode === "inline") {
       // Inline mode has no queue to absorb work, so every recognized trigger
@@ -510,7 +565,9 @@ export default {
         emitRunLog(run, "failed", "missing_db");
         throw new Error("Cloudflare D1 binding DB is missing");
       }
-      const claimed = await claimInlineSyncMinute(env);
+      const claimed = await withPhase(metrics, "gate", () => claimInlineSyncMinute(env));
+      inlineClaim = claimed ? "won" : "duplicate";
+      if (measure) run.fields.inlineClaim = inlineClaim;
       if (!claimed) {
         emitRunLog(run, "skipped", "inline_tick_duplicate");
         return;
@@ -544,7 +601,7 @@ export default {
 
     let context: CronStateSnapshot;
     try {
-      context = await readCronState(env);
+      context = await withPhase(metrics, "state", () => readCronState(env));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (isQuotaStop(error)) {
@@ -556,6 +613,7 @@ export default {
       return;
     }
     let indexState = context.indexState;
+    let searchComplete = context.searchComplete;
     if (indexState.invalid) {
       console.error("Invalid db_prune_index_state value; keeping it and disabling index/prune", indexState.raw);
     }
@@ -565,7 +623,7 @@ export default {
     // recovery attempt, whatever state (or error) it produces.
     if (!indexState.invalid && indexState.value === "1") {
       try {
-        await recoverIndexState(env, indexState);
+        await withPhase(metrics, "state", () => recoverIndexState(env, indexState));
       } catch (error) {
         console.error("recoverIndexState failed; ending invocation", error instanceof Error ? error.message : String(error));
       }
@@ -573,7 +631,7 @@ export default {
       return;
     }
 
-    // The three settings/size reads below plus the merged readCronState are the
+    // The merged prune-settings read, size probe, and readCronState are the
     // complete pre-lease prefix; they run exactly once per invocation.
     const startedAt = Date.now();
     let settingsOk = true;
@@ -581,9 +639,10 @@ export default {
     let paidPlan = false;
     let limitMb = 0;
     try {
-      paidPlan = await readD1PaidEnabled(env);
+      const pruneSettings = await withPhase(metrics, "settings", () => readPruneSettings(env));
+      paidPlan = pruneSettings.paidPlan;
+      limitMb = pruneSettings.limitMb;
       paidKnown = true;
-      limitMb = await readDbPruneLimitMb(env, paidPlan);
     } catch (error) {
       if (isQuotaStop(error)) {
         console.error("prune settings read hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
@@ -591,14 +650,13 @@ export default {
         return;
       }
       settingsOk = false;
-      const key = paidKnown ? "db_prune_limit_mb" : "d1_paid_enabled";
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 200);
-      console.error("prune_settings_read_failed", JSON.stringify({ key, message }));
+      console.error("prune_settings_read_failed", JSON.stringify({ key: "prune_settings", message }));
     }
 
     let sizeProbe: number | null = null;
     try {
-      sizeProbe = await readDatabaseSizeBytes(env);
+      sizeProbe = await withPhase(metrics, "size", () => readDatabaseSizeBytes(env));
     } catch (error) {
       if (isQuotaStop(error)) {
         console.error("readDatabaseSizeBytes hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
@@ -611,7 +669,7 @@ export default {
 
     let leaseToken: string | null = null;
     try {
-      leaseToken = await acquirePruneLease(env);
+      leaseToken = await withPhase(metrics, "lease", () => acquirePruneLease(env));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (isQuotaStop(error)) {
@@ -630,34 +688,55 @@ export default {
     const token = leaseToken;
     // Lease release stays the last plain call and never consumes the budget.
     const releaseLease = async (): Promise<void> => {
-      await releasePruneLease(env, token);
+      await withPhase(metrics, "lease", () => releasePruneLease(env, token));
+    };
+    const measureInput = (): CronMeasureInput => ({
+      cron: event.cron,
+      cronRole: role,
+      mode: ingestMode,
+      scriptVersion: env.COMMIT_VERSION || "local",
+      inlineClaim,
+      inserted: measureSummary.inserted,
+      indexFailureCount: measureSummary.indexFailureCount,
+      notificationAttempts: measureSummary.notificationAttempts,
+      cleanupRan,
+      indexState: indexState.value,
+      pruneCalled,
+      backfillCalled
+    });
+    // Deliberately emitted only after the background waitUntil chain and the
+    // lease release settle, so d1Calls/d1PhaseCounts include background work.
+    const emitMeasure = (): void => {
+      if (!measure || !metrics) return;
+      emitRunMeasureLog(run, cronMeasureFields(metrics, measureInput()));
     };
     let backgroundChain: Promise<void> | null = null;
 
     try {
-      let stateAfterLease: IndexStateSnapshot;
+      let stateAfterLease: { indexState: IndexStateSnapshot; searchComplete: number };
       try {
-        stateAfterLease = await readIndexState(env);
+        stateAfterLease = await withPhase(metrics, "state", () => readIndexStateAfterLease(env));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (isQuotaStop(error)) {
           console.error("d1_daily_write_quota_exhausted", "state_after_lease", message);
         } else {
-          console.error("readIndexState after lease failed; aborting", message);
+          console.error("readIndexStateAfterLease after lease failed; aborting", message);
         }
         emitRunLog(run, "failed", "read_index_state");
         return;
       }
-      if (indexStateChanged(stateAfterLease, indexState)) {
+      if (indexStateChanged(stateAfterLease.indexState, indexState)) {
         console.warn("db_prune_index_state changed after lease acquisition; aborting normal work");
         emitRunLog(run, "skipped", "index_state_changed");
         return;
       }
-      indexState = stateAfterLease;
+      indexState = stateAfterLease.indexState;
+      searchComplete = stateAfterLease.searchComplete;
 
       const result = ingestMode === "queue"
         ? await enqueueRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts })
-        : await safeSyncRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts });
+        : await withPhase(metrics, "sync", () => safeSyncRss(env, { maxNewPosts, searchComplete }));
       if (!result.ok && isQuotaStop(result.error)) {
         console.error("RSS sync hit D1 daily write quota; ending invocation", String(result.error ?? ""));
         emitRunLog(run, "failed", "rss_quota");
@@ -670,7 +749,7 @@ export default {
       }
       if (ingestMode === "inline" && result.firstSync) {
         try {
-          await initializeNotificationCursor(env);
+          await withPhase(metrics, "notifications", () => initializeNotificationCursor(env));
         } catch (error) {
           if (isQuotaStop(error)) {
             console.error("initializeNotificationCursor hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
@@ -695,7 +774,7 @@ export default {
       if (!prefixOverCap && ingestMode === "inline" && result.ok && !result.firstSync) {
         const notificationsStartedAt = Date.now();
         try {
-          const notifications = await processNotifications(env, budget);
+          const notifications = await withPhase(metrics, "notifications", () => processNotifications(env, budget));
           notificationTimings = {
             totalMs: Date.now() - notificationsStartedAt,
             compileMs: notifications.compileMs,
@@ -721,7 +800,7 @@ export default {
       let leaseHeld = false;
       if (!prefixOverCap) {
         try {
-          leaseHeld = await refreshPruneLease(env, token);
+          leaseHeld = await withPhase(metrics, "lease", () => refreshPruneLease(env, token));
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (isQuotaStop(error)) {
@@ -747,9 +826,9 @@ export default {
           console.warn("query headroom insufficient for claim+DDL+verify+failure cleanup; staying 0", JSON.stringify({ remaining: budgetRemaining(budget) }));
         } else {
           try {
-            const fresh = await readIndexState(env, budget);
+            const fresh = await withPhase(metrics, "state", () => readIndexState(env, budget));
             if (!fresh.invalid && fresh.value === "0" && canClaimIndexBuild(fresh)) {
-              const claim = await claimIndexBuild(env, fresh.updatedAt, budget);
+              const claim = await withPhase(metrics, "state", () => claimIndexBuild(env, fresh.updatedAt, budget));
               if (claimAbortsNormalWork(claim.status) || (claim.status === "claimed" && !claim.token)) {
                 // The claim may have committed 0 -> 1 but the response was
                 // lost; let the next invocation recover from the main database.
@@ -759,7 +838,8 @@ export default {
               }
               if (claim.status === "claimed" && claim.token) {
                 maintenanceInvocation = true;
-                await buildAndVerifyReadStatesIndex(env, claim.token, budget);
+                const claimToken = claim.token;
+                await withPhase(metrics, "state", () => buildAndVerifyReadStatesIndex(env, claimToken, budget));
               }
             }
           } catch (error) {
@@ -778,11 +858,12 @@ export default {
       }
 
       const cleanupStartedAt = Date.now();
+      cleanupRan = true;
       let cleanupOldDataMs = 0;
       try {
-        await runIsolated("cleanupOldData", async () => {
+        await withPhase(metrics, "cleanup", () => runIsolated("cleanupOldData", async () => {
           await cleanupOldData(env);
-        });
+        }));
       } catch (error) {
         if (isQuotaStop(error)) {
           console.error("cleanupOldData hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
@@ -796,7 +877,7 @@ export default {
       const forceTiming = !result.ok || !notificationsOk;
       if (shouldRecordCronTiming(forceTiming, Math.random())) {
         try {
-          await runIsolated("recordCronTiming", async () => {
+          await withPhase(metrics, "timing", () => runIsolated("recordCronTiming", async () => {
             await recordCronTiming(env, {
               recordedAt: new Date().toISOString(),
               ok: result.ok,
@@ -832,7 +913,7 @@ export default {
               forced: forceTiming,
               sampleRate: 10
             });
-          });
+          }));
         } catch (error) {
           if (isQuotaStop(error)) {
             console.error("recordCronTiming hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
@@ -848,7 +929,7 @@ export default {
       if (pruneWindowOpen) {
         let stillHeld = false;
         try {
-          stillHeld = await refreshPruneLease(env, token);
+          stillHeld = await withPhase(metrics, "lease", () => refreshPruneLease(env, token));
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (isQuotaStop(error)) {
@@ -868,7 +949,8 @@ export default {
           console.warn("query headroom insufficient for prune; skipping this run", JSON.stringify({ remaining: budgetRemaining(budget) }));
         } else {
           try {
-            prune = await pruneOldPostsBySize(env, { indexState, paidPlan, limitMb, budget });
+            pruneCalled = true;
+            prune = await withPhase(metrics, "prune", () => pruneOldPostsBySize(env, { indexState, paidPlan, limitMb, budget }));
           } catch (error) {
             if (isQuotaStop(error)) {
               console.error("pruneOldPostsBySize hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
@@ -899,7 +981,7 @@ export default {
         pruneDeletedThisRun: prune?.deletedThisRun ?? 0
       });
       const wantOrphans = settingsOk && context.ftsOrphansPending && backgroundPlan.runFtsOrphans;
-      const wantBackfill = ingestMode === "inline" && backgroundPlan.runSearchBackfill && context.searchComplete !== 1;
+      const wantBackfill = ingestMode === "inline" && backgroundPlan.runSearchBackfill && searchComplete !== 1;
       if (!prefixOverCap && (wantOrphans || wantBackfill)) {
         if (budgetRemaining(budget) < DB_PRUNE_BACKGROUND_QUERY_RESERVE) {
           console.warn("query headroom insufficient for background maintenance; skipping", JSON.stringify({ remaining: budgetRemaining(budget) }));
@@ -908,7 +990,7 @@ export default {
             let canBackfill = true;
             if (wantOrphans) {
               try {
-                await cleanupFtsOrphans(env, { paidPlan, limitMb, blockedFull: context.blockedFull, orphansPending: context.ftsOrphansPending, budget });
+                await withPhase(metrics, "background", () => cleanupFtsOrphans(env, { paidPlan, limitMb, blockedFull: context.blockedFull, orphansPending: context.ftsOrphansPending, budget }));
               } catch (error) {
                 if (isQuotaStop(error)) {
                   markDailyWriteQuotaExhausted(budget);
@@ -927,14 +1009,15 @@ export default {
                 consumeQuery(budget);
                 consumeQuery(budget);
                 consumeQuery(budget);
-                await backfillSearchIndexes(env);
+                backfillCalled = true;
+                await withPhase(metrics, "background", () => backfillSearchIndexes(env));
               } catch (error) {
                 if (isQuotaStop(error)) {
                   markDailyWriteQuotaExhausted(budget);
                   console.error("backfillSearchIndexes hit D1 daily write quota; stopping background chain", error instanceof Error ? error.message : String(error));
                 } else {
                   try {
-                    await recordSearchIndexError(env, error);
+                    await withPhase(metrics, "background", () => recordSearchIndexError(env, error, budget));
                   } catch (recordError) {
                     if (isQuotaStop(recordError)) {
                       markDailyWriteQuotaExhausted(budget);
@@ -949,13 +1032,31 @@ export default {
           })();
         }
       }
+      measureSummary.inserted = result.inserted;
+      measureSummary.indexFailureCount = result.timings?.indexFailureCount ?? 0;
+      measureSummary.notificationAttempts = notificationTimings.attempts;
+      if (measure && metrics) Object.assign(run.fields, cronMeasureFields(metrics, measureInput()));
       emitRunLog(run, result.ok && notificationsOk ? "ok" : "failed", result.ok ? (notificationsOk ? null : "notifications") : "rss_sync");
     } catch (error) {
       emitRunLog(run, "failed", "unhandled");
       throw error;
     } finally {
       if (backgroundChain) {
-        ctx.waitUntil(backgroundChain.then(releaseLease, releaseLease));
+        if (measure) {
+          const settled = backgroundChain.then(releaseLease, releaseLease);
+          ctx.waitUntil(settled.then(emitMeasure, (error: unknown) => {
+            emitMeasure();
+            throw error;
+          }));
+        } else {
+          ctx.waitUntil(backgroundChain.then(releaseLease, releaseLease));
+        }
+      } else if (measure) {
+        try {
+          await releaseLease();
+        } finally {
+          emitMeasure();
+        }
       } else {
         await releaseLease();
       }

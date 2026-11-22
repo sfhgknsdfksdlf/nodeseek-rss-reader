@@ -322,6 +322,30 @@ export async function readIndexState(env: Env, budget?: QueryBudget): Promise<In
 }
 
 /**
+ * Post-lease snapshot: the index-state row (value + updated_at) and the
+ * search-backfill marker in one D1 statement. The lease holder re-reads both so
+ * no post-lease decision (sync pre-mark or backfill gate) relies on the
+ * pre-lease `readCronState` value; still exactly one query.
+ */
+export async function readIndexStateAfterLease(env: Env, budget?: QueryBudget): Promise<{ indexState: IndexStateSnapshot; searchComplete: number }> {
+  takeQuery(budget);
+  const row = await env.DB.prepare(`SELECT
+      (SELECT value FROM sync_state WHERE key = ?) AS index_value,
+      (SELECT updated_at FROM sync_state WHERE key = ?) AS index_updated_at,
+      (SELECT complete FROM search_index_state WHERE id = 1) AS search_complete`)
+    .bind(DB_PRUNE_INDEX_STATE_KEY, DB_PRUNE_INDEX_STATE_KEY)
+    .first<{
+      index_value: string | null;
+      index_updated_at: string | null;
+      search_complete: number | null;
+    }>();
+  return {
+    indexState: decodeIndexSnapshot(row?.index_value ?? null, row?.index_updated_at ?? null, row?.index_value !== null && row?.index_value !== undefined),
+    searchComplete: Number(row?.search_complete) === 1 ? 1 : 0
+  };
+}
+
+/**
  * One-shot invocation snapshot: index state (value + updated_at), prune flags,
  * and the search-backfill marker in a single D1 query. The scalar subselects
  * resolve on the sync_state/search_index_state primary keys, so the combined
@@ -873,6 +897,30 @@ export async function readDbPruneLimitMb(env: Env, paid: boolean, budget?: Query
   takeQuery(budget);
   const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind("db_prune_limit_mb").first<{ value: string }>();
   return decodeStoredPruneLimitMb(row?.value, paid);
+}
+
+export interface PruneSettings {
+  paidPlan: boolean;
+  limitMb: number;
+}
+
+/**
+ * Pure decode of the two prune settings rows. A missing row keeps the existing
+ * defaults (free plan, plan-default limit); a missing paid row means free.
+ */
+export function parsePruneSettingsRows(rows: Array<{ key: string; value: string }>): PruneSettings {
+  const byKey = new Map(rows.map((row) => [row.key, row.value]));
+  const paidRaw = byKey.get("d1_paid_enabled");
+  const paidPlan = paidRaw === "1" || paidRaw === "true";
+  return { paidPlan, limitMb: decodeStoredPruneLimitMb(byKey.get("db_prune_limit_mb"), paidPlan) };
+}
+
+export async function readPruneSettings(env: Env, budget?: QueryBudget): Promise<PruneSettings> {
+  takeQuery(budget);
+  const result = await env.DB.prepare("SELECT key, value FROM app_settings WHERE key IN (?, ?)")
+    .bind("d1_paid_enabled", "db_prune_limit_mb")
+    .all<{ key: string; value: string }>();
+  return parsePruneSettingsRows(result.results ?? []);
 }
 
 function parseCandidateCursor(raw: string): PruneCandidateCursor | null {

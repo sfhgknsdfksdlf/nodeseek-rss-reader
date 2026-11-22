@@ -1,0 +1,27 @@
+{
+  "name": "d1-metrics.classifyBatchPhase first-statement attribution",
+  "module": "d1-metrics",
+  "export": "classifyBatchPhase",
+  "cases": [
+    {
+      "name": "attributes the insert batch by its first statement",
+      "args": [["INSERT OR IGNORE INTO posts (guid) VALUES (?)", "DELETE FROM posts_search_trigram WHERE rowid = ?"]],
+      "expect": "posts"
+    },
+    {
+      "name": "attributes the merged FTS batch by its first statement",
+      "args": [["DELETE FROM posts_search_trigram WHERE rowid = ?", "INSERT INTO posts_search_bigrams(rowid, tok) VALUES (?, ?)"]],
+      "expect": "fts"
+    },
+    {
+      "name": "attributes an empty batch as fallback",
+      "args": [[]],
+      "expect": "fallback"
+    },
+    {
+      "name": "attributes an unrecognised first statement as fallback",
+      "args": [["SELECT 1", "DELETE FROM posts_search_trigram WHERE rowid = ?"]],
+      "expect": "fallback"
+    }
+  ]
+}

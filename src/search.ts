@@ -1,4 +1,6 @@
 import { all, nowIso, one } from "./db";
+import { budgetRemaining, consumeQuery } from "./query-budget";
+import type { QueryBudget } from "./query-budget";
 import type { Env, Post } from "./types";
 
 export const SEARCH_QUERY_MAX_UNITS = 200;
@@ -130,7 +132,28 @@ export async function indexPostForSearch(env: Env, post: Pick<Post, "id" | "titl
   await env.DB.batch(indexStatements(env, post));
 }
 
-export async function recordSearchIndexError(env: Env, error: unknown): Promise<boolean> {
+/**
+ * Indexes every new post in one D1 batch. The whole FTS write set rolls back
+ * together on failure, so callers keep the inserted posts and let `complete=0`
+ * drive the resumable backfill instead of indexing per post.
+ */
+export async function indexPostsForSearch(env: Env, posts: Array<Pick<Post, "id" | "title" | "content_text">>): Promise<void> {
+  const statements = posts.flatMap((post) => indexStatements(env, post));
+  if (!statements.length) return;
+  await env.DB.batch(statements);
+}
+
+export async function recordSearchIndexError(env: Env, error: unknown, budget?: QueryBudget): Promise<boolean> {
+  if (budget) {
+    // The diagnostic is optional telemetry: without headroom, skip the write
+    // instead of crossing the platform query limit or double-charging callers
+    // that already reserved it in their prefix estimate.
+    if (budgetRemaining(budget) < 1) {
+      console.error("Search index diagnostic skipped: query budget exhausted");
+      return false;
+    }
+    consumeQuery(budget);
+  }
   const message = error instanceof Error ? error.message : String(error);
   const timestamp = nowIso();
   try {

@@ -13,6 +13,9 @@ export interface RunContext {
   runId: string;
   role: RunRole;
   firstInIsolate: boolean;
+  // Temporary `MEASURE_CRON=1` mode: forces the success line out and enables
+  // the second `run_measure` line. Never set outside the inline cron flag path.
+  measureSuccess: boolean;
   fields: Record<string, RunFieldValue>;
 }
 
@@ -26,13 +29,13 @@ export function noteFirstInIsolate(): boolean {
   return isFirst;
 }
 
-export function createRunContext(role: RunRole, isFirstInIsolate: boolean): RunContext {
-  return { runId: crypto.randomUUID(), role, firstInIsolate: isFirstInIsolate, fields: {} };
+export function createRunContext(role: RunRole, isFirstInIsolate: boolean, measureSuccess = false): RunContext {
+  return { runId: crypto.randomUUID(), role, firstInIsolate: isFirstInIsolate, measureSuccess, fields: {} };
 }
 
-export function shouldEmitRunLog(outcome: string, random: number): boolean {
+export function shouldEmitRunLog(outcome: string, random: number, measureSuccess = false): boolean {
   if (outcome !== "ok") return true;
-  return random < 0.05;
+  return measureSuccess || random < 0.05;
 }
 
 // Cron timing snapshots are one D1 write each, so a healthy cron only samples
@@ -42,7 +45,7 @@ export function shouldRecordCronTiming(force: boolean, random: number): boolean 
 }
 
 export function emitRunLog(ctx: RunContext, outcome: string, failureStage?: string | null): void {
-  if (!shouldEmitRunLog(outcome, Math.random())) return;
+  if (!shouldEmitRunLog(outcome, Math.random(), ctx.measureSuccess)) return;
   const payload: Record<string, RunFieldValue> = {
     event: "run",
     role: ctx.role,
@@ -52,6 +55,23 @@ export function emitRunLog(ctx: RunContext, outcome: string, failureStage?: stri
   };
   if (failureStage !== undefined && failureStage !== null) payload.failureStage = failureStage;
   for (const [key, value] of Object.entries(ctx.fields)) {
+    if (value !== null) payload[key] = value;
+  }
+  console.log(JSON.stringify(payload));
+}
+
+// Second measurement-only line, emitted after the waitUntil background chain
+// and lease release settle so it carries the complete D1 counters. Uses
+// `syncRunId` for correlation; ScheduledEvent has no platform requestId.
+export function emitRunMeasureLog(ctx: RunContext, fields: Record<string, RunFieldValue>): void {
+  if (!ctx.measureSuccess) return;
+  const payload: Record<string, RunFieldValue> = {
+    event: "run_measure",
+    role: ctx.role,
+    syncRunId: ctx.runId,
+    firstInIsolate: ctx.firstInIsolate
+  };
+  for (const [key, value] of Object.entries(fields)) {
     if (value !== null) payload[key] = value;
   }
   console.log(JSON.stringify(payload));

@@ -2,7 +2,7 @@ import { all, nowIso, one } from "./db";
 import { normalizeBoard } from "./board";
 import { sanitizePostHtml, stripHtml } from "./filters";
 import { sanitizeAndExtract } from "./html";
-import { indexPostForSearch, markSearchIndexRetryPending, recordSearchIndexError } from "./search";
+import { indexPostsForSearch, markSearchIndexRetryPending, recordSearchIndexError } from "./search";
 import type { CronTimingSnapshot, Env, Post, RssNewPost } from "./types";
 
 export interface RssItem {
@@ -326,7 +326,7 @@ export async function queryExistingGuids(env: Env, guids: string[]): Promise<Set
 // then conditional updates so a stable cron does not rewrite unchanged values.
 // Queue mode passes markFirstSyncDone=false: first_sync_done may only flip once
 // the consumer has actually persisted every bootstrap GUID.
-export async function persistSyncSuccess(env: Env, strategy: string, options?: { markFirstSyncDone?: boolean }): Promise<void> {
+export async function persistSyncSuccess(env: Env, strategy: string, options?: { markFirstSyncDone?: boolean; restoreSearchComplete?: boolean }): Promise<void> {
   const updatedAt = nowIso();
   const statements: D1PreparedStatement[] = [];
   if (options?.markFirstSyncDone !== false) statements.push(initSyncState(env, "first_sync_done", "1", updatedAt));
@@ -338,6 +338,11 @@ export async function persistSyncSuccess(env: Env, strategy: string, options?: {
     env.DB.prepare("UPDATE sync_state SET value = '', updated_at = ? WHERE key = 'last_sync_error' AND value IS NOT ''").bind(updatedAt),
     env.DB.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE key = 'last_sync_strategy' AND value IS NOT ?").bind(strategy, updatedAt, strategy)
   );
+  // Same batch, no extra D1 call: if this restore fails, complete stays 0 and
+  // the resumable backfill repairs the posts.
+  if (options?.restoreSearchComplete) {
+    statements.push(env.DB.prepare("UPDATE search_index_state SET complete = 1, updated_at = ? WHERE id = 1").bind(updatedAt));
+  }
   await env.DB.batch(statements);
 }
 
@@ -384,6 +389,13 @@ export interface RssSyncTiming {
   enqueuedMessages?: number;
 }
 
+export interface RssSyncOptions {
+  maxNewPosts?: number;
+  // Observed `search_index_state.complete` from the invocation's single read;
+  // only a currently-complete index needs the durable pre-mark/restore pair.
+  searchComplete?: number;
+}
+
 interface RssSyncResult {
   inserted: number;
   firstSync: boolean;
@@ -411,8 +423,15 @@ export interface SafeRssSyncResult {
   error?: string;
 }
 
-export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Promise<RssSyncResult> {
+// A pre-mark is only useful (and only safe to restore) when this sync actually
+// inserts rows into an index that was complete before the sync started.
+export function shouldPreMarkSearchIncomplete(insertRowCount: number, initialSearchComplete: number | undefined): boolean {
+  return insertRowCount > 0 && initialSearchComplete === 1;
+}
+
+export async function syncRss(env: Env, options?: RssSyncOptions): Promise<RssSyncResult> {
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
+  const initialSearchComplete = options?.searchComplete;
   const fetchStartedAt = Date.now();
   const { xml, strategy, timings: fetchTimings } = await fetchRssXml(env, rssUrl);
   const fetchRssMs = Date.now() - fetchStartedAt;
@@ -474,6 +493,7 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
   let indexFailureCount = 0;
   let firstIndexFailure: unknown = null;
   const insertedPosts: RssNewPost[] = [];
+  const insertedForIndex: Array<Pick<Post, "id" | "title" | "content_text">> = [];
   const insertStartedAt = Date.now();
   const prepareInsertStartedAt = Date.now();
   let insertRows = targetCandidates
@@ -487,11 +507,17 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
   let insertNewCount = 0;
   let insertExistingCount = existingGuids.size;
   const batchStartedAt = Date.now();
+  const preMarkSearchIncomplete = shouldPreMarkSearchIncomplete(insertRows.length, initialSearchComplete);
   if (insertRows.length) {
     const sql = "INSERT OR IGNORE INTO posts (guid, title, link, content_html, content_text, author, board_key, published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
     const statements = insertRows.map((row) => env.DB.prepare(sql).bind(...row.values));
+    if (preMarkSearchIncomplete) {
+      // Durability: complete=0 commits atomically with the posts themselves, so
+      // the retry survives even when the later diagnostic writes fail.
+      statements.push(env.DB.prepare("UPDATE search_index_state SET complete = 0, updated_at = ? WHERE id = 1").bind(nowIso()));
+    }
     const results = await env.DB.batch(statements);
-    for (let index = 0; index < results.length; index++) {
+    for (let index = 0; index < insertRows.length; index++) {
       const result = results[index];
       const { item, values } = insertRows[index];
       if (result.meta.changes) {
@@ -508,20 +534,21 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
           published_at: item.publishedAt,
           fetched_at: values[8] as string
         });
-        if (indexFailureCount === 0) {
-          try {
-            await indexPostForSearch(env, { id: result.meta.last_row_id, title: item.title, content_text: item.contentText });
-          } catch (error) {
-            // Stop after the first inline failure: this bounds the diagnostic
-            // queries to one pair per invocation, and complete=0 lets the cron
-            // backfill repair every post left unindexed below.
-            indexFailureCount = 1;
-            firstIndexFailure = error;
-          }
-        }
+        insertedForIndex.push({ id: result.meta.last_row_id, title: item.title, content_text: item.contentText });
       } else {
         insertExistingCount++;
       }
+    }
+  }
+  if (insertedForIndex.length > 0) {
+    try {
+      await indexPostsForSearch(env, insertedForIndex);
+    } catch (error) {
+      // One merged FTS batch rolls back only the index writes; the posts above
+      // are already committed, and complete=0 lets the cron backfill repair
+      // every post left unindexed.
+      indexFailureCount = 1;
+      firstIndexFailure = error;
     }
   }
   const insertLoopMs = Date.now() - insertStartedAt;
@@ -534,14 +561,15 @@ export async function syncRss(env: Env, options?: { maxNewPosts?: number }): Pro
     }
   }
   const writeStateStartedAt = Date.now();
-  await persistSyncSuccess(env, strategy);
+  const restoreSearchComplete = preMarkSearchIncomplete && firstIndexFailure === null;
+  await persistSyncSuccess(env, strategy, restoreSearchComplete ? { restoreSearchComplete } : undefined);
   const writeSyncStateMs = Date.now() - writeStateStartedAt;
   const insertPostsMs = insertLoopMs;
   insertBindRunMs = Date.now() - batchStartedAt;
   return { inserted, firstSync: first, insertedPosts, strategy, indexFailureCount, timings: { fetchRssMs: fetchTimings.fetchRssMs, fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs, fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs, parseItemsMs, parseItemCount: chunks.length, prepareInsertMs, insertBindRunMs, insertNewCount, insertExistingCount, insertLoopMs, insertPostsMs, writeSyncStateMs, totalMs: Date.now() - fetchStartedAt, guidExtractMs, guidExtractCount: chunks.length, fullParseMs, fullParseCount, guidMismatchCount, indexFailureCount }, cpu: { parseItemsMs, parseItemCount: chunks.length } };
 }
 
-export async function safeSyncRss(env: Env, options?: { maxNewPosts?: number }): Promise<SafeRssSyncResult> {
+export async function safeSyncRss(env: Env, options?: RssSyncOptions): Promise<SafeRssSyncResult> {
   try {
     const result = await syncRss(env, options);
     return { inserted: result.inserted, firstSync: result.firstSync, insertedPosts: result.insertedPosts, ok: true, strategy: result.strategy, timings: result.timings, cpu: result.cpu };

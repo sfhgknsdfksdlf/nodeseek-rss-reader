@@ -1,0 +1,86 @@
+{
+  "name": "prune.parsePruneSettingsRows merged settings decode",
+  "module": "prune",
+  "export": "parsePruneSettingsRows",
+  "cases": [
+    {
+      "name": "reads both rows for the paid plan",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "1" },
+        { "key": "db_prune_limit_mb", "value": "600" }
+      ]],
+      "expect": { "paidPlan": true, "limitMb": 600 }
+    },
+    {
+      "name": "treats the legacy free 450 as 480",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "0" },
+        { "key": "db_prune_limit_mb", "value": "450" }
+      ]],
+      "expect": { "paidPlan": false, "limitMb": 480 }
+    },
+    {
+      "name": "keeps an admin re-saved 450.0 at 450",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "0" },
+        { "key": "db_prune_limit_mb", "value": "450.0" }
+      ]],
+      "expect": { "paidPlan": false, "limitMb": 450 }
+    },
+    {
+      "name": "uses free defaults when both rows are missing",
+      "args": [[]],
+      "expect": { "paidPlan": false, "limitMb": 480 }
+    },
+    {
+      "name": "uses the paid default when only the paid row exists",
+      "args": [[{ "key": "d1_paid_enabled", "value": "true" }]],
+      "expect": { "paidPlan": true, "limitMb": 9850 }
+    },
+    {
+      "name": "uses the free default when only the limit row exists",
+      "args": [[{ "key": "db_prune_limit_mb", "value": "700" }]],
+      "expect": { "paidPlan": false, "limitMb": 700 }
+    },
+    {
+      "name": "falls back to free default on an invalid limit",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "0" },
+        { "key": "db_prune_limit_mb", "value": "abc" }
+      ]],
+      "expect": { "paidPlan": false, "limitMb": 480 }
+    },
+    {
+      "name": "clamps an overflow limit to 9850",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "0" },
+        { "key": "db_prune_limit_mb", "value": "99999" }
+      ]],
+      "expect": { "paidPlan": false, "limitMb": 9850 }
+    },
+    {
+      "name": "clamps an underflow limit to 100",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "0" },
+        { "key": "db_prune_limit_mb", "value": "50" }
+      ]],
+      "expect": { "paidPlan": false, "limitMb": 100 }
+    },
+    {
+      "name": "treats an unrecognized paid value as free",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "yes" },
+        { "key": "db_prune_limit_mb", "value": "600" }
+      ]],
+      "expect": { "paidPlan": false, "limitMb": 600 }
+    },
+    {
+      "name": "accepts the true string for the paid toggle",
+      "args": [[
+        { "key": "d1_paid_enabled", "value": "true" },
+        { "key": "db_prune_limit_mb", "value": "5000" }
+      ]],
+      "expect": { "paidPlan": true, "limitMb": 5000 }
+    }
+  ]
+}
