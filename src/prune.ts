@@ -322,26 +322,31 @@ export async function readIndexState(env: Env, budget?: QueryBudget): Promise<In
 }
 
 /**
- * Post-lease snapshot: the index-state row (value + updated_at) and the
- * search-backfill marker in one D1 statement. The lease holder re-reads both so
- * no post-lease decision (sync pre-mark or backfill gate) relies on the
- * pre-lease `readCronState` value; still exactly one query.
+ * Post-lease snapshot: the index-state row (value + updated_at), the
+ * search-backfill marker, and the first-sync marker in one D1 statement. The
+ * lease holder re-reads the index state so no post-lease decision (sync pre-mark
+ * or backfill gate) relies on the pre-lease `readCronState` value; still exactly
+ * one query. `firstSyncDone` uses row-existence semantics (the row being present
+ * means the first sync already completed), matching `syncRss`'s standalone read.
  */
-export async function readIndexStateAfterLease(env: Env, budget?: QueryBudget): Promise<{ indexState: IndexStateSnapshot; searchComplete: number }> {
+export async function readIndexStateAfterLease(env: Env, budget?: QueryBudget): Promise<{ indexState: IndexStateSnapshot; searchComplete: number; firstSyncDone: boolean }> {
   takeQuery(budget);
   const row = await env.DB.prepare(`SELECT
       (SELECT value FROM sync_state WHERE key = ?) AS index_value,
       (SELECT updated_at FROM sync_state WHERE key = ?) AS index_updated_at,
-      (SELECT complete FROM search_index_state WHERE id = 1) AS search_complete`)
+      (SELECT complete FROM search_index_state WHERE id = 1) AS search_complete,
+      (SELECT value FROM sync_state WHERE key = 'first_sync_done') AS first_sync_done`)
     .bind(DB_PRUNE_INDEX_STATE_KEY, DB_PRUNE_INDEX_STATE_KEY)
     .first<{
       index_value: string | null;
       index_updated_at: string | null;
       search_complete: number | null;
+      first_sync_done: string | null;
     }>();
   return {
     indexState: decodeIndexSnapshot(row?.index_value ?? null, row?.index_updated_at ?? null, row?.index_value !== null && row?.index_value !== undefined),
-    searchComplete: Number(row?.search_complete) === 1 ? 1 : 0
+    searchComplete: Number(row?.search_complete) === 1 ? 1 : 0,
+    firstSyncDone: row?.first_sync_done !== null && row?.first_sync_done !== undefined
   };
 }
 

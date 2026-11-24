@@ -713,7 +713,7 @@ export default {
     let backgroundChain: Promise<void> | null = null;
 
     try {
-      let stateAfterLease: { indexState: IndexStateSnapshot; searchComplete: number };
+      let stateAfterLease: { indexState: IndexStateSnapshot; searchComplete: number; firstSyncDone: boolean };
       try {
         stateAfterLease = await withPhase(metrics, "state", () => readIndexStateAfterLease(env));
       } catch (error) {
@@ -736,7 +736,7 @@ export default {
 
       const result = ingestMode === "queue"
         ? await enqueueRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts })
-        : await withPhase(metrics, "sync", () => safeSyncRss(env, { maxNewPosts, searchComplete }));
+        : await withPhase(metrics, "sync", () => safeSyncRss(env, { maxNewPosts, searchComplete, firstSyncDone: stateAfterLease.firstSyncDone }));
       if (!result.ok && isQuotaStop(result.error)) {
         console.error("RSS sync hit D1 daily write quota; ending invocation", String(result.error ?? ""));
         emitRunLog(run, "failed", "rss_quota");

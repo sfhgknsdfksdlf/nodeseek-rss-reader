@@ -394,6 +394,10 @@ export interface RssSyncOptions {
   // Observed `search_index_state.complete` from the invocation's single read;
   // only a currently-complete index needs the durable pre-mark/restore pair.
   searchComplete?: number;
+  // `first_sync_done` row presence, preloaded by the inline caller's post-lease
+  // snapshot so `syncRss` does not need a separate point read. Callers that omit
+  // it (queue mode) keep the standalone query.
+  firstSyncDone?: boolean;
 }
 
 interface RssSyncResult {
@@ -488,7 +492,9 @@ export async function syncRss(env: Env, options?: RssSyncOptions): Promise<RssSy
   if (guidMismatchCount > 0) console.warn("RSS GUID mismatch", JSON.stringify({ count: guidMismatchCount }));
   if (capped) console.warn("RSS insert capped", JSON.stringify({ cap: maxNewPosts, candidates: candidateInsertCount }));
   const parseItemsMs = guidExtractMs + fullParseMs;
-  const first = !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")));
+  const first = options?.firstSyncDone === undefined
+    ? !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")))
+    : !options.firstSyncDone;
   let inserted = 0;
   let indexFailureCount = 0;
   let firstIndexFailure: unknown = null;
