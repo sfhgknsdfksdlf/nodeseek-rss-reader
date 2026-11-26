@@ -192,7 +192,18 @@ function buildConfig(databaseId, version) {
     ]
   },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "redact_query_string": false,
+    "issues": {
+      "enabled": false
+    },
+    "logs": {
+      "destinations": ["nodeseek-rss-reader-factory"]
+    },
+    "traces": {
+      "enabled": true,
+      "destinations": ["nodeseek-rss-reader-factory-traces"]
+    }
   },
   "queues": {
     "producers": [
