@@ -27,6 +27,8 @@ const htmlMode = readMode("HTML_MODE", "regex", ["regex", "rewriter"]);
 const itemsPerMessage = readMode("INGEST_ITEMS_PER_MESSAGE", "5", ["1", "3", "5"]);
 // Temporary cron measurement switch; off unless MEASURE_CRON is explicitly "1".
 const measureCron = (process.env.MEASURE_CRON || "").trim() === "1" ? "1" : "";
+// Temporary A/B/C/D CPU-stage experiment switch; off unless ABCD_EXPERIMENT is explicitly "1".
+const abcdExperiment = (process.env.ABCD_EXPERIMENT || "").trim() === "1" ? "1" : "";
 
 function commitVersion() {
   const result = spawnSync("git", ["rev-parse", "--short=7", "HEAD"], { cwd: root, encoding: "utf8" });
@@ -223,7 +225,8 @@ function buildConfig(databaseId, version) {
     "INGEST_MODE": "${ingestMode}",
     "INGEST_ITEMS_PER_MESSAGE": "${itemsPerMessage}",
     "HTML_MODE": "${htmlMode}",
-    "MEASURE_CRON": "${measureCron}"
+    "MEASURE_CRON": "${measureCron}",
+    "ABCD_EXPERIMENT": "${abcdExperiment}"
   }
 }
 `;
@@ -264,7 +267,7 @@ async function main() {
   console.log(`Updated ${rootConfig} so Cloudflare deploys with DB + Queue bindings`);
   console.log(`D1 binding: DB -> ${databaseName} (${databaseId})`);
   console.log(`Queue binding: INGEST_QUEUE -> ${ingestQueueName}; DLQ -> ${deadLetterQueueName}`);
-  console.log(`Ingest mode: ${ingestMode}; HTML mode: ${htmlMode}; items/message: ${itemsPerMessage}; measure cron: ${measureCron || "off"}`);
+  console.log(`Ingest mode: ${ingestMode}; HTML mode: ${htmlMode}; items/message: ${itemsPerMessage}; measure cron: ${measureCron || "off"}; abcd experiment: ${abcdExperiment || "off"}`);
   run(["d1", "migrations", "apply", databaseName, "--remote", "--config", generatedConfig]);
   verifyMigratedDatabase();
   // Re-check immediately before the dry-run so the last readiness check is as

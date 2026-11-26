@@ -6,7 +6,8 @@
     "RSS_URL": "https://rss.nodeseek.com/",
     "COMMIT_VERSION": "local",
     "INGEST_MODE": "inline",
-    "INGEST_ITEMS_PER_MESSAGE": "5"
+    "INGEST_ITEMS_PER_MESSAGE": "5",
+    "ABCD_EXPERIMENT": "0"
   },
   "d1_databases": [
     {

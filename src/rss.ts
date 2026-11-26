@@ -270,7 +270,7 @@ async function recordRssAttempt(env: Env, source: string, strategy: string, outc
     .run();
 }
 
-async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: string, strategy: FetchStrategy): Promise<{ ok: true; xml: string; strategy: string; fetchMs: number } | { ok: false; message: string; fetchMs: number }> {
+async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: string, strategy: FetchStrategy, persistFailure = true): Promise<{ ok: true; xml: string; strategy: string; fetchMs: number } | { ok: false; message: string; fetchMs: number }> {
   const startedAt = Date.now();
   try {
     const res = await fetchWithStrategy(rssUrl, strategy);
@@ -281,25 +281,26 @@ async function tryStrategy(env: Env, source: string, logMethod: string, rssUrl: 
       return { ok: true, xml: text, strategy: strategy.name, fetchMs: Date.now() - startedAt };
     }
     const message = `${logMethod}: ${res.status} ${res.statusText} ${preview}`.trim();
-    await recordRssAttempt(env, source, strategy.name, "failure", res.status, res.statusText, undefined, preview);
+    if (persistFailure) await recordRssAttempt(env, source, strategy.name, "failure", res.status, res.statusText, undefined, preview);
     return { ok: false, message, fetchMs: Date.now() - startedAt };
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
-    await recordRssAttempt(env, source, strategy.name, "failure", undefined, undefined, messageText);
+    if (persistFailure) await recordRssAttempt(env, source, strategy.name, "failure", undefined, undefined, messageText);
     return { ok: false, message: `${logMethod}: ${messageText}`, fetchMs: Date.now() - startedAt };
   }
 }
 
-export async function fetchRssXml(env: Env, rssUrl: string): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number } }> {
+export async function fetchRssXml(env: Env, rssUrl: string, options?: { persistFailure?: boolean }): Promise<{ xml: string; strategy: string; timings: { fetchRssMs: number; fetchFirstStrategyMs: number; fetchRetryStrategyMs: number } }> {
   const rssStrategy = rssFetchStrategies[0];
   const browserStrategy = rssFetchStrategies[1];
+  const persistFailure = options?.persistFailure !== false;
   const firstDelaySeconds = randomIntInclusive(21, 24);
   const retryDelaySeconds = randomIntInclusive(21, 24);
   await sleep(firstDelaySeconds * 1000);
-  const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy);
+  const rssResult = await tryStrategy(env, "sync", "rss", rssUrl, rssStrategy, persistFailure);
   if (rssResult.ok) return { xml: rssResult.xml, strategy: rssResult.strategy, timings: { fetchRssMs: rssResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: 0 } };
   await sleep(retryDelaySeconds * 1000);
-  const browserResult = await tryStrategy(env, "sync", "browser", rssUrl, browserStrategy);
+  const browserResult = await tryStrategy(env, "sync", "browser", rssUrl, browserStrategy, persistFailure);
   if (browserResult.ok) return { xml: browserResult.xml, strategy: browserResult.strategy, timings: { fetchRssMs: rssResult.fetchMs + browserResult.fetchMs, fetchFirstStrategyMs: rssResult.fetchMs, fetchRetryStrategyMs: browserResult.fetchMs } };
   const errors = [rssResult.message, browserResult.message];
   throw new Error(`RSS fetch failed. ${errors.join(" | ")}`);
@@ -398,6 +399,9 @@ export interface RssSyncOptions {
   // snapshot so `syncRss` does not need a separate point read. Callers that omit
   // it (queue mode) keep the standalone query.
   firstSyncDone?: boolean;
+  // Cut C of the factory A/B/C/D experiment: fetch and parse the real prefix,
+  // then return before any business write or failure diagnostic.
+  abcdCut?: "C";
 }
 
 interface RssSyncResult {
@@ -406,6 +410,7 @@ interface RssSyncResult {
   insertedPosts: RssNewPost[];
   strategy: string;
   indexFailureCount: number;
+  abcdCut?: "C";
   timings: RssSyncTiming;
   cpu: {
     parseItemsMs: number;
@@ -419,6 +424,7 @@ export interface SafeRssSyncResult {
   insertedPosts: RssNewPost[];
   ok: boolean;
   strategy?: string;
+  abcdCut?: "C";
   timings?: RssSyncTiming;
   cpu?: {
     parseItemsMs: number;
@@ -437,7 +443,7 @@ export async function syncRss(env: Env, options?: RssSyncOptions): Promise<RssSy
   const rssUrl = env.RSS_URL || "https://rss.nodeseek.com/";
   const initialSearchComplete = options?.searchComplete;
   const fetchStartedAt = Date.now();
-  const { xml, strategy, timings: fetchTimings } = await fetchRssXml(env, rssUrl);
+  const { xml, strategy, timings: fetchTimings } = await fetchRssXml(env, rssUrl, { persistFailure: options?.abcdCut !== "C" });
   const fetchRssMs = Date.now() - fetchStartedAt;
   const chunks = splitItemChunks(xml);
   const guidExtractStartedAt = Date.now();
@@ -492,6 +498,40 @@ export async function syncRss(env: Env, options?: RssSyncOptions): Promise<RssSy
   if (guidMismatchCount > 0) console.warn("RSS GUID mismatch", JSON.stringify({ count: guidMismatchCount }));
   if (capped) console.warn("RSS insert capped", JSON.stringify({ cap: maxNewPosts, candidates: candidateInsertCount }));
   const parseItemsMs = guidExtractMs + fullParseMs;
+  if (options?.abcdCut === "C") {
+    // Cut C stops after the real fetch/GUID/parse prefix and before any
+    // posts, FTS, sync_state, first_sync, or diagnostic write.
+    return {
+      inserted: 0,
+      firstSync: false,
+      insertedPosts: [],
+      strategy,
+      indexFailureCount: 0,
+      abcdCut: "C",
+      timings: {
+        fetchRssMs: fetchTimings.fetchRssMs,
+        fetchFirstStrategyMs: fetchTimings.fetchFirstStrategyMs,
+        fetchRetryStrategyMs: fetchTimings.fetchRetryStrategyMs,
+        parseItemsMs,
+        parseItemCount: chunks.length,
+        prepareInsertMs: 0,
+        insertBindRunMs: 0,
+        insertNewCount: 0,
+        insertExistingCount: existingGuids.size,
+        insertLoopMs: 0,
+        insertPostsMs: 0,
+        writeSyncStateMs: 0,
+        totalMs: Date.now() - fetchStartedAt,
+        guidExtractMs,
+        guidExtractCount: chunks.length,
+        fullParseMs,
+        fullParseCount,
+        guidMismatchCount,
+        indexFailureCount: 0
+      },
+      cpu: { parseItemsMs, parseItemCount: chunks.length }
+    };
+  }
   const first = options?.firstSyncDone === undefined
     ? !(await one<{ value: string }>(env.DB.prepare("SELECT value FROM sync_state WHERE key = 'first_sync_done'")))
     : !options.firstSyncDone;
@@ -578,14 +618,17 @@ export async function syncRss(env: Env, options?: RssSyncOptions): Promise<RssSy
 export async function safeSyncRss(env: Env, options?: RssSyncOptions): Promise<SafeRssSyncResult> {
   try {
     const result = await syncRss(env, options);
-    return { inserted: result.inserted, firstSync: result.firstSync, insertedPosts: result.insertedPosts, ok: true, strategy: result.strategy, timings: result.timings, cpu: result.cpu };
+    return { inserted: result.inserted, firstSync: result.firstSync, insertedPosts: result.insertedPosts, ok: true, strategy: result.strategy, timings: result.timings, cpu: result.cpu, abcdCut: result.abcdCut };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("RSS sync failed", message);
-    try {
-      await persistSyncFailure(env, message);
-    } catch (stateError) {
-      console.error("RSS sync state persist failed", stateError instanceof Error ? stateError.message : String(stateError));
+    // Cut C must leave no failure diagnostic behind; only the default path persists it.
+    if (options?.abcdCut !== "C") {
+      try {
+        await persistSyncFailure(env, message);
+      } catch (stateError) {
+        console.error("RSS sync state persist failed", stateError instanceof Error ? stateError.message : String(stateError));
+      }
     }
     return { inserted: 0, firstSync: false, insertedPosts: [], ok: false, error: message, timings: { fetchRssMs: 0, fetchFirstStrategyMs: 0, fetchRetryStrategyMs: 0, parseItemsMs: 0, parseItemCount: 0, prepareInsertMs: 0, insertBindRunMs: 0, insertNewCount: 0, insertExistingCount: 0, insertLoopMs: 0, insertPostsMs: 0, writeSyncStateMs: 0, totalMs: 0 }, cpu: { parseItemsMs: 0, parseItemCount: 0 } };
   }

@@ -20,6 +20,8 @@ import { getRssAttemptDiagnostics, recordCronTiming, safeSyncRss, testRssFetch }
 import { enqueueRss } from "./ingest-producer";
 import { processIngestMessage } from "./ingest-consumer";
 import { claimInlineSyncMinute } from "./inline-gate";
+import { annotateAbcdCut, annotateAbcdPath, isAbcdExperimentEnabled, pickAbcdCut } from "./abcd-experiment";
+import type { AbcdCut } from "./abcd-experiment";
 import type { IngestMessageV1 } from "./ingest-message";
 import { adminSettingsResponse, adminStatus, adminUsersResponse, deleteAdminUser, handleAdmin, isAdmin, runtimeSettings, updateAdminSettings } from "./settings";
 import { createSubscription, initializeNotificationCursor, processNotifications } from "./subscriptions";
@@ -538,6 +540,9 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const role = resolveCronRole(event.cron);
     const ingestMode = env.INGEST_MODE === "queue" ? "queue" : "inline";
+    const abcdActive = isAbcdExperimentEnabled(ingestMode, env.ABCD_EXPERIMENT);
+    let abcdCut: AbcdCut | undefined;
+    let abcdSpan: Span | undefined;
     // MEASURE_CRON is a temporary inline-only switch. Flag off keeps the real
     // binding untouched; the swap below happens before the inline gate so the
     // gate claim itself is counted.
@@ -572,6 +577,19 @@ export default {
         emitRunLog(run, "skipped", "inline_tick_duplicate");
         return;
       }
+      if (abcdActive) {
+        const byte = crypto.getRandomValues(new Uint8Array(1))[0] & 3;
+        abcdCut = pickAbcdCut(byte);
+        // getActiveSpan is documented but absent from the pinned type package;
+        // guard it so a type/runtime drift can never crash a cut invocation.
+        const tracing = ctx.tracing;
+        abcdSpan = tracing && typeof tracing.getActiveSpan === "function" ? tracing.getActiveSpan() : undefined;
+        annotateAbcdCut(abcdSpan, abcdCut);
+        if (abcdCut === "A") {
+          annotateAbcdPath(abcdSpan, "A");
+          return;
+        }
+      }
     } else {
       if (role === "notify") {
         if (!env.DB) {
@@ -599,6 +617,10 @@ export default {
       }
     }
 
+    const abcdPath = (path: string): void => {
+      if (abcdCut !== undefined) annotateAbcdPath(abcdSpan, path);
+    };
+
     let context: CronStateSnapshot;
     try {
       context = await withPhase(metrics, "state", () => readCronState(env));
@@ -609,6 +631,7 @@ export default {
       } else {
         console.error("readCronState failed; skipping scheduled work", message);
       }
+      abcdPath("failed");
       emitRunLog(run, "failed", "read_cron_state");
       return;
     }
@@ -627,6 +650,7 @@ export default {
       } catch (error) {
         console.error("recoverIndexState failed; ending invocation", error instanceof Error ? error.message : String(error));
       }
+      abcdPath("state_recovery");
       emitRunLog(run, "maintenance", "index_state_1");
       return;
     }
@@ -646,6 +670,7 @@ export default {
     } catch (error) {
       if (isQuotaStop(error)) {
         console.error("prune settings read hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+        abcdPath("failed");
         emitRunLog(run, "failed", "settings_quota");
         return;
       }
@@ -660,6 +685,7 @@ export default {
     } catch (error) {
       if (isQuotaStop(error)) {
         console.error("readDatabaseSizeBytes hit D1 daily write quota; ending invocation", error instanceof Error ? error.message : String(error));
+        abcdPath("failed");
         emitRunLog(run, "failed", "size_probe_quota");
         return;
       }
@@ -677,6 +703,7 @@ export default {
       } else {
         console.error("acquirePruneLease failed; skipping normal cron work", message);
       }
+      abcdPath("failed");
       emitRunLog(run, "failed", "acquire_lease");
       return;
     }
@@ -723,6 +750,7 @@ export default {
         } else {
           console.error("readIndexStateAfterLease after lease failed; aborting", message);
         }
+        abcdPath("failed");
         emitRunLog(run, "failed", "read_index_state");
         return;
       }
@@ -734,12 +762,21 @@ export default {
       indexState = stateAfterLease.indexState;
       searchComplete = stateAfterLease.searchComplete;
 
+      if (abcdCut === "B") {
+        abcdPath("B");
+        return;
+      }
+      if (abcdCut === "D") abcdPath("D");
       const result = ingestMode === "queue"
         ? await enqueueRss(env, maxNewPosts === undefined ? undefined : { maxNewPosts })
-        : await withPhase(metrics, "sync", () => safeSyncRss(env, { maxNewPosts, searchComplete, firstSyncDone: stateAfterLease.firstSyncDone }));
+        : await withPhase(metrics, "sync", () => safeSyncRss(env, { maxNewPosts, searchComplete, firstSyncDone: stateAfterLease.firstSyncDone, abcdCut: abcdCut === "C" ? "C" : undefined }));
       if (!result.ok && isQuotaStop(result.error)) {
         console.error("RSS sync hit D1 daily write quota; ending invocation", String(result.error ?? ""));
         emitRunLog(run, "failed", "rss_quota");
+        return;
+      }
+      if (abcdCut === "C") {
+        abcdPath(result.ok ? "C" : "failed");
         return;
       }
       if (ingestMode === "queue") {

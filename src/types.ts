@@ -19,6 +19,9 @@ export interface Env {
   INGEST_ITEMS_PER_MESSAGE?: string;
   HTML_MODE?: string;
   MEASURE_CRON?: string;
+  // Owner-only A/B/C/D CPU-stage experiment switch for the factory test branch.
+  // Active only when strictly "1" in inline mode; absent/other values are off.
+  ABCD_EXPERIMENT?: string;
 }
 
 export interface User {

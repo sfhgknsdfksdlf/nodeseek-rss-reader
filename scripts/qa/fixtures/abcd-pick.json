@@ -1,0 +1,47 @@
+{
+  "name": "abcd-experiment.pickAbcdCut low-two-bit mapping",
+  "module": "abcd-experiment",
+  "export": "pickAbcdCut",
+  "cases": [
+    {
+      "name": "0 maps to A",
+      "args": [0],
+      "expect": "A"
+    },
+    {
+      "name": "1 maps to B",
+      "args": [1],
+      "expect": "B"
+    },
+    {
+      "name": "2 maps to C",
+      "args": [2],
+      "expect": "C"
+    },
+    {
+      "name": "3 maps to D",
+      "args": [3],
+      "expect": "D"
+    },
+    {
+      "name": "4 uses its low two bits and maps to A",
+      "args": [4],
+      "expect": "A"
+    },
+    {
+      "name": "7 uses its low two bits and maps to D",
+      "args": [7],
+      "expect": "D"
+    },
+    {
+      "name": "255 uses its low two bits and maps to D",
+      "args": [255],
+      "expect": "D"
+    },
+    {
+      "name": "256 uses its low two bits and maps to A",
+      "args": [256],
+      "expect": "A"
+    }
+  ]
+}

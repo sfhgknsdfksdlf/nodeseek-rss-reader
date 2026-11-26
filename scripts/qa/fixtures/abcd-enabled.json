@@ -1,0 +1,37 @@
+{
+  "name": "abcd-experiment.isAbcdExperimentEnabled inline-and-strict-1 gate",
+  "module": "abcd-experiment",
+  "export": "isAbcdExperimentEnabled",
+  "cases": [
+    {
+      "name": "inline mode with strict 1 enables the experiment",
+      "args": ["inline", "1"],
+      "expect": true
+    },
+    {
+      "name": "inline mode with 0 is off",
+      "args": ["inline", "0"],
+      "expect": false
+    },
+    {
+      "name": "inline mode with true is not the strict 1",
+      "args": ["inline", "true"],
+      "expect": false
+    },
+    {
+      "name": "inline mode with an empty value is off",
+      "args": ["inline", ""],
+      "expect": false
+    },
+    {
+      "name": "inline mode with the value absent is off",
+      "args": ["inline"],
+      "expect": false
+    },
+    {
+      "name": "queue mode stays off even with strict 1",
+      "args": ["queue", "1"],
+      "expect": false
+    }
+  ]
+}
